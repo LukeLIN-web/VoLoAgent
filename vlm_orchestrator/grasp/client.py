@@ -85,7 +85,12 @@ class GraspClient:
         resp.raise_for_status()
         return resp.json()
 
-    def compute_grasp(
+    def compute_grasp(self, *args, **kwargs) -> tuple[np.ndarray, float]:
+        """The best grasp of :meth:`compute_grasps`: ``(grasp_pose (4, 4), confidence)``."""
+        poses, confidences = self.compute_grasps(*args, **kwargs)
+        return poses[0], float(confidences[0])
+
+    def compute_grasps(
         self,
         point_cloud: np.ndarray,
         mask: np.ndarray,
@@ -98,8 +103,8 @@ class GraspClient:
         topdown_gravity: Optional[np.ndarray] = None,
         topdown_threshold: Optional[float] = None,
         enable_topdown_filter: Optional[bool] = None,
-    ) -> tuple[np.ndarray, float]:
-        """Predict a grasp pose for the masked object.
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Predict grasp poses for the masked object, best first.
 
         Args:
             point_cloud: (N, 3) float32 scene point cloud in camera frame.
@@ -125,9 +130,9 @@ class GraspClient:
                 does not matter).  ``None`` leaves the server default (on).
 
         Returns:
-            Tuple of ``(grasp_pose, confidence)`` where *grasp_pose* is a
-            (4, 4) float64 homogeneous transform in camera frame and
-            *confidence* is a float in [0, 1].
+            Tuple of ``(grasp_poses, confidences)``: (K, 4, 4) homogeneous
+            transforms in camera frame and their (K,) confidences in [0, 1],
+            sorted by confidence, highest first.
 
         Raises:
             requests.HTTPError: on server-side failure (e.g. no valid grasp).
@@ -176,9 +181,7 @@ class GraspClient:
             )
 
         data = self._unpack_npz(resp.content)
-        grasp_pose = data["grasp_pose"]          # (4, 4)
-        confidence = float(data["grasp_confidence"])
-        return grasp_pose, confidence
+        return data["grasp_poses"], data["grasp_confidences"]
 
     def plan_motion(
         self,

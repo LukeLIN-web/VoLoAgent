@@ -237,8 +237,8 @@ def compute_grasp_core(
     enable_topdown_filter: bool = True,
     topdown_gravity: np.ndarray | None = None,
     topdown_threshold: float = _TOPDOWN_SCORE_THRESHOLD,
-) -> tuple[np.ndarray, float]:
-    """Run GraspGen inference and return ``(best_grasp_4x4, confidence)``.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run GraspGen inference and return ``(grasps (K, 4, 4), confidences (K,))``, best first.
 
     This is the server-side core.  Mirrors the logic in
     ``SpaceTools-Toolshed/toolshed/tools/grasp_generator.py``
@@ -385,16 +385,13 @@ def compute_grasp_core(
         coll_free_grasps = grasps_np
         coll_free_conf = conf_np
 
-    # ---- best grasp ----
-    best_idx = int(np.argmax(coll_free_conf))
-    best_grasp = coll_free_grasps[best_idx]  # 4×4
-    best_conf = float(coll_free_conf[best_idx])
+    order = np.argsort(-coll_free_conf, kind="stable")
     logger.info(
-        f"Best grasp: confidence={best_conf:.3f}, "
+        f"Best grasp: confidence={float(coll_free_conf[order[0]]):.3f}, "
         f"{len(coll_free_grasps)}/{len(grasps_np)} "
         f"{'collision-free' if filter_colliding_grasps else 'unfiltered'}"
     )
-    return best_grasp, best_conf
+    return coll_free_grasps[order], coll_free_conf[order]
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +509,7 @@ def build_app(
             )
 
             t0 = time.time()
-            grasp_pose, confidence = compute_grasp_core(
+            grasps, confidences = compute_grasp_core(
                 point_cloud,
                 mask,
                 image_hw,
@@ -528,8 +525,10 @@ def build_app(
             logger.info(f"/compute_grasp completed in {elapsed:.2f}s")
 
             return _npz_response(
-                grasp_pose=grasp_pose,
-                grasp_confidence=np.array(confidence),
+                grasp_pose=grasps[0],
+                grasp_confidence=np.array(float(confidences[0])),
+                grasp_poses=grasps,
+                grasp_confidences=confidences,
             )
 
         except RuntimeError as e:
