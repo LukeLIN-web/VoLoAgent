@@ -28,6 +28,7 @@ import requests
 
 from vlm_orchestrator.grasp.camera import CameraIntrinsics
 from vlm_orchestrator.grasp.client import GraspClient
+from vlm_orchestrator.perception.gt_segmentation import gt_object_at
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,9 @@ def point_to_place_2d(
     seg_mode: Literal["gt_sim", "sam3", "gdino_sam2", "vlm_point", "molmo_point"],
     grasp_client: GraspClient | None = None,
     vlm=None,                                           # VLMBackend
-    gt_state: dict | None = None,
+    obs: dict | None = None,
+    front: bool = False,
+    point: tuple[float, float] | None = None,
     intrinsics: CameraIntrinsics | None = None,
     cam_to_world: np.ndarray | None = None,
 ) -> PointToPlace2D:
@@ -154,8 +157,10 @@ def point_to_place_2d(
 
     ``seg_mode`` controls dispatch:
 
-    * ``gt_sim``      — read ``gt_state.objects[target].pos`` and project
-      to image plane via ``intrinsics`` + ``cam_to_world``.
+    * ``gt_sim``      — resolve the destination (a scene-object name, or the
+      master's normalised ``point``) against the eval client's ground truth
+      (``obs``: gt_state + id images of the ``front`` or default camera);
+      see :func:`_gt_sim_point`.
     * ``sam3``        — SAM3 detect+segment via grasp server.
     * ``gdino_sam2``  — GroundingDINO bbox → SAM2 mask, centroid.
     * ``vlm_point``   — orchestrator main VLM (Claude / Bedrock) pointing.
@@ -167,7 +172,9 @@ def point_to_place_2d(
     if seg_mode == "gt_sim":
         return _gt_sim_point(
             target_phrase=target_phrase,
-            gt_state=gt_state,
+            point=point,
+            obs=obs,
+            front=front,
             image_hw=image_rgb.shape[:2],
             intrinsics=intrinsics,
             cam_to_world=cam_to_world,
@@ -351,12 +358,22 @@ def raycast_2d_to_3d(
 def _gt_sim_point(
     *,
     target_phrase: str,
-    gt_state: dict | None,
+    point: tuple[float, float] | None,
+    obs: dict | None,
+    front: bool,
     image_hw: tuple[int, int],
     intrinsics: CameraIntrinsics | None,
     cam_to_world: np.ndarray | None,
 ) -> PointToPlace2D:
-    """Read ``gt_state.objects[target].pos`` and project to image."""
+    """Ground-truth destination pixel.
+
+    The destination object is ``target_phrase`` when that is an exact scene
+    object name; otherwise it is the scene object under the master's
+    ``point``. A point on no scene object (open table, "empty space next to
+    ...") is the destination itself. An object destination is its gt_state
+    position projected to the image.
+    """
+    gt_state = (obs or {}).get("gt_state")
     if gt_state is None:
         raise PerceptionFailure(
             "seg_mode='gt_sim' requires gt_state in obs "
@@ -367,12 +384,31 @@ def _gt_sim_point(
             "seg_mode='gt_sim' requires intrinsics + cam_to_world"
         )
 
-    objects = gt_state.get("objects", {}) or {}
-    obj = _lookup_gt_object(objects, target_phrase)
+    name = target_phrase
+    if name not in obs.get("gt_seg/obj_body_id", {}):
+        if point is None:
+            raise PerceptionFailure(
+                f"GT_SIM: {target_phrase!r} is not a scene object and the "
+                f"master gave no destination point"
+            )
+        try:
+            name = gt_object_at(obs, point, front=front, radius_px=0)
+        except RuntimeError as e:
+            raise PerceptionFailure(str(e)) from e
+        if name is None:
+            return PointToPlace2D(
+                x_norm=float(point[0]),
+                y_norm=float(point[1]),
+                confidence=1.0,
+                source="gt_sim:point",
+                rationale=f"master's point on no scene object ({target_phrase!r})",
+            )
+
+    obj = gt_state.get("objects", {}).get(name)
     if obj is None:
         raise PerceptionFailure(
-            f"GT_SIM: object {target_phrase!r} not in gt_state.objects "
-            f"(known: {sorted(objects.keys())})"
+            f"GT_SIM: object {name!r} not in gt_state.objects "
+            f"(known: {sorted(gt_state.get('objects', {}))})"
         )
 
     pos_world = np.asarray(obj["pos"], dtype=np.float64).reshape(3)
@@ -382,7 +418,7 @@ def _gt_sim_point(
     pt_cam = world_to_cam[:3, :3] @ pos_world + world_to_cam[:3, 3]
     if pt_cam[2] <= 0:
         raise PerceptionFailure(
-            f"GT_SIM: object {target_phrase!r} at world={pos_world} "
+            f"GT_SIM: object {name!r} at world={pos_world} "
             f"projects behind camera (cam_z={pt_cam[2]:.3f})"
         )
     u = intrinsics.fx * pt_cam[0] / pt_cam[2] + intrinsics.cx
@@ -390,7 +426,7 @@ def _gt_sim_point(
     h, w = image_hw
     if not (0 <= u < w and 0 <= v < h):
         raise PerceptionFailure(
-            f"GT_SIM: object {target_phrase!r} projects outside image "
+            f"GT_SIM: object {name!r} projects outside image "
             f"(u={u:.1f} v={v:.1f}, image {w}x{h})"
         )
 
@@ -399,22 +435,8 @@ def _gt_sim_point(
         y_norm=float(v / h),
         confidence=1.0,
         source="gt_sim",
-        rationale=f"gt_state.objects[{target_phrase!r}].pos={pos_world.tolist()}",
+        rationale=f"gt_state.objects[{name!r}].pos={pos_world.tolist()}",
     )
-
-
-def _lookup_gt_object(objects: dict, name: str) -> dict | None:
-    """Find an object in gt_state.objects by name, with simple aliases."""
-    if name in objects:
-        return objects[name]
-    snake = name.replace(" ", "_")
-    if snake in objects:
-        return objects[snake]
-    lower = name.lower()
-    for k, v in objects.items():
-        if k.lower() == lower:
-            return v
-    return None
 
 
 # ----------------------------------------------------------------------

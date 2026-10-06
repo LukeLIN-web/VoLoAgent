@@ -32,7 +32,6 @@ Usage (inside proxy.py)::
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from enum import Enum
@@ -54,6 +53,7 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.grasp.client import GraspClient
+from vlm_orchestrator.perception.gt_segmentation import gt_object_at, gt_object_mask
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,11 @@ GRASP_ROBOLAB_CLEAN_IK = (
 
 # Retreat offset: lift straight up in world frame (metres)
 RETREAT_HEIGHT = 0.10
+# A finished grasp counts only if the target touches the gripper and has
+# risen at least this far since perception (RoboLab's "lifted" threshold).
+GRASP_LIFT_THRESHOLD_M = 0.03
+# gt_sim: a master's grasp point this close (px) to a scene object picks that object.
+GT_POINT_SNAP_PX = 15
 
 # Safe height: lift arm to this z before perception (clears camera view)
 SAFE_HEIGHT_Z = 0.45
@@ -369,6 +374,7 @@ class GraspPhase(str, Enum):
     SETTLE_HOLD = "settle_hold"       # TESTING: hold final waypoint to let ramp-lag decay
     INTEGRAL_SETTLE = "integral_settle"  # ROBOLAB: integral correction of P-controller undershoot
     MEASURING = "measuring"           # one-shot: capture post-move metrics, then DONE
+    VERIFYING = "verifying"           # one-shot: judge held-and-lifted after the retreat
     DONE = "done"
     FAILED = "failed"
 
@@ -558,6 +564,12 @@ class GraspToolExecutor:
 
         # Settle counter (wait for object to land before perception)
         self._settle_remaining: int = 0
+        # gt_sim: the master's point on the target, the scene object the
+        # target resolved to, and its gt_state height at perception (the
+        # baseline of the post-retreat verdict).
+        self._target_point: tuple[float, float] | None = None
+        self._gt_name: str | None = None
+        self._target_z0: float | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -585,8 +597,13 @@ class GraspToolExecutor:
         obs: dict,
         state,
         stack: bool = True,
+        point: tuple[float, float] | None = None,
     ) -> None:
         """Kick off a planned grasp for *target_object*.
+
+        ``point`` is the master's normalised ``(x, y)`` on the target in the
+        grasp camera image; ``gt_sim`` uses it to identify the target when
+        ``target_object`` is a phrase rather than a scene-object name.
 
         ``stack`` is advisory and only honoured when the executor was
         constructed with ``stack_mode_enabled=True``.  ``stack=False`` means
@@ -605,6 +622,7 @@ class GraspToolExecutor:
         subsequent ``step()`` calls will serve the planned trajectory.
         """
         self._target_object = target_object
+        self._target_point = point
         self._stack_this_grasp = bool(stack)
         self._status_message = f"Lifting arm for '{target_object}'..."
         self._last_obs = obs
@@ -817,14 +835,12 @@ class GraspToolExecutor:
 
             if self._seg_mode == GraspSegMode.GT_SIM:
                 # ---- GT_SIM: use ground-truth mask from simulator ----
-                # Debug: check what gt_seg keys are available
-                gt_seg_keys = [k for k in obs if k.startswith("gt_seg")]
-                logger.info(
-                    f"  GT_SIM: available gt_seg keys = {gt_seg_keys}"
+                self._gt_name = self._resolve_gt_target(obs, target_object)
+                self._target_z0 = self._gt_height(obs)
+                mask = gt_object_mask(
+                    obs, self._gt_name, front=self._use_front_camera,
                 )
-                mask, bbox, detection_score = self._get_gt_mask(
-                    obs, target_object, image.shape[:2],
-                )
+                bbox, detection_score = self._mask_to_bbox(mask), 1.0
                 logger.info(
                     f"  GT_SIM segmentation: '{target_object}' — "
                     f"{mask.sum()} pixels "
@@ -833,10 +849,8 @@ class GraspToolExecutor:
                 )
                 if mask.sum() == 0:
                     raise RuntimeError(
-                        f"GT_SIM mask for '{target_object}' has 0 pixels. "
-                        f"gt_seg keys in obs: {gt_seg_keys}. "
-                        f"The object may be occluded or gt_seg data may "
-                        f"not be forwarded by the eval client."
+                        f"GT_SIM: '{target_object}' is not visible from the "
+                        f"grasp camera"
                     )
             elif self._seg_mode == GraspSegMode.SAM3:
                 # ---- SAM3: unified detect + segment in one call ----
@@ -1225,6 +1239,9 @@ class GraspToolExecutor:
         if self._phase == GraspPhase.MEASURING:
             return self._step_measuring(obs, state)
 
+        if self._phase == GraspPhase.VERIFYING:
+            return self._step_verifying(obs, state)
+
         if self._phase in (GraspPhase.DONE, GraspPhase.FAILED):
             # Shouldn't be called but return a no-op
             return self._noop_response(obs)
@@ -1609,6 +1626,52 @@ class GraspToolExecutor:
         last_action = self._seg_final[-1] if self._seg_final else self._trajectory[-1]
         return {"actions": np.tile(last_action, (self._action_horizon, 1))}
 
+    def _step_verifying(self, obs: dict, state) -> dict:
+        """Hold for one chunk and judge the grasp on the post-retreat obs.
+
+        Called exactly once after RETREATING ends. Without gt_state for the
+        target there is nothing to judge, and the grasp is DONE.
+        """
+        verdict = self._judge_grasp(obs)
+        if verdict is None or verdict[0]:
+            self._phase = GraspPhase.DONE
+            self._status_message = "Grasp complete — handing back to VLA"
+        else:
+            self._phase = GraspPhase.FAILED
+            self._status_message = f"Failed: {verdict[1]}"
+        if verdict is not None:
+            logger.info(f"  Grasp verdict: success={verdict[0]} ({verdict[1]})")
+            state.log({
+                "type": "grasp_verdict",
+                "target": self._target_object,
+                "object": self._gt_name,
+                "success": verdict[0],
+                "reason": verdict[1],
+            })
+        return self._noop_response(obs)
+
+    def _gt_height(self, obs: dict) -> float | None:
+        """gt_state height of the resolved target, or None without one."""
+        obj = (obs.get("gt_state") or {}).get("objects", {}).get(self._gt_name)
+        return None if obj is None else float(obj["pos"][2])
+
+    def _judge_grasp(self, obs: dict) -> tuple[bool, str] | None:
+        """(success, reason) for the finished grasp, or None without GT for the target."""
+        z = self._gt_height(obs)
+        if z is None or self._target_z0 is None:
+            return None
+        # The ungated contact sensor: the eval client's ``objects_in_contact``
+        # drops contacts below a gripper-closure gate that a wide held object
+        # can stall the fingers under.
+        contacts = obs["gt_state"].get("robot", {}).get("objects_in_contact_raw", [])
+        held = self._gt_name in contacts
+        lift = z - self._target_z0
+        reason = (
+            f"'{self._gt_name}' {'touching' if held else 'not touching'} the "
+            f"gripper, raised {lift * 100:.1f} cm"
+        )
+        return held and lift >= GRASP_LIFT_THRESHOLD_M, reason
+
     def _do_post_move_log(self, obs: dict, state) -> None:
         """Capture post-move position/orientation metrics and save debug images."""
         try:
@@ -1980,9 +2043,9 @@ class GraspToolExecutor:
                 self._phase = GraspPhase.MEASURING
 
         elif self._phase == GraspPhase.RETREATING:
-            logger.info("  Retreat complete → DONE")
-            self._phase = GraspPhase.DONE
-            self._status_message = "Grasp complete — handing back to VLA"
+            # Judge on the next obs, after the last retreat chunk has run.
+            logger.info("  Retreat complete → verifying the grasp")
+            self._phase = GraspPhase.VERIFYING
 
     # ------------------------------------------------------------------
     # Trajectory planning (IK + motion-planned joint-space segments)
@@ -2355,385 +2418,35 @@ class GraspToolExecutor:
     # Perception helpers
     # ------------------------------------------------------------------
 
-    def _get_gt_mask(
-        self,
-        obs: dict,
-        target_object: str,
-        image_hw: tuple[int, int],
-    ) -> tuple[np.ndarray, tuple[int, int, int, int], float]:
-        """Get a segmentation mask for the target object using GT info.
+    def _resolve_gt_target(self, obs: dict, target_object: str) -> str:
+        """The scene object ``target_object`` refers to (gt_sim).
 
-        Pipeline:
-          1. If the seg buffer is available, extract the pixel-perfect mask
-             directly from ``body_ids == matched_id``.  This is the ideal
-             path — frame-accurate and doesn't require SAM2.
-          2. If the seg buffer is unavailable or matching failed, fall back
-             to SAM2 prompted with the gt_state 3D→2D projection.
-          3. Bbox fallback if SAM2 is also unavailable.
-
-        Returns ``(mask, bbox, score)``.
+        An exact scene-object name (GT detector, grasp probe) is taken as
+        is. Otherwise the master's point on the target identifies it: the
+        scene object under the point, or within ``GT_POINT_SNAP_PX`` of it.
         """
-        h, w = image_hw
-        _sfx = "_front" if self._use_front_camera else ""
-
-        # ── Step 1: try pixel-perfect mask from seg buffer ──
-        body_ids = obs.get("gt_seg/body_ids")
-        if body_ids is None:
-            body_ids = obs.get(f"gt_seg/instance_ids{_sfx}")
-
-        if body_ids is not None:
-            body_ids_arr = np.asarray(body_ids, dtype=np.int32)
-            result = self._match_centroid_to_gt(
-                obs, target_object, body_ids_arr, h, w,
-            )
-            if result is not None:
-                matched_id, cu, cv = result
-                # Extract pixel-perfect mask from seg buffer
-                seg_mask = (body_ids_arr == matched_id)
-                seg_h, seg_w = seg_mask.shape[:2]
-                # Resize to RGB image resolution if needed
-                if (seg_h, seg_w) != (h, w):
-                    import cv2 as _cv2
-                    seg_mask = (
-                        _cv2.resize(
-                            seg_mask.astype(np.uint8) * 255,
-                            (w, h),
-                            interpolation=_cv2.INTER_NEAREST,
-                        ) > 127
-                    )
-                bbox = self._mask_to_bbox(seg_mask)
-                logger.info(
-                    f"  [GT_SIM] pixel-perfect mask from seg buffer "
-                    f"(id={matched_id}): {seg_mask.sum()} px, bbox={bbox}"
-                )
-                return seg_mask, bbox, 1.0
-            logger.info(
-                "  [GT_SIM] seg buffer available but centroid matching "
-                "failed — falling through to SAM2/bbox"
-            )
-
-        # ── Step 2: no seg-buffer mask — locate center via gt_state ──
-        center_uv, center_src = self._project_gt_position(
-            obs, target_object, h, w,
-        )
-
-        if center_uv is None:
+        if target_object in obs.get("gt_seg/obj_body_id", {}):
+            return target_object
+        if self._target_point is None:
             raise RuntimeError(
-                f"GT_SIM: could not locate '{target_object}' — "
-                f"no seg buffer match and no gt_state available."
+                f"GT_SIM: {target_object!r} is not a scene object and the "
+                f"master gave no point on it"
             )
-
-        u, v = int(round(center_uv[0])), int(round(center_uv[1]))
-        u = max(0, min(w - 1, u))
-        v = max(0, min(h - 1, v))
+        x, y = self._target_point
+        name = gt_object_at(
+            obs, (x, y), front=self._use_front_camera,
+            radius_px=GT_POINT_SNAP_PX,
+        )
+        if name is None:
+            raise RuntimeError(
+                f"GT_SIM: the point ({x:.3f}, {y:.3f}) for "
+                f"{target_object!r} is not on a scene object"
+            )
         logger.info(
-            f"  [GT_SIM] center=({u},{v}) src={center_src}"
+            f"  [GT_SIM] point ({x:.3f}, {y:.3f}) for "
+            f"{target_object!r} → '{name}'"
         )
-
-        # ── Step 3: SAM2 with point prompt (no hardcoded box) ──
-        # Let SAM2 determine the object extent from the point alone,
-        # just as gdino_sam2 mode lets GDino supply the real bbox.
-        try:
-            image = self._extract_image(obs)
-            mask, iou = self._grasp_client.segment(
-                image, u / w, v / h,
-            )
-            logger.info(
-                f"  GT_SIM → SAM2 (point-only): iou={iou:.3f}, "
-                f"{mask.sum()} px"
-            )
-            if mask.sum() >= 50:
-                bbox = self._mask_to_bbox(mask)
-                return mask, bbox, 1.0
-            logger.warning(f"  SAM2 mask too small ({mask.sum()} px)")
-        except Exception as e:
-            logger.warning(f"  SAM2 failed ({e})")
-
-        # ── Step 4: bbox fallback (no SAM2 available at all) ──
-        # Conservative small radius — only reached when SAM2 is down.
-        fallback_radius = 20
-        bbox = (max(0, u - fallback_radius), max(0, v - fallback_radius),
-                min(w, u + fallback_radius), min(h, v + fallback_radius))
-        mask = self._bbox_to_mask(bbox, (h, w))
-        logger.info(
-            f"  GT_SIM bbox fallback (no SAM2): ({u},{v}), "
-            f"radius={fallback_radius}, {mask.sum()} px"
-        )
-        return mask, bbox, 1.0
-
-    def _find_object_center(
-        self,
-        obs: dict,
-        target_object: str,
-        h: int,
-        w: int,
-    ) -> tuple[tuple[float, float] | None, str | None]:
-        """Find the best 2D center pixel for the target object.
-
-        Priority:
-          A) Seg buffer centroid — frame-accurate (same render as image)
-          B) gt_state 3D projection — may lag 1 frame
-
-        Returns ``((u, v), source_description)`` or ``(None, None)``.
-        """
-        _sfx = "_front" if self._use_front_camera else ""
-
-        # ── A) Seg buffer centroid ──
-        body_ids = obs.get("gt_seg/body_ids")
-        if body_ids is None:
-            body_ids = obs.get(f"gt_seg/instance_ids{_sfx}")
-
-        if body_ids is not None:
-            body_ids = np.asarray(body_ids, dtype=np.int32)
-            result = self._match_centroid_to_gt(
-                obs, target_object, body_ids, h, w,
-            )
-            if result is not None:
-                matched_id, cu, cv = result
-                seg_h, seg_w = body_ids.shape[:2]
-                center_uv = (cu * w / seg_w, cv * h / seg_h)
-                return center_uv, f"seg_centroid(id={matched_id})"
-            logger.info("  [GT_SIM] seg centroid matching failed")
-
-        # ── B) gt_state 3D projection ──
-        return self._project_gt_position(obs, target_object, h, w)
-
-    def _project_gt_position(
-        self,
-        obs: dict,
-        target_object: str,
-        h: int,
-        w: int,
-    ) -> tuple[tuple[float, float] | None, str | None]:
-        """Project the gt_state 3D position to a 2D pixel.
-
-        Returns ``((u, v), "gt_projection")`` or ``(None, None)``.
-        May be ~30-50 px off if the object is still settling.
-        """
-        gt_state = obs.get("gt_state")
-        if gt_state is None:
-            return None, None
-        objects = gt_state.get("objects", {})
-
-        obj_data = None
-        target_us = target_object.replace(" ", "_")
-        target_sp = target_object.replace("_", " ")
-        for variant in (target_object, target_us, target_sp):
-            if variant in objects:
-                obj_data = objects[variant]
-                break
-        if obj_data is None:
-            target_norm = target_us.lower()
-            for name, data in objects.items():
-                if target_norm in name.lower().replace(" ", "_"):
-                    obj_data = data
-                    break
-        if obj_data is None:
-            return None, None
-
-        obj_pos = np.array(obj_data["pos"])
-        try:
-            cam_to_world = self._get_camera_to_world(obs)
-        except Exception:
-            return None, None
-        world_to_cam = np.linalg.inv(cam_to_world)
-        pos_cam = world_to_cam[:3, :3] @ obj_pos + world_to_cam[:3, 3]
-        if pos_cam[2] <= 0:
-            return None, None
-
-        _sfx = "_front" if self._use_front_camera else ""
-        obs_K = obs.get(f"observation/camera_K{_sfx}")
-        if obs_K is None:
-            obs_K = obs.get("observation/camera_K")
-        if obs_K is not None:
-            K = np.asarray(obs_K).reshape(3, 3)
-        else:
-            K = np.array([
-                [self._intrinsics.fx, 0, self._intrinsics.cx],
-                [0, self._intrinsics.fy, self._intrinsics.cy],
-                [0, 0, 1],
-            ])
-
-        px = K @ pos_cam
-        u = float(px[0] / px[2])
-        v = float(px[1] / px[2])
-        logger.info(
-            f"  [GT_SIM] gt_projection: '{target_object}' "
-            f"pos={obj_pos} → pixel ({u:.0f},{v:.0f})"
-        )
-        return (u, v), "gt_projection"
-
-    def _match_centroid_to_gt(
-        self,
-        obs: dict,
-        target_object: str,
-        body_ids: np.ndarray,
-        img_h: int,
-        img_w: int,
-    ) -> tuple[int, float, float] | None:
-        """Match a seg-buffer instance to the target via centroid proximity.
-
-        The seg buffer is rendered in the SAME frame as the RGB image,
-        so its pixel data is perfectly synchronised.  ``gt_state``
-        positions may lag by a frame (object still settling / falling),
-        so we only use them for **coarse** matching: project gt position
-        → pixel, then pick the seg-buffer instance whose centroid is
-        nearest to that projection.
-
-        Returns ``(instance_id, centroid_u, centroid_v)`` in **seg-buffer
-        coordinates**, or *None* if no plausible candidate is found.
-        """
-        # ── 1. Project gt_state position → approximate pixel ──
-        gt_state = obs.get("gt_state", {})
-        objects = gt_state.get("objects", {})
-
-        obj_data = None
-        target_us = target_object.replace(" ", "_")
-        target_sp = target_object.replace("_", " ")
-        for variant in (target_object, target_us, target_sp):
-            if variant in objects:
-                obj_data = objects[variant]
-                break
-        if obj_data is None:
-            target_norm = target_us.lower()
-            for name, data in objects.items():
-                if target_norm in name.lower().replace(" ", "_"):
-                    obj_data = data
-                    break
-        if obj_data is None:
-            return None
-
-        obj_pos = np.array(obj_data["pos"])
-        try:
-            cam_to_world = self._get_camera_to_world(obs)
-        except Exception:
-            return None
-        world_to_cam = np.linalg.inv(cam_to_world)
-        pos_cam = world_to_cam[:3, :3] @ obj_pos + world_to_cam[:3, 3]
-        if pos_cam[2] <= 0:
-            return None
-
-        _sfx = "_front" if self._use_front_camera else ""
-        obs_K = obs.get(f"observation/camera_K{_sfx}")
-        if obs_K is None:
-            obs_K = obs.get("observation/camera_K")
-        if obs_K is not None:
-            K = np.asarray(obs_K).reshape(3, 3)
-        else:
-            K = np.array([
-                [self._intrinsics.fx, 0, self._intrinsics.cx],
-                [0, self._intrinsics.fy, self._intrinsics.cy],
-                [0, 0, 1],
-            ])
-
-        px = K @ pos_cam
-        proj_u = px[0] / px[2]
-        proj_v = px[1] / px[2]
-
-        # ── 2. Compute centroids of all small-object IDs in seg buffer ──
-        seg_h, seg_w = body_ids.shape[:2]
-        total_px = seg_h * seg_w
-        # Scale projection if seg buffer resolution differs from image
-        scale_u = seg_w / img_w
-        scale_v = seg_h / img_h
-        proj_u_seg = proj_u * scale_u
-        proj_v_seg = proj_v * scale_v
-
-        unique_ids = np.unique(body_ids)
-        candidates = []  # (id, centroid_u, centroid_v, npx, dist)
-        for uid in unique_ids:
-            uid = int(uid)
-            if uid == 0:
-                continue  # background
-            id_mask = (body_ids == uid)
-            npx = int(id_mask.sum())
-            frac = npx / total_px
-            # Skip IDs that are too large (table/robot: >3%) or too
-            # small (<10 px: noise)
-            if npx < 10 or frac > 0.03:
-                continue
-            ys, xs = np.where(id_mask)
-            cu = float(xs.mean())
-            cv = float(ys.mean())
-            dist = math.sqrt((cu - proj_u_seg) ** 2 + (cv - proj_v_seg) ** 2)
-            candidates.append((uid, cu, cv, npx, dist))
-
-        if not candidates:
-            logger.info(
-                f"  [GT_SIM] centroid match: no small-object IDs in seg buffer"
-            )
-            return None
-
-        # ── 3. Pick nearest centroid to projected position ──
-        candidates.sort(key=lambda c: c[4])  # sort by distance
-        best_id, best_cu, best_cv, best_npx, best_dist = candidates[0]
-
-        # Reject if too far (>150 px — generous for 1-frame lag)
-        max_dist = 150
-        if best_dist > max_dist:
-            logger.info(
-                f"  [GT_SIM] centroid match: nearest ID={best_id} is "
-                f"{best_dist:.0f}px away (>{max_dist}), rejecting. "
-                f"Candidates: {[(c[0], c[3], f'{c[4]:.0f}px') for c in candidates[:5]]}"
-            )
-            return None
-
-        logger.info(
-            f"  [GT_SIM] centroid match: '{target_object}' → ID={best_id}, "
-            f"centroid=({best_cu:.0f},{best_cv:.0f}), {best_npx}px, "
-            f"dist={best_dist:.0f}px from projection ({proj_u_seg:.0f},{proj_v_seg:.0f}). "
-            f"Others: {[(c[0], c[3], f'{c[4]:.0f}px') for c in candidates[1:4]]}"
-        )
-        return best_id, best_cu, best_cv
-
-    @staticmethod
-    def _resolve_gt_body_id(
-        target_object: str,
-        obj_body_id: dict,
-    ) -> int | None:
-        """Resolve target object name → MuJoCo body ID.
-
-        Uses the mapping provided by the eval client's GT seg provider.
-        Supports exact match, _main suffix, and fuzzy substring match.
-        Normalises spaces ↔ underscores so ``"green block"`` matches
-        ``"green_block"`` and vice-versa.
-        """
-        # Normalise: try both space and underscore variants
-        target_us = target_object.replace(" ", "_")
-        target_sp = target_object.replace("_", " ")
-
-        # Exact match (original, underscore, space)
-        for variant in (target_object, target_us, target_sp):
-            if variant in obj_body_id:
-                return obj_body_id[variant]
-
-        # _main suffix (robosuite convention)
-        for variant in (target_object, target_us, target_sp):
-            with_main = f"{variant}_main"
-            if with_main in obj_body_id:
-                return obj_body_id[with_main]
-
-        # Fuzzy substring match (normalise both sides to underscores)
-        target_norm = target_us.lower()
-        candidates = [
-            (name, bid) for name, bid in obj_body_id.items()
-            if target_norm in name.lower().replace(" ", "_")
-        ]
-        if candidates:
-            # Take shortest name (most specific)
-            candidates.sort(key=lambda x: len(x[0]))
-            name, bid = candidates[0]
-            logger.info(
-                f"  GT_SIM: fuzzy body ID match "
-                f"'{target_object}' → '{name}' (body_id={bid})"
-            )
-            return bid
-
-        logger.warning(
-            f"  GT_SIM: could not resolve '{target_object}' to body_id. "
-            f"Available: {list(obj_body_id.keys())[:15]}"
-        )
-        return None
+        return name
 
     @staticmethod
     def _mask_to_bbox(
@@ -3043,22 +2756,6 @@ class GraspToolExecutor:
                 f"iou={iou:.3f}) for bbox={bbox}. Object likely misdetected "
                 f"or occluded; aborting grasp rather than fabricating a mask."
             )
-        return mask
-
-    @staticmethod
-    def _bbox_to_mask(
-        bbox: tuple[int, int, int, int],
-        image_hw: tuple[int, int],
-    ) -> np.ndarray:
-        """Create a boolean mask from a bounding box (fallback)."""
-        h, w = image_hw
-        mask = np.zeros((h, w), dtype=bool)
-        x1, y1, x2, y2 = bbox
-        x1 = max(0, min(x1, w - 1))
-        x2 = max(0, min(x2, w))
-        y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h))
-        mask[y1:y2, x1:x2] = True
         return mask
 
     # ------------------------------------------------------------------
@@ -3596,6 +3293,9 @@ class GraspToolExecutor:
         self._q_at_grasp = None
         self._ee_at_grasp = None
         self._T_flange_to_tcp = None
+        self._target_point = None
+        self._gt_name = None
+        self._target_z0 = None
         self._libero_pre_grasp_pos = None
         self._libero_grasp_pos = None
         self._libero_seg_target_pos = None

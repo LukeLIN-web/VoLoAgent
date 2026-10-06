@@ -125,6 +125,14 @@ class HandlerResult:
     (setting an object ON TOP of another: stacking a block, nesting a lid).
     """
 
+    grasp_point: tuple[float, float] | None = None
+    """Normalised point on the ``grasp_tool`` target in the primary NOW
+    image; required when the grasp tool runs ``gt_sim``."""
+
+    place_point: tuple[float, float] | None = None
+    """Normalised destination point for ``place_tool`` in the primary NOW
+    image; required when the place tool runs ``gt_sim``."""
+
     # -- Extra context (for logging) -----------------------------------
 
     extra: dict[str, Any] = field(default_factory=dict)

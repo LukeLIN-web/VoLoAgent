@@ -277,6 +277,16 @@ class DestinationSpec:
             return f"{self.relation} pixel{self.target_point_2d}"
         return "<unspecified>"
 
+    @classmethod
+    def for_call(
+        cls, phrase: str, point: tuple[float, float] | None = None, **kwargs,
+    ) -> "DestinationSpec":
+        """A tool call's destination: the master's point when it gave one
+        (``gt_sim`` resolves it against ground truth), else its phrase."""
+        if point is not None:
+            return cls(target_point_2d=point, **kwargs)
+        return cls(target_object=phrase, **kwargs)
+
     def validate(self) -> None:
         n = sum(
             1 for v in (
@@ -693,7 +703,7 @@ class PlaceToolExecutor:
         self._intrinsics_used = intrinsics
         self._cam_to_world_used = cam_to_world
 
-        if dest.target_point_2d is not None:
+        if dest.target_point_2d is not None and self._seg_mode != PlaceSegMode.GT_SIM:
             pt = PointToPlace2D(
                 x_norm=float(dest.target_point_2d[0]),
                 y_norm=float(dest.target_point_2d[1]),
@@ -710,7 +720,9 @@ class PlaceToolExecutor:
                 seg_mode=self._seg_mode.value,
                 grasp_client=self._client,
                 vlm=self._vlm,
-                gt_state=obs.get("gt_state"),
+                obs=obs,
+                front=self._use_front_camera,
+                point=dest.target_point_2d,
                 intrinsics=intrinsics,
                 cam_to_world=cam_to_world,
             )

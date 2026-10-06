@@ -526,6 +526,20 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 f"Front camera enabled for VLM: {ctx.front_image_key}"
             )
 
+    @property
+    def _point_tools(self) -> frozenset[str]:
+        """Tools whose calls carry the master's image point.
+
+        Under ``gt_sim`` the point is how the master names an object: the
+        tool reads the scene object under it from the ground-truth id image.
+        """
+        return frozenset(
+            tool for tool, mode in (
+                ("grasp", self._grasp_seg_mode),
+                ("place", self._place_seg_mode),
+            ) if mode == "gt_sim"
+        )
+
     # ------------------------------------------------------------------
     # Motion planner (lazy creation, shared across grasp + place tools)
     # ------------------------------------------------------------------
@@ -570,6 +584,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 getattr(self.ctx, "front_image_key", None)
             ),
             stack_mode_enabled=self._stack_mode_enabled,
+            point_tools=self._point_tools,
         )
         logger.info(
             f"VLM failure handler created: "
@@ -789,6 +804,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         state.original_instruction = prompt
         state.subgoals = []
         state.current_subgoal_idx = 0
+        state.episode_done = False
         state.step_at_last_check = state.episode_step
         state.step_at_subgoal_start = state.episode_step
         self._recycle_count = 0
@@ -1240,6 +1256,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 # Build a minimal ClassificationResult for compatibility
                 _make_dummy_classification(result),
                 target_override=target,
+                point=result.grasp_point,
             )
             if not activated:
                 logger.warning(
@@ -1292,7 +1309,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 payload = f"in|{destination}|{held_hint}"
                 activated = self._activate_place_tool_from_hitl(
                     obs, state, payload, source="vlm_handler",
-                    stack=place_stack,
+                    stack=place_stack, point=result.place_point,
                 )
                 if not activated:
                     logger.warning(
@@ -2187,8 +2204,12 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         *,
         source: str = "hitl",
         stack: bool = False,
+        point: tuple[float, float] | None = None,
     ) -> bool:
         """Parse a place_tool payload and start the executor.
+
+        ``point`` is the master's normalised destination point in the place
+        camera image (``gt_sim`` resolves the destination from it).
 
         Payload shape: ``"<relation>|<target>|<held_hint>"``.  Older
         clients may pass just ``"<target>"`` — treated as
@@ -2259,10 +2280,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 stack_mode_enabled=self._stack_mode_enabled,
             )
 
-        spec = DestinationSpec(
-            target_object=target,
-            relation=relation,
-        )
+        spec = DestinationSpec.for_call(target, point, relation=relation)
         try:
             state.place_tool_executor.start(
                 spec, obs, state,
@@ -3203,7 +3221,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         return obs, state
 
     def _activate_grasp_tool(
-        self, obs, state, sg, result, *, target_override=None,
+        self, obs, state, sg, result, *, target_override=None, point=None,
     ) -> bool:
         """Activate the grasp tool executor.  Returns True if activated.
 
@@ -3239,7 +3257,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             state._hitl = self._hitl
 
         state.grasp_tool_executor.start(
-            target_object=target, obs=obs, state=state,
+            target_object=target, obs=obs, state=state, point=point,
         )
         state.grasp_tool_active = state.grasp_tool_executor.is_active
         state.grasp_tool_phase = state.grasp_tool_executor.phase.value

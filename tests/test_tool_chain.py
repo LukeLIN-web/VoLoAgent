@@ -104,6 +104,28 @@ class TestParseValid:
         assert "relation" not in d.args or d.args.get("relation") is None
 
 
+class TestParsePoints:
+    def _raw(self, args, tool="grasp"):
+        return json.dumps({"subgoal_action": "continue", "tool": tool, "args": args, "reason": "r"})
+
+    def test_point_is_stored_as_a_tuple(self):
+        d = parse_tool_chain_response(self._raw({"target": "x", "point": [0.25, 0.75]}), frozenset({"grasp"}))
+        assert d.args["point"] == (0.25, 0.75)
+
+    def test_missing_or_pixel_point_is_malformed(self):
+        with pytest.raises(ValueError, match="args.point"):
+            parse_tool_chain_response(self._raw({"target": "x"}), frozenset({"grasp"}))
+        with pytest.raises(ValueError, match="args.point"):
+            parse_tool_chain_response(
+                self._raw({"destination": "in the bowl", "point": [412, 260]}, tool="place"),
+                frozenset({"place"}),
+            )
+
+    def test_point_not_required_outside_point_tools(self):
+        d = parse_tool_chain_response(self._raw({"target": "x"}), frozenset({"place"}))
+        assert "point" not in d.args
+
+
 class TestParseInvalid:
     def test_not_json(self):
         with pytest.raises(ValueError, match="parse"):

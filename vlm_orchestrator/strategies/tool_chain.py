@@ -29,7 +29,7 @@ from .subgoal import SubgoalConfig, SubgoalStrategy
 
 import numpy as np
 
-from vlm_orchestrator.vlm import encode_image_b64, parse_json
+from vlm_orchestrator.vlm import POINT_CONVENTION, encode_image_b64, parse_json, parse_norm_point
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +300,35 @@ grasp() that picks that object up.
 Example: {"tool": "grasp", "args": {"target": "blue block", "stack": true}}"""
 
 
+def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
+    """System-prompt addition requiring ``args.point`` on ``point_tools`` calls."""
+    tools = sorted(point_tools)
+    lines = [
+        "",
+        "",
+        f"POINTS: every {' and '.join(tools)} call also carries `point`: "
+        f"{POINT_CONVENTION}, in the NOW image.",
+    ]
+    if "grasp" in point_tools:
+        lines.append("  - grasp: a point on the object to pick up.")
+    if "place" in point_tools:
+        lines.append(
+            "  - place: where the held object should go — on the destination "
+            "object, or on the open table spot for an empty-space destination."
+        )
+    examples = {
+        "grasp": '{"tool": "grasp", "args": {"target": "red block", "point": [0.42, 0.57]}}',
+        "place": '{"tool": "place", "args": {"destination": "in the blue bowl", '
+                 '"held_object_hint": "red block", "point": [0.63, 0.48]}}',
+    }
+    lines.append(
+        "The examples above omit `point`; here a "
+        f"{' or '.join(tools)} call without it is rejected. Examples:"
+    )
+    lines += [f"  {examples[t]}" for t in tools]
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # User content builder
 # ----------------------------------------------------------------------
@@ -367,8 +396,13 @@ def build_tool_chain_user_content(
 # Response parsing
 # ----------------------------------------------------------------------
 
-def parse_tool_chain_response(raw: str) -> ToolChainDecision:
+def parse_tool_chain_response(
+    raw: str, point_tools: frozenset[str] = frozenset(),
+) -> ToolChainDecision:
     """Parse a VLM response into a :class:`ToolChainDecision`.
+
+    Calls of a tool in ``point_tools`` must carry ``args.point``
+    (normalised ``[x, y]`` in the NOW image); it is stored as a tuple.
 
     Raises:
         ValueError when the JSON is malformed or required fields are
@@ -432,6 +466,12 @@ def parse_tool_chain_response(raw: str) -> ToolChainDecision:
         # phrase itself and is resolved by the VLM-pointing perception
         # layer.  Any `relation` the model emits is ignored downstream.
     # noop: no required args.
+
+    if decision.tool in point_tools:
+        try:
+            decision.args["point"] = parse_norm_point(decision.args.get("point"))
+        except ValueError as e:
+            raise ValueError(f"{decision.tool} needs `args.point`: {e}") from e
 
     # Pairing rule: advance / replan / abort never run a tool.  The
     # strategy will silently drop the tool field anyway (it returns
@@ -723,6 +763,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 g_stack = self._stack_force  # A/B override
             self._activate_grasp_for_tool_chain(
                 obs, state, decision.args.get("target", ""), stack=g_stack,
+                point=decision.args.get("point"),
             )
         elif decision.tool == "place":
             self._activate_place_for_tool_chain(obs, state, decision.args)
@@ -778,6 +819,8 @@ class ToolChainStrategy(SubgoalStrategy):
         # advertise a no-op control.
         if self._stack_mode_enabled:
             system_prompt = system_prompt + _TOOL_CHAIN_STACK_NOTE
+        if self._point_tools:
+            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools)
         try:
             raw = self._vlm_call(system_prompt, user_content)
         except Exception as e:
@@ -796,7 +839,7 @@ class ToolChainStrategy(SubgoalStrategy):
         )
 
         try:
-            decision = parse_tool_chain_response(raw)
+            decision = parse_tool_chain_response(raw, self._point_tools)
         except ValueError as e:
             logger.warning(
                 f"tool_chain: malformed VLM response ({e}); "
@@ -901,6 +944,7 @@ class ToolChainStrategy(SubgoalStrategy):
 
     def _activate_grasp_for_tool_chain(
         self, obs, state, target: str, stack: bool = True,
+        point: tuple[float, float] | None = None,
     ) -> None:
         """Direct grasp activation for tool_chain mode.
 
@@ -933,6 +977,7 @@ class ToolChainStrategy(SubgoalStrategy):
         try:
             state.grasp_tool_executor.start(
                 target_object=target, obs=obs, state=state, stack=stack,
+                point=point,
             )
         except Exception as e:
             logger.error(
@@ -995,7 +1040,7 @@ class ToolChainStrategy(SubgoalStrategy):
         # it directly via vlm_point.  DestinationSpec.relation defaults
         # to "in" but is not consulted in any Z computation under the
         # drop-from-safe-height model.
-        spec = DestinationSpec(target_object=destination)
+        spec = DestinationSpec.for_call(destination, args.get("point"))
         try:
             state.place_tool_executor.start(
                 spec, obs, state,

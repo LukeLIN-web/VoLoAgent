@@ -661,11 +661,16 @@ class OrchestratorProxy:
                 # ---- grasp_with_tool: bypass VLA ----
                 # When a planned grasp is active, generate actions
                 # locally instead of forwarding to the VLA server.
+                # Tool steps run perception and the grasp-server call
+                # (tens of seconds on a busy GPU), so like process() they
+                # run in a thread to keep the client's pings answered.
                 if (
                     getattr(state, "grasp_tool_active", False)
                     and state.grasp_tool_executor is not None
                 ):
-                    response = state.grasp_tool_executor.step(obs, state)
+                    response = await asyncio.to_thread(
+                        state.grasp_tool_executor.step, obs, state,
+                    )
                     response["orchestrator_grasp_tool"] = {
                         "active": True,
                         "phase": state.grasp_tool_phase,
@@ -681,7 +686,9 @@ class OrchestratorProxy:
                     and state.place_tool_executor is not None
                 ):
                     # ---- place_with_tool: bypass VLA ----
-                    response = state.place_tool_executor.step(obs, state)
+                    response = await asyncio.to_thread(
+                        state.place_tool_executor.step, obs, state,
+                    )
                     response["orchestrator_place_tool"] = {
                         "active": True,
                         "phase": state.place_tool_phase,
@@ -840,6 +847,11 @@ class OrchestratorProxy:
                 if getattr(state, "flush_actions", False):
                     response["orchestrator_flush_actions"] = True
                     state.flush_actions = False
+
+                # The strategy is finished: ask the eval client to end the
+                # episode now rather than hold until its time limit.
+                if state.episode_done:
+                    response["__episode_done"] = True
 
                 # Frame-level metadata for annotated videos
                 response["orchestrator_use_front_camera"] = bool(

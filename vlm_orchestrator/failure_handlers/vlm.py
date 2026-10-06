@@ -27,7 +27,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from vlm_orchestrator.vlm import parse_json
+from vlm_orchestrator.vlm import POINT_CONVENTION, parse_json, parse_norm_point
 
 from .base import (
     ACTION_CONTINUE,
@@ -78,8 +78,13 @@ def _build_system_prompt(
     *,
     use_front_camera: bool = False,
     stack_mode_enabled: bool = False,
+    point_tools: frozenset[str] = frozenset(),
+    primary_label: str = "External camera",
 ) -> str:
     """Build the system prompt with the available action vocabulary.
+
+    For each tool in ``point_tools`` the VLM must also give a point in the
+    primary NOW image (``grasp_point`` / ``place_point``).
 
     When ``use_front_camera`` is True, the prompt warns the VLM that
     the front (egocentric_mirrored) camera view is left-right flipped
@@ -113,6 +118,11 @@ def _build_system_prompt(
             "robot is still attempting the correct object — that is "
             'in-progress execution; emit "continue". When firing, set '
             '"grasp_target" to the noun phrase of the correct object.'
+            + (
+                ' Also set "grasp_point" to a point on that object in the '
+                f"NOW {primary_label} image: {POINT_CONVENTION}."
+                if "grasp" in point_tools else ""
+            )
         )
     if ACTION_PLACE in available_actions:
         action_descriptions.append(
@@ -130,7 +140,13 @@ def _build_system_prompt(
             "  3. Open table → \"empty space on the table\".\n"
             "  4. On a surface object → \"on <surface>\" "
             '(e.g. "on the wire rack shelf").\n'
-            "Optionally also set \"place_held_object\" with the noun "
+            + (
+                'Also set "place_point" to where the held object should go '
+                f"in the NOW {primary_label} image (on the destination object, "
+                f"or on the open table spot): {POINT_CONVENTION}.\n"
+                if "place" in point_tools else ""
+            )
+            + "Optionally also set \"place_held_object\" with the noun "
             "phrase of the object in the gripper.\n"
             "LIMITATION: place_tool is unreliable for high containers "
             '(e.g. a shelf, a high vase). For those destinations prefer '
@@ -235,10 +251,13 @@ Output ONLY valid JSON (no markdown, no explanation):
 def _parse_vlm_detection(
     raw: str,
     available_actions: set[str],
+    point_tools: frozenset[str] = frozenset(),
 ) -> HandlerResult:
     """Parse VLM JSON response into a HandlerResult.
 
-    Falls back to ``(in_progress, continue)`` on parse failure.
+    Falls back to ``(in_progress, continue)`` on parse failure; a tool
+    action whose required point (``point_tools``) is missing or off the
+    image falls back to ``continue``.
     """
     try:
         data = parse_json(raw)
@@ -276,6 +295,19 @@ def _parse_vlm_detection(
         )
         action = ACTION_CONTINUE
 
+    points = {"grasp": None, "place": None}
+    for tool, act in (("grasp", ACTION_GRASP), ("place", ACTION_PLACE)):
+        if action != act or tool not in point_tools:
+            continue
+        try:
+            points[tool] = parse_norm_point(data.get(f"{tool}_point"))
+        except ValueError as e:
+            logger.warning(
+                f"  VLM detection: {act} needs {tool}_point ({e}); "
+                f"defaulting to continue"
+            )
+            action = ACTION_CONTINUE
+
     if place_relation not in ("in", "on", "on_top_of"):
         logger.warning(
             f"  VLM detection: invalid place_relation {place_relation!r}, "
@@ -293,6 +325,8 @@ def _parse_vlm_detection(
         place_relation=place_relation,
         place_held_object=place_held_object,
         place_stack=place_stack,
+        grasp_point=points["grasp"],
+        place_point=points["place"],
     )
 
 
@@ -325,6 +359,9 @@ class VLMFailureHandler(FailureHandler):
     recovery_mode:
         Controls available actions: ``"replan"``, ``"replan_grasp"``,
         or ``"grasp"``.
+    point_tools:
+        Tools (``"grasp"`` / ``"place"``) whose actions must carry a point
+        in the primary NOW image (their ``gt_sim`` resolves targets from it).
     """
 
     def __init__(
@@ -339,6 +376,7 @@ class VLMFailureHandler(FailureHandler):
         extra_labels: list[str] | None = None,
         use_front_camera: bool = False,
         stack_mode_enabled: bool = False,
+        point_tools: frozenset[str] = frozenset(),
     ):
         self._vlm_call = vlm_call_fn
         self._build_check_message = image_builder_fn
@@ -354,10 +392,13 @@ class VLMFailureHandler(FailureHandler):
                 f"expected one of {list(_ACTION_SETS)}"
             )
         self._available_actions = _ACTION_SETS[recovery_mode]
+        self._point_tools = point_tools
         self._system_prompt = _build_system_prompt(
             self._available_actions,
             use_front_camera=use_front_camera,
             stack_mode_enabled=stack_mode_enabled,
+            point_tools=point_tools,
+            primary_label=primary_label,
         )
 
         # Per-episode state — sim step at which the last VLM check
@@ -452,7 +493,7 @@ class VLMFailureHandler(FailureHandler):
         logger.info(f"  VLM detect raw ({elapsed:.1f}s): {raw[:500]}")
 
         # Parse result
-        result = _parse_vlm_detection(raw, self._available_actions)
+        result = _parse_vlm_detection(raw, self._available_actions, self._point_tools)
         result.extra["vlm_latency_s"] = round(elapsed, 2)
         result.extra["vlm_raw"] = raw
 
@@ -486,6 +527,8 @@ class VLMFailureHandler(FailureHandler):
             "subgoal_idx": sg_idx,
             "subgoal": current_sg,
             "grasp_target": result.grasp_target,
+            "grasp_point": result.grasp_point,
+            "place_point": result.place_point,
             "vlm_latency_s": round(elapsed, 2),
             "vlm_raw": raw[:500],
             "step_count": state.infer_count,

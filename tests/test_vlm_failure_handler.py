@@ -142,6 +142,25 @@ class TestParseVLMDetection:
         assert r.status == STATUS_COMPLETE
         assert r.action == ACTION_NEXT
 
+    def test_point_tool_action_keeps_its_point(self):
+        raw = ('{"status": "failure", "action": "grasp_tool", "reason": "wrong", '
+               '"grasp_target": "red block", "grasp_point": [0.4, 0.6]}')
+        r = _parse_vlm_detection(raw, _ACTION_SETS["replan_tools"], frozenset({"grasp"}))
+        assert r.action == ACTION_GRASP
+        assert r.grasp_point == (0.4, 0.6)
+
+    def test_point_tool_action_without_point_continues(self):
+        raw = ('{"status": "failure", "action": "place_tool", "reason": "wrong", '
+               '"place_destination": "in the bowl"}')
+        r = _parse_vlm_detection(raw, _ACTION_SETS["replan_tools"], frozenset({"place"}))
+        assert r.action == ACTION_CONTINUE
+        assert r.place_point is None
+
+    def test_prompt_asks_for_points_only_for_point_tools(self):
+        grasp_only = _build_system_prompt(_ACTION_SETS["replan_tools"], point_tools=frozenset({"grasp"}))
+        assert '"grasp_point"' in grasp_only and '"place_point"' not in grasp_only
+        assert '"grasp_point"' not in _build_system_prompt(_ACTION_SETS["replan_tools"])
+
 
 # ======================================================================
 # HandlerResult validation

@@ -14,6 +14,7 @@ from vlm_orchestrator.perception.gt_segmentation import (
     IsaacLabSegProvider,
     RobosuiteSegProvider,
     create_seg_provider,
+    gt_object_mask,
 )
 from vlm_orchestrator.grasp.tool import GraspSegMode, GraspToolExecutor
 
@@ -294,61 +295,30 @@ class TestGraspToolGTSIM:
         assert GraspSegMode.GT_SIM == "gt_sim"
         assert GraspSegMode("gt_sim") == GraspSegMode.GT_SIM
 
-    def test_get_gt_mask_from_obs(self):
-        """Test _get_gt_mask when eval client provides body_ids buffer.
-
-        Centroid matching projects gt_state position → pixel, then
-        picks the seg-buffer instance whose centroid is nearest.
-        The identity camera (extrinsic=I) projects (0.3, 0.0, 0.1)
-        to pixel (1500, 500) which clips to image bounds, but the
-        centroid of body_id=5 at (105, 75) should still be matched
-        as the closest candidate.
-        """
-        executor = GraspToolExecutor(
-            seg_mode=GraspSegMode.GT_SIM,
-            env_mode="libero",
-        )
-
-        # Simulate body_ids seg buffer with known object positions
+    @staticmethod
+    def _obs():
+        """LIBERO-style id image: -1 background, two objects and the table."""
         body_ids = np.full((256, 256), -1, dtype=np.int32)
-        body_ids[50:100, 80:130] = 5  # red_block body_id
-
-        obs = {
+        body_ids[40:80, 60:120] = 5     # red_block
+        body_ids[150:180, 100:140] = 7  # blue_cup
+        body_ids[200:256, :] = 2        # table
+        return {
             "gt_seg/body_ids": body_ids,
-            "gt_seg/obj_body_id": {"red_block": 5},
-            "gt_state": {
-                "objects": {
-                    "red_block": {"pos": [0.3, 0.0, 0.1]},
-                },
-                "subtask": {"score": 0.5},
-            },
-            # Camera info for centroid projection
-            "observation/camera_extrinsic": np.eye(4).tolist(),
-            "observation/camera_K": np.array([
-                [500, 0, 128],
-                [0, 500, 128],
-                [0, 0, 1],
-            ]).tolist(),
+            "gt_seg/obj_body_id": {"red_block": 5, "blue_cup": 7, "table": 2},
         }
 
-        result_mask, bbox, score = executor._get_gt_mask(
-            obs, "red_block", (256, 256)
-        )
+    def test_mask_is_exactly_the_named_object(self):
+        obs = self._obs()
+        mask = gt_object_mask(obs, "blue_cup", front=False)
+        assert np.array_equal(mask, obs["gt_seg/body_ids"] == 7)
 
-        assert result_mask.shape == (256, 256)
-        assert result_mask.sum() > 0  # pixels matched
-        assert score == 1.0
+    def test_missing_id_image_raises(self):
+        with pytest.raises(RuntimeError, match="gt_sim needs"):
+            gt_object_mask({}, "red_block", front=False)
 
-    def test_get_gt_mask_no_data_raises(self):
-        """Test that _get_gt_mask raises when no seg buffer or gt_state."""
-        executor = GraspToolExecutor(
-            seg_mode=GraspSegMode.GT_SIM,
-            env_mode="libero",
-        )
-        obs = {}  # no gt_seg, no gt_state
-
-        with pytest.raises(RuntimeError, match="could not locate"):
-            executor._get_gt_mask(obs, "red_block", (256, 256))
+    def test_unknown_name_raises(self):
+        with pytest.raises(ValueError, match="not a scene object"):
+            gt_object_mask(self._obs(), "red", front=False)
 
     def test_mask_to_bbox(self):
         mask = np.zeros((100, 100), dtype=bool)
@@ -361,87 +331,34 @@ class TestGraspToolGTSIM:
         bbox = GraspToolExecutor._mask_to_bbox(mask)
         assert bbox == (0, 0, 0, 0)
 
-    def test_get_gt_mask_from_body_ids_buffer(self):
-        """Test _get_gt_mask when eval client sends raw body-ID seg image.
+    def test_scene_object_name_is_taken_as_is(self):
+        executor = GraspToolExecutor(seg_mode=GraspSegMode.GT_SIM, env_mode="libero")
+        assert executor._resolve_gt_target(self._obs(), "red_block") == "red_block"
 
-        Centroid matching requires gt_state + camera info to project
-        3D position → pixel, then matches nearest seg-buffer instance.
-        """
-        executor = GraspToolExecutor(
-            seg_mode=GraspSegMode.GT_SIM,
-            env_mode="libero",
-        )
+    def test_phrase_resolves_through_the_masters_point(self):
+        executor = GraspToolExecutor(seg_mode=GraspSegMode.GT_SIM, env_mode="libero")
+        obs = self._obs()
+        with pytest.raises(RuntimeError, match="gave no point"):
+            executor._resolve_gt_target(obs, "the blue cup")
+        executor._target_point = (120 / 256, 165 / 256)  # on the cup
+        assert executor._resolve_gt_target(obs, "the blue cup") == "blue_cup"
+        executor._target_point = (125 / 256, 60 / 256)  # a few px beside the block
+        assert executor._resolve_gt_target(obs, "red block") == "red_block"
+        executor._target_point = (10 / 256, 10 / 256)  # far from every object
+        with pytest.raises(RuntimeError, match="not on a scene object"):
+            executor._resolve_gt_target(obs, "red block")
 
-        # Simulate raw segmentation buffer from eval client
-        body_ids = np.full((256, 256), -1, dtype=np.int32)
-        body_ids[40:80, 60:120] = 5   # red_block body
-        body_ids[150:180, 100:140] = 7  # blue_cup body
+    def test_grasp_verdict_needs_held_and_lifted(self):
+        executor = GraspToolExecutor(seg_mode=GraspSegMode.GT_SIM, env_mode="libero")
 
-        obs = {
-            "gt_seg/body_ids": body_ids,
-            "gt_seg/obj_body_id": {
-                "red_block": 5,
-                "blue_cup": 7,
-                "table": 2,
-            },
-            "gt_state": {
-                "objects": {
-                    "red_block": {"pos": [0.3, 0.0, 0.1]},
-                    "blue_cup": {"pos": [0.1, 0.1, 0.1]},
-                },
-                "subtask": {"score": 0.5},
-            },
-            "observation/camera_extrinsic": np.eye(4).tolist(),
-            "observation/camera_K": np.array([
-                [500, 0, 128],
-                [0, 500, 128],
-                [0, 0, 1],
-            ]).tolist(),
-        }
+        def obs(z, contacts):
+            return {"gt_state": {
+                "objects": {"red_block": {"pos": [0.3, 0.0, z]}},
+                "robot": {"objects_in_contact_raw": contacts},
+            }}
 
-        mask, bbox, score = executor._get_gt_mask(obs, "red_block", (256, 256))
-        assert mask.shape == (256, 256)
-        assert mask.sum() > 0  # pixels matched
-        assert score == 1.0
-
-    def test_get_gt_mask_body_ids_fuzzy_match(self):
-        """Fuzzy name matching with body-ID buffer."""
-        executor = GraspToolExecutor(
-            seg_mode=GraspSegMode.GT_SIM,
-            env_mode="libero",
-        )
-
-        body_ids = np.full((256, 256), -1, dtype=np.int32)
-        body_ids[50:100, 50:100] = 5
-
-        obs = {
-            "gt_seg/body_ids": body_ids,
-            "gt_seg/obj_body_id": {"alphabet_soup_1_main": 5},
-            "gt_state": {
-                "objects": {
-                    "alphabet_soup_1_main": {"pos": [0.1, 0.0, 0.1]},
-                },
-                "subtask": {"score": 0.5},
-            },
-            "observation/camera_extrinsic": np.eye(4).tolist(),
-            "observation/camera_K": np.array([
-                [500, 0, 128],
-                [0, 500, 128],
-                [0, 0, 1],
-            ]).tolist(),
-        }
-
-        # "alphabet_soup" should fuzzy-match "alphabet_soup_1_main"
-        mask, bbox, score = executor._get_gt_mask(
-            obs, "alphabet_soup", (256, 256)
-        )
-        assert mask.sum() > 0
-
-    def test_resolve_gt_body_id(self):
-        mapping = {"red_block": 5, "red_block_main": 5, "blue_cup": 7}
-        assert GraspToolExecutor._resolve_gt_body_id("red_block", mapping) == 5
-        assert GraspToolExecutor._resolve_gt_body_id("blue_cup", mapping) == 7
-        # Fuzzy
-        assert GraspToolExecutor._resolve_gt_body_id("blue", mapping) == 7
-        # Not found
-        assert GraspToolExecutor._resolve_gt_body_id("nonexistent", mapping) is None
+        assert executor._judge_grasp(obs(0.15, ["red_block"])) is None  # no target resolved
+        executor._gt_name, executor._target_z0 = "red_block", 0.10
+        assert executor._judge_grasp(obs(0.15, ["red_block"]))[0] is True
+        assert executor._judge_grasp(obs(0.11, ["red_block"]))[0] is False
+        assert executor._judge_grasp(obs(0.15, []))[0] is False

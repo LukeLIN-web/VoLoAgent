@@ -94,45 +94,67 @@ def _fake_obs(*, gripper_closed: bool = True, with_depth: bool = True) -> dict:
 # ----------------------------------------------------------------------
 
 
-def test_gt_sim_projects_object_to_image_centre():
-    pt = point_to_place_2d(
+def _gt_obs() -> dict:
+    """gt_state plus a default-camera id image: red_bowl covers the centre."""
+    ids = np.zeros((480, 640), dtype=np.uint8)
+    ids[200:280, 280:360] = 1
+    return {
+        "gt_state": _gt_state(),
+        "gt_seg/body_ids": ids,
+        "gt_seg/obj_body_id": {"red_bowl": 1},
+    }
+
+
+def _gt_sim_point(target_phrase: str, obs: dict | None, point=None) -> PointToPlace2D:
+    return point_to_place_2d(
         image_rgb=np.zeros((480, 640, 3), dtype=np.uint8),
         instruction="put the cube in the red bowl",
-        target_phrase="red_bowl",
+        target_phrase=target_phrase,
         seg_mode="gt_sim",
-        gt_state=_gt_state(),
+        obs=obs,
+        point=point,
         intrinsics=_intrinsics(),
         cam_to_world=_cam_to_world(),
     )
+
+
+def test_gt_sim_scene_object_name_projects_its_position():
+    pt = _gt_sim_point("red_bowl", _gt_obs())
     assert pt.source == "gt_sim"
     assert abs(pt.x_norm - 0.5) < 0.05
     assert abs(pt.y_norm - 0.5) < 0.05
 
 
-def test_gt_sim_missing_object_raises():
-    with pytest.raises(PerceptionFailure):
-        point_to_place_2d(
-            image_rgb=np.zeros((480, 640, 3), dtype=np.uint8),
-            instruction="...",
-            target_phrase="nonexistent_thing",
-            seg_mode="gt_sim",
-            gt_state=_gt_state(),
-            intrinsics=_intrinsics(),
-            cam_to_world=_cam_to_world(),
-        )
+def test_gt_sim_point_on_an_object_uses_its_position():
+    pt = _gt_sim_point("in the red bowl", _gt_obs(), point=(285 / 640, 205 / 480))  # bowl rim
+    assert pt.source == "gt_sim"
+    assert abs(pt.x_norm - 0.5) < 0.05
+    assert abs(pt.y_norm - 0.5) < 0.05
+
+
+def test_gt_sim_point_on_open_table_is_the_destination():
+    pt = _gt_sim_point("empty space on the table", _gt_obs(), point=(0.1, 0.9))
+    assert pt.source == "gt_sim:point"
+    assert (pt.x_norm, pt.y_norm) == (0.1, 0.9)
+
+
+def test_gt_sim_phrase_without_point_raises():
+    with pytest.raises(PerceptionFailure, match="no destination point"):
+        _gt_sim_point("in the red bowl", _gt_obs())
+
+
+def test_a_call_with_a_point_is_a_point_destination():
+    spec = DestinationSpec.for_call("in the red bowl", (0.4, 0.5))
+    spec.validate()
+    assert (spec.target_object, spec.target_point_2d) == (None, (0.4, 0.5))
+    phrase = DestinationSpec.for_call("in the red bowl")
+    phrase.validate()
+    assert phrase.target_object == "in the red bowl"
 
 
 def test_gt_sim_without_gt_state_raises():
     with pytest.raises(PerceptionFailure):
-        point_to_place_2d(
-            image_rgb=np.zeros((480, 640, 3), dtype=np.uint8),
-            instruction="...",
-            target_phrase="red_bowl",
-            seg_mode="gt_sim",
-            gt_state=None,
-            intrinsics=_intrinsics(),
-            cam_to_world=_cam_to_world(),
-        )
+        _gt_sim_point("red_bowl", None)
 
 
 # ----------------------------------------------------------------------

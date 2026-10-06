@@ -112,6 +112,27 @@ def parse_json(text: str) -> dict:
     raise ValueError(f"Cannot parse JSON from: {text[:200]}")
 
 
+# How prompts ask a VLM for an image point; parse_norm_point reads the answer.
+POINT_CONVENTION = (
+    "[x, y] normalised to [0, 1] (x: 0 = left edge, 1 = right edge; "
+    "y: 0 = top edge, 1 = bottom edge)"
+)
+
+
+def parse_norm_point(value) -> tuple[float, float]:
+    """A normalised image point ``[x, y]`` (see ``POINT_CONVENTION``).
+
+    Raises ValueError for anything else, including points off the image.
+    """
+    try:
+        x, y = (float(v) for v in value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"point must be [x, y] numbers; got {value!r}") from e
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        raise ValueError(f"point must be normalised to [0, 1]; got {value!r}")
+    return x, y
+
+
 # --------------------------------------------------------------------------- #
 #  Prompt: direct rewrite (no reasoning trace)
 # --------------------------------------------------------------------------- #

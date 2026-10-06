@@ -26,36 +26,21 @@ Supported simulators
   ``data_types``.  The annotator produces a ``(H, W)`` integer array
   of instance IDs that can be mapped to object names via the USD stage.
 
-Usage in eval clients
-~~~~~~~~~~~~~~~~~~~~~
-
-Each eval client creates the appropriate provider and calls
-``render_mask()`` to get a binary mask for a target object::
-
-    # LIBERO example:
-    from vlm_orchestrator.perception.gt_segmentation import RobosuiteSegProvider
-
-    seg = RobosuiteSegProvider(env, camera_name="agentview")
-    mask = seg.render_mask("alphabet_soup_1")  # (H, W) bool
-    wire_obs["gt_seg/mask"] = mask
-    wire_obs["gt_seg/target"] = "alphabet_soup_1"
-
-The proxy's grasp tool (``GraspSegMode.GT_SIM``) reads these keys
-instead of running GDino + SAM2.
-
 Wire format
 ~~~~~~~~~~~
 
-When GT segmentation is active, eval clients add two keys to the wire
-observation dict:
+When GT segmentation is active, eval clients add to the wire observation:
 
-- ``gt_seg/mask``: ``np.ndarray`` shape ``(H, W)``, dtype ``bool`` —
-  binary mask of the target object.
-- ``gt_seg/target``: ``str`` — name of the segmented object (for
-  verification / logging).
+- ``gt_seg/body_ids``: ``(H, W)`` (or ``(H, W, 1)``) integer id image of the
+  default camera; ``gt_seg/body_ids_front`` for the front camera.
+- ``gt_seg/obj_body_id``: ``{object name: id}`` — the legend of those images,
+  one entry per nameable scene object.
 
-These keys are stripped by the proxy before forwarding to the VLA
-policy server (the policy never sees them).
+The LIBERO client builds them with :class:`RobosuiteSegProvider`; RoboLab's
+VoLo client forwards its instance-segmentation object-id images. The grasp
+and place tools (``gt_sim``) read them through
+:func:`gt_object_mask` / :func:`gt_object_at`. The proxy strips every
+``gt_seg/`` key before forwarding to the VLA policy server.
 """
 
 from __future__ import annotations
@@ -66,6 +51,60 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ======================================================================
+# Wire-side readers (proxy)
+# ======================================================================
+
+
+def _id_image(obs: dict, front: bool) -> tuple[np.ndarray, dict]:
+    """The ``(H, W)`` id image of a camera and its ``{name: id}`` legend."""
+    ids = obs.get("gt_seg/body_ids_front" if front else "gt_seg/body_ids")
+    legend = obs.get("gt_seg/obj_body_id")
+    if ids is None or legend is None:
+        raise RuntimeError(
+            "gt_sim needs gt_seg/body_ids%s and gt_seg/obj_body_id from the "
+            "eval client" % ("_front" if front else "")
+        )
+    ids = np.asarray(ids)
+    return ids.reshape(ids.shape[:2]), legend
+
+
+def gt_object_mask(obs: dict, name: str, *, front: bool) -> np.ndarray:
+    """Pixel-exact ``(H, W)`` bool mask of scene object ``name``.
+
+    Raises ``RuntimeError`` when the eval client sends no id images and
+    ``ValueError`` when ``name`` is not one of its scene objects.
+    """
+    ids, legend = _id_image(obs, front)
+    if name not in legend:
+        raise ValueError(
+            f"{name!r} is not a scene object; scene objects: {sorted(legend)}"
+        )
+    return ids == legend[name]
+
+
+def gt_object_at(
+    obs: dict, point: tuple[float, float], *, front: bool, radius_px: int,
+) -> str | None:
+    """The scene object at a normalised image point ``(x, y)`` in [0, 1].
+
+    The object under the pixel; off every object, the one with the nearest
+    pixel within ``radius_px``; otherwise None.
+    """
+    ids, legend = _id_image(obs, front)
+    names = {int(v): k for k, v in legend.items()}
+    h, w = ids.shape
+    u, v = min(int(point[0] * w), w - 1), min(int(point[1] * h), h - 1)
+    if int(ids[v, u]) in names:
+        return names[int(ids[v, u])]
+    ys, xs = np.nonzero(np.isin(ids, list(names)))
+    if len(xs) == 0:
+        return None
+    d2 = (xs - u) ** 2 + (ys - v) ** 2
+    i = int(np.argmin(d2))
+    return names[int(ids[ys[i], xs[i]])] if d2[i] <= radius_px ** 2 else None
 
 
 # ======================================================================

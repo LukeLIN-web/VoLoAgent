@@ -90,13 +90,16 @@ def main():
         choices=[
             "rewrite", "passthrough", "adaptive",
             "subgoal", "scene_edit", "subgoal_scene_edit",
-            "next_goal", "tool_chain",
+            "next_goal", "tool_chain", "grasp_probe",
         ],
         default="subgoal",
         help="Operation mode: "
              "subgoal (decompose + periodic check, recommended), "
              "tool_chain (no VLA at all; VLM picks grasp/place tools and "
              "checks status only after each tool finishes), "
+             "grasp_probe (no VLM, no VLA; grasps every scene object once "
+             "per episode to measure the grasp tool, needs --grasp-seg-mode "
+             "gt_sim), "
              "next_goal (VLM predicts next step on-the-fly, no upfront decomposition), "
              "passthrough (never). "
              "Archived exploration modes: rewrite (single-shot rewrite), "
@@ -733,17 +736,22 @@ def main():
     # detector / recovery-mode pipeline is irrelevant.  Reject those
     # flags explicitly so the user is not surprised by them being silently
     # ignored.
-    if args.mode == "tool_chain":
+    if args.mode in _TOOL_CHAIN_MODES:
         if args.failure_monitor is not None:
             parser.error(
-                "--mode tool_chain does not use --failure-monitor "
+                f"--mode {args.mode} does not use --failure-monitor "
                 "(the post-tool VLM check supplants it)."
             )
         if args.recovery_mode is not None:
             parser.error(
-                "--mode tool_chain does not use --recovery-mode "
+                f"--mode {args.mode} does not use --recovery-mode "
                 "(the per-cycle VLM step decides advance/replan/abort)."
             )
+    if args.mode == "grasp_probe" and args.grasp_seg_mode != "gt_sim":
+        parser.error(
+            "--mode grasp_probe grasps scene objects by name and needs "
+            "--grasp-seg-mode gt_sim."
+        )
 
     # Auto-default --recovery-mode based on --failure-monitor
     if args.recovery_mode is None:
@@ -819,8 +827,10 @@ def main():
     proxy.serve_forever()
 
 
+# Modes that run the tool_chain loop: tool actions only, never the VLA.
+_TOOL_CHAIN_MODES = {"tool_chain", "grasp_probe"}
 # Modes whose grasp/place tools route trajectories through the motion planner.
-_GRASP_TOOL_MODES = {"tool_chain", "subgoal", "subgoal_scene_edit", "scene_edit"}
+_GRASP_TOOL_MODES = {*_TOOL_CHAIN_MODES, "subgoal", "subgoal_scene_edit", "scene_edit"}
 _GRASP_RECOVERY_MODES = {
     "grasp", "grasp_first", "vlm_grasp", "replan_grasp", "replan_tools",
 }
@@ -844,7 +854,7 @@ def _preflight_motion_planner(args):
     mode = getattr(args, "mode", None)
     recovery = getattr(args, "recovery_mode", None)
     uses_grasp = mode in _GRASP_TOOL_MODES and (
-        mode == "tool_chain" or recovery in _GRASP_RECOVERY_MODES
+        mode in _TOOL_CHAIN_MODES or recovery in _GRASP_RECOVERY_MODES
     )
     if not uses_grasp:
         return
@@ -902,7 +912,7 @@ def _build_protocols(args):
     # real VLA backend and use an in-process stub that synthesizes the
     # openpi metadata handshake.  Saves one GPU (no policy-server task)
     # and removes the need for vla_stub_server.py on local runners.
-    if args.mode == "tool_chain":
+    if args.mode in _TOOL_CHAIN_MODES:
         from vlm_orchestrator.protocols.stub import StubBackend
         backend = StubBackend()
     elif args.backend == "openpi-ws":
@@ -1038,7 +1048,8 @@ def _build_strategy(args):
         hitl_server = HITLServer(hitl_state, port=args.hitl_port)
         hitl_server.start()
 
-    if args.mode == "tool_chain":
+    if args.mode in _TOOL_CHAIN_MODES:
+        from vlm_orchestrator.strategies.grasp_probe import GraspProbeStrategy
         from vlm_orchestrator.strategies.tool_chain import (
             ToolChainConfig,
             ToolChainStrategy,
@@ -1057,7 +1068,10 @@ def _build_strategy(args):
             ),
         )
         initial_strategy = _build_initial_strategy(args, ctx)
-        return ToolChainStrategy(
+        strategy_cls = (
+            GraspProbeStrategy if args.mode == "grasp_probe" else ToolChainStrategy
+        )
+        return strategy_cls(
             ctx, tc_config, initial_strategy=initial_strategy,
             hitl_state=hitl_state,
             grasp_seg_mode=args.grasp_seg_mode,

@@ -114,6 +114,9 @@ class SessionState:
     tool_chain_subgoal_calls: int = 0     # tool calls on the current subgoal
     tool_chain_tool_calls: int = 0        # tool calls in the episode
     tool_chain_task_done: bool = False    # last subgoal advanced
+    # The strategy has nothing left to do this episode (grasp_probe); the
+    # proxy then asks the eval client to end it early (``__episode_done``).
+    episode_done: bool = False
     tool_chain_aborted: bool = False      # VLM said abort or cap hit
     # Last tool's outcome (None on the first cycle).  Read by the
     # next vlm_step call so the VLM can reason about what just
