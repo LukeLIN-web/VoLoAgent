@@ -45,6 +45,13 @@ def _default_grasp_url() -> str:
     return f"http://{host}:{port}"
 
 
+def _default_perception_url(grasp_url: str) -> str:
+    """The server answering /detect, /segment and /detect_and_segment: the
+    grasp server itself unless PERCEPTION_SERVER_URL points at a separate
+    perception-only instance (server.py without --gripper-config)."""
+    return os.environ.get("PERCEPTION_SERVER_URL", grasp_url)
+
+
 class GraspClient:
     """HTTP client for the grasp prediction server."""
 
@@ -54,6 +61,7 @@ class GraspClient:
         timeout: float = _DEFAULT_TIMEOUT,
     ):
         self._url = (url or _default_grasp_url()).rstrip("/")
+        self._perception_url = _default_perception_url(self._url).rstrip("/")
         self._timeout = timeout
 
     # ------------------------------------------------------------------
@@ -343,7 +351,7 @@ class GraspClient:
         )
 
         resp = requests.post(
-            f"{self._url}/detect",
+            f"{self._perception_url}/detect",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
             timeout=self._timeout,
@@ -395,7 +403,7 @@ class GraspClient:
         )
 
         resp = requests.post(
-            f"{self._url}/detect_and_segment",
+            f"{self._perception_url}/detect_and_segment",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
             timeout=self._timeout,
@@ -444,7 +452,7 @@ class GraspClient:
         body = self._pack_npz(**arrays)
 
         resp = requests.post(
-            f"{self._url}/segment",
+            f"{self._perception_url}/segment",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
             timeout=self._timeout,

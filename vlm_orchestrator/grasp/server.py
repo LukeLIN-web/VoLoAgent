@@ -400,7 +400,7 @@ def compute_grasp_core(
 
 
 def build_app(
-    gripper_config: str,
+    gripper_config: str | None,
     enable_sam2: bool = False,
     sam2_model: str = "facebook/sam2.1-hiera-small",
     enable_sam3: bool = False,
@@ -415,7 +415,11 @@ def build_app(
     """Create the FastAPI app and load models."""
 
     # ---- load models at import time (before first request) ----
-    _load_graspgen(gripper_config)
+    # No gripper config: a perception-only instance (GDino / SAM2 / SAM3 in an
+    # env with a newer torch than GraspGen's); the grasp tool reaches it
+    # through PERCEPTION_SERVER_URL (see client.py).
+    if gripper_config:
+        _load_graspgen(gripper_config)
     if enable_sam2:
         from vlm_orchestrator.perception import sam2 as _sam2_mod
         _sam2_mod.load(sam2_model)
@@ -450,7 +454,7 @@ def build_app(
     @app.get("/health")
     async def health():
         from vlm_orchestrator.perception import sam2 as _sam2_mod
-        models = ["graspgen"]
+        models = ["graspgen"] if _graspgen_sampler is not None else []
         if _gdino_detector is not None:
             models.append("gdino")
         if _sam2_mod.is_loaded():
@@ -923,9 +927,10 @@ def main():
         help="Host to bind to (default: 0.0.0.0)",
     )
     parser.add_argument(
-        "--gripper-config", required=True,
+        "--gripper-config", default=None,
         help="Path to GraspGen gripper YAML config "
-             "(e.g. graspgen_franka_panda.yml)",
+             "(e.g. graspgen_franka_panda.yml); omit for a perception-only "
+             "server (no /compute_grasp)",
     )
     parser.add_argument(
         "--enable-sam2", action="store_true",
