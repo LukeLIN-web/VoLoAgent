@@ -311,6 +311,18 @@ def compute_grasp_core(
         pad_idx = np.random.choice(len(obj_pts), MIN_OBJ_POINTS - len(obj_pts), replace=True)
         obj_pts = np.concatenate([obj_pts, obj_pts[pad_idx]], axis=0)
 
+    # ---- Subsample object points if too many ----
+    # A loose detector mask (a whole table) gives 10^5 object points, on which
+    # the PointNet kernels OOM or fail to launch; GraspGen needs a few thousand.
+    MAX_OBJ_POINTS = 8192
+    if len(obj_pts) > MAX_OBJ_POINTS:
+        logger.warning(
+            f"{len(obj_pts)} object points — subsampling to {MAX_OBJ_POINTS}"
+        )
+        obj_pts = obj_pts[np.random.default_rng(0).choice(
+            len(obj_pts), MAX_OBJ_POINTS, replace=False,
+        )]
+
     logger.info(
         f"  GraspGen input: {len(obj_pts)} object pts, "
         f"{len(pts)} scene pts, mask_px={int(mask_array.sum())}"
