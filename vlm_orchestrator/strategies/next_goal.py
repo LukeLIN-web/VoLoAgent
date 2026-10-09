@@ -736,8 +736,6 @@ class NextGoalStrategy(OrchestrationStrategy):
 
         # Lazy OpenAI-compatible client
         self._client = None
-        self._call_count = 0
-        self._last_api_usage: dict | None = None  # set as side-effect in _vlm_call
 
         # Validate template name early — better error than a KeyError later
         if config.template_name not in NEXT_ACTION_TEMPLATE:
@@ -852,11 +850,6 @@ class NextGoalStrategy(OrchestrationStrategy):
                 "NextGoal: VLM response truncated "
                 f"(max_tokens={max_tokens or self.config.vlm_max_tokens})"
             )
-        usage = response.usage
-        self._last_api_usage = {
-            "input_tokens": usage.prompt_tokens if usage else None,
-            "output_tokens": usage.completion_tokens if usage else None,
-        }
         content = choice.message.content
         return content.strip() if content is not None else ""
 
@@ -1091,10 +1084,6 @@ class NextGoalStrategy(OrchestrationStrategy):
             log_entry["check_interval"] = self.config.check_interval
         state.log(log_entry)
 
-        # Write per-call log for the API backend.
-        if not self._use_ember:
-            self._write_vlm_log(state, user_content, raw, elapsed)
-
         return obs, state
 
     def _save_vlm_images(
@@ -1142,52 +1131,3 @@ class NextGoalStrategy(OrchestrationStrategy):
                 )
         except Exception as e:
             logger.warning(f"NextGoal: failed to save VLM images: {e}")
-
-    def _write_vlm_log(
-        self,
-        state: SessionState,
-        user_content: list[dict],
-        response: str,
-        elapsed: float,
-    ) -> None:
-        """Append one VLM call record to vlm_calls.jsonl in the episode dir."""
-        import json
-        from datetime import datetime, timezone
-
-        if not state.episode_log_dir:
-            return
-
-        self._call_count += 1
-
-        user_text_parts = []
-        n_images = 0
-        for item in user_content:
-            if item.get("type") == "text":
-                user_text_parts.append(item["text"])
-            elif item.get("type") == "image_url":
-                n_images += 1
-
-        usage = self._last_api_usage or {}
-        input_tokens = usage.get("input_tokens")
-        output_tokens = usage.get("output_tokens")
-
-        record = {
-            "call_id": self._call_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "model": self.config.vlm_model,
-            "user_text": "\n".join(user_text_parts),
-            "n_images": n_images,
-            "response": response,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "elapsed_s": round(elapsed, 2),
-        }
-        if input_tokens and output_tokens:
-            record["tok_per_s"] = round(output_tokens / max(elapsed, 0.01), 1)
-
-        log_path = os.path.join(state.episode_log_dir, "vlm_calls.jsonl")
-        try:
-            with open(log_path, "a") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.warning(f"NextGoal: failed to write vlm_calls.jsonl: {e}")

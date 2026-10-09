@@ -10,10 +10,16 @@ Also hosts shared VLM utility functions (:func:`encode_image_b64`,
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import io
 import json
 import logging
+import os
 import re
+import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -27,14 +33,22 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 
+# Model names match with or without a provider prefix: "gpt-5.5" (direct to
+# OpenAI) and "openai/gpt-5.5" (via a gateway).
+# OpenAI reasoning families: gpt-5 and later (gpt-5, gpt-5.5, gpt-6-…), o-series.
+_OPENAI_REASONING = r"gpt-(?:[5-9]|\d\d)(?:\.\d+)?|o[134]"
 # Models that reject `temperature` (deprecated by the provider). Includes
 # OpenAI reasoning models AND newer Claude (≥ 4.7).
 _NO_TEMPERATURE_RE = re.compile(
-    r"/(gpt-5(?:\.\d+)?|o[134]|(?:bedrock-)?claude-opus-4-(?:[7-9]|\d\d))(?:[-/]|$)"
+    rf"(?:^|/)(?:{_OPENAI_REASONING}|(?:bedrock-)?claude-opus-4-(?:[7-9]|\d\d))(?:[-/]|$)"
 )
-# Subset that accepts the OpenAI `reasoning_effort` parameter — gpt-5+, o-series.
+# Subset that accepts the OpenAI `reasoning_effort` parameter.
 # Claude 4.7+ rejects this param (uses its own `thinking` config instead).
-_OPENAI_REASONING_RE = re.compile(r"/(gpt-5(?:\.\d+)?|o[134])(?:[-/]|$)")
+_OPENAI_REASONING_RE = re.compile(rf"(?:^|/)(?:{_OPENAI_REASONING})(?:[-/]|$)")
+
+_IMAGE_EXT = {"image/jpeg": "jpg", "image/png": "png"}
+_call_log_dir: str | os.PathLike | None = None
+_call_log_lock = threading.Lock()
 
 
 def is_reasoning_model(model: str) -> bool:
@@ -43,15 +57,73 @@ def is_reasoning_model(model: str) -> bool:
     return bool(_NO_TEMPERATURE_RE.search(model))
 
 
+def set_call_log_dir(path: str | os.PathLike | None) -> None:
+    """Directory where :func:`chat_create` records its calls; None stops recording."""
+    global _call_log_dir
+    _call_log_dir = path
+
+
+def _save_image(log_dir: str | os.PathLike, data_url: str) -> str:
+    """Write a data-URL image once to ``<log_dir>/vlm_images/<sha1 of bytes>.<ext>``;
+    return that path relative to ``log_dir``."""
+    mime, _, b64 = data_url.removeprefix("data:").partition(";base64,")
+    data = base64.b64decode(b64)
+    rel = f"vlm_images/{hashlib.sha1(data).hexdigest()}.{_IMAGE_EXT[mime]}"
+    path = os.path.join(log_dir, rel)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    return rel
+
+
+def _record_call(log_dir, t: float, caller: str, kwargs: dict,
+                 response, error: str | None) -> None:
+    """Append one ``chat_create`` call to ``<log_dir>/vlm_calls.jsonl``."""
+    latency_s = time.time() - t
+    if response is None:
+        reply = {"response": None, "finish_reason": None, "usage": None}
+    else:
+        choice = response.choices[0]
+        reply = {
+            "response": choice.message.content,
+            "finish_reason": choice.finish_reason,
+            "usage": response.usage.model_dump() if response.usage is not None else None,
+        }
+    messages = copy.deepcopy(kwargs["messages"])
+    with _call_log_lock:
+        for message in messages:
+            if not isinstance(message["content"], list):
+                continue
+            for part in message["content"]:
+                if part["type"] == "image_url" and part["image_url"]["url"].startswith("data:"):
+                    part["image_url"]["url"] = _save_image(log_dir, part["image_url"]["url"])
+        record = {
+            "t": t,
+            "latency_s": latency_s,
+            "caller": caller,
+            "model": kwargs["model"],
+            "params": {k: v for k, v in kwargs.items() if k not in ("model", "messages")},
+            "messages": messages,
+            **reply,
+            "error": error,
+        }
+        with open(os.path.join(log_dir, "vlm_calls.jsonl"), "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
 def chat_create(client, *, model: str, messages, temperature: float = 0.0,
                 max_tokens: int | None = None, **extra):
     """Wrapper around `client.chat.completions.create` that picks the right
     parameter set for reasoning vs standard chat models. All call sites should
     use this so a single check covers every VLM call path.
 
-    Categories:
-      - **standard chat** (Claude ≤ 4.6, GPT-4*): ``temperature`` + ``max_tokens``.
-      - **OpenAI reasoning** (gpt-5+, o1/o3/o4): no ``temperature``;
+    Categories (the model name may carry a provider prefix: ``gpt-5.5`` and
+    ``openai/gpt-5.5`` are the same model):
+      - **standard chat** (Claude ≤ 4.6, GPT-4*, open models such as
+        qwen3.5-9b): ``temperature`` + ``max_tokens``.
+      - **OpenAI reasoning** (gpt-5 and later, e.g. gpt-5, gpt-5.5,
+        gpt-5.5-mini, gpt-6-*; o1/o3/o4): no ``temperature``;
         ``max_completion_tokens`` (×4 of caller's max_tokens to leave room
         for invisible reasoning tokens) + ``reasoning_effort=low`` (or
         ``medium`` for ``-pro``).
@@ -60,6 +132,11 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
         ``thinking`` config separately if desired).
 
     Caller can override any of these by passing the param in **extra.
+
+    While :func:`set_call_log_dir` has set a directory, every call (including
+    one that raises) appends a record to ``<dir>/vlm_calls.jsonl``: the direct
+    caller, the exact request (data-URL images replaced by
+    ``vlm_images/<sha1>.<ext>`` files beside it), the reply, usage and latency.
     """
     kwargs = dict(model=model, messages=messages, **extra)
     if is_reasoning_model(model):
@@ -77,7 +154,20 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
         kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-    return client.chat.completions.create(**kwargs)
+    log_dir = _call_log_dir
+    if log_dir is None:
+        return client.chat.completions.create(**kwargs)
+    frame = sys._getframe(1)
+    caller = (f"{frame.f_globals['__name__']}:"
+              f"{getattr(frame.f_code, 'co_qualname', frame.f_code.co_name)}")
+    t = time.time()
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        _record_call(log_dir, t, caller, kwargs, None, repr(e))
+        raise
+    _record_call(log_dir, t, caller, kwargs, response, None)
+    return response
 
 
 def encode_image_b64(image: np.ndarray) -> str:

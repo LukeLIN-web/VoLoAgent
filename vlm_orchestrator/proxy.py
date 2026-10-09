@@ -36,6 +36,7 @@ from vlm_orchestrator.strategies.base import (
     StrategyContext,
 )
 from vlm_orchestrator.strategies.passthrough import PassthroughStrategy
+from vlm_orchestrator.vlm.api import set_call_log_dir
 
 logger = logging.getLogger(__name__)
 
@@ -1159,6 +1160,9 @@ class OrchestratorProxy:
         )
         os.makedirs(ep_dir, exist_ok=True)
         self._episode_log_dir = ep_dir
+        # VLM calls run only inside strategy / tool steps, which follow the
+        # episode-boundary handling, so repointing here never splits an episode.
+        set_call_log_dir(ep_dir)
         if state is not None:
             state.episode_log_dir = ep_dir
 
