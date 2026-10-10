@@ -863,7 +863,7 @@ def _preflight_motion_planner(args):
 
     client = GraspClient()
     try:
-        health = client.health()
+        health = client.planner_health()
     except Exception as e:  # noqa: BLE001
         # Server may not be up yet (some launch orders start it in parallel).
         # Don't hard-fail on unreachable — just warn; the loud-fail on first
@@ -881,7 +881,7 @@ def _preflight_motion_planner(args):
         raise SystemExit(
             "FATAL: --motion-planner curobo (the default) requires the grasp "
             "server to be launched with --enable-curobo, but the server at "
-            f"{client._url} reports models={health.get('models')} (no "
+            f"{client._planner_url} reports models={health.get('models')} (no "
             "'curobo'). Either restart the grasp server with --enable-curobo, "
             "or run the orchestrator with --motion-planner linear."
         )
