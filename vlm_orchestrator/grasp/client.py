@@ -52,6 +52,14 @@ def _default_perception_url(grasp_url: str) -> str:
     return os.environ.get("PERCEPTION_SERVER_URL", grasp_url)
 
 
+def _default_planner_url(grasp_url: str) -> str:
+    """The server answering /plan_motion, /attach_object and /detach_object:
+    the grasp server itself unless PLANNER_SERVER_URL points at a separate
+    cuRobo-only instance (server.py --enable-curobo without --gripper-config;
+    cuRobo 0.8 needs a newer torch than GraspGen's)."""
+    return os.environ.get("PLANNER_SERVER_URL", grasp_url)
+
+
 class GraspClient:
     """HTTP client for the grasp prediction server."""
 
@@ -62,6 +70,7 @@ class GraspClient:
     ):
         self._url = (url or _default_grasp_url()).rstrip("/")
         self._perception_url = _default_perception_url(self._url).rstrip("/")
+        self._planner_url = _default_planner_url(self._url).rstrip("/")
         self._timeout = timeout
 
     # ------------------------------------------------------------------
@@ -231,7 +240,7 @@ class GraspClient:
         body = self._pack_npz(**arrays)
         try:
             resp = requests.post(
-                f"{self._url}/plan_motion",
+                f"{self._planner_url}/plan_motion",
                 data=body,
                 headers={"Content-Type": "application/octet-stream"},
                 timeout=self._timeout,
@@ -286,7 +295,7 @@ class GraspClient:
         body = self._pack_npz(**arrays)
         try:
             resp = requests.post(
-                f"{self._url}/attach_object",
+                f"{self._planner_url}/attach_object",
                 data=body,
                 headers={"Content-Type": "application/octet-stream"},
                 timeout=self._timeout,
@@ -310,7 +319,7 @@ class GraspClient:
         """
         try:
             resp = requests.post(
-                f"{self._url}/detach_object",
+                f"{self._planner_url}/detach_object",
                 data=self._pack_npz(),
                 headers={"Content-Type": "application/octet-stream"},
                 timeout=self._timeout,
