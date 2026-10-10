@@ -102,6 +102,14 @@ class GraspClient:
         resp.raise_for_status()
         return resp.json()
 
+    def planner_health(self) -> dict:
+        """Health of the server answering /plan_motion (see PLANNER_SERVER_URL)."""
+        resp = requests.get(
+            f"{self._planner_url}/health", timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def compute_grasp(self, *args, **kwargs) -> tuple[np.ndarray, float]:
         """The best grasp of :meth:`compute_grasps`: ``(grasp_pose (4, 4), confidence)``."""
         poses, confidences = self.compute_grasps(*args, **kwargs)
