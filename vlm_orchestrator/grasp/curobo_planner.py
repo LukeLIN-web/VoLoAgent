@@ -64,6 +64,10 @@ class CuroboMotionPlanner:
         warmup_iterations: int = 5,
     ):
         import torch  # noqa: F401  (ensures torch present before cuRobo)
+        import curobo._src.runtime as curobo_runtime
+        # Off by default in cuRobo 0.8; without it the solver raises as soon
+        # as a request changes the batch shape (every scene cloud differs).
+        curobo_runtime.cuda_graph_reset = True
         from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 
         self._torch = __import__("torch")
