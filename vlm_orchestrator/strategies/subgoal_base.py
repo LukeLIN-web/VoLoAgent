@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Tool grounding sources that read the master's image point.
-POINT_SEG_MODES = frozenset({"gt_sim", "vlm_sam2", "vlm_point"})
+POINT_SEG_MODES = frozenset({"gt_sim", "vlm_sam2", "vlm_point", "sam3_point"})
 
 # ======================================================================
 # Shared constants
@@ -436,10 +436,12 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
         master_points: bool = False,
+        place_target: str = "pixel",
     ):
         super().__init__(ctx)
         self.initial_strategy = initial_strategy
         self._master_points = bool(master_points)
+        self._place_target = place_target
         self._client = None
         self._recycle_count = 0
         self._original_subgoals: list[str] = []
@@ -551,7 +553,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
     @property
     def _point_consumers(self) -> frozenset[str]:
         """Tools whose grounding is the master's point: ``gt_sim`` (which
-        object), ``vlm_sam2`` / ``vlm_point`` (where, with no second call)."""
+        object), ``vlm_sam2`` / ``vlm_point`` (where, with no second call),
+        ``sam3_point`` (which of the phrase's detections)."""
         return frozenset(
             tool for tool, mode in (
                 ("grasp", self._grasp_seg_mode),
@@ -2297,6 +2300,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 vlm=self.ctx.vlm,
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
+                target_rule=self._place_target,
             )
 
         spec = DestinationSpec.for_call(target, point, relation=relation)

@@ -817,6 +817,8 @@ def build_app(
         Expects ``.npz`` body with:
           - ``image``         (H, W, 3) uint8 RGB
           - ``text_prompt``   (scalar) bytes/str — object description
+          - ``point``         (2,) float, optional — normalised (x, y); the
+            detection whose mask covers it is returned, 422 when none does
 
         Returns ``.npz`` with:
           - ``mask``          (H, W) uint8 — best detection mask
@@ -878,7 +880,17 @@ def build_app(
             # If we fell back to a generic noun and the original prompt
             # had a color, filter by color to pick the right instance.
             best = results[0]
-            if used_variant and len(results) > 1:
+            if "point" in data:
+                h, w = image.shape[:2]
+                px, py = (np.clip(np.asarray(data["point"], dtype=np.float64), 0.0, 1.0 - 1e-6) * [w, h]).astype(int)
+                hits = [r for r in results if r["mask"][py, px]]
+                if not hits:
+                    raise RuntimeError(
+                        f"SAM3: none of {len(results)} detection(s) of "
+                        f"'{text_prompt}' covers the point ({px}, {py})"
+                    )
+                best = max(hits, key=lambda r: r["score"])
+            elif used_variant and len(results) > 1:
                 color = _extract_color(text_prompt)
                 if color:
                     best = _sam3_detector.detect_best(

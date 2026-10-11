@@ -259,6 +259,29 @@ def _molmo_point(
 # Stage 2 — 2D pixel → 3D world point
 # ----------------------------------------------------------------------
 
+def mask_top_target(
+    mask: np.ndarray,
+    depth: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    cam_to_world: np.ndarray,
+    top_percentile: float = 95.0,
+) -> np.ndarray:
+    """Surface anchor over a destination's mask: the median horizontal
+    position of its back-projected pixels, at the height of its top
+    (``top_percentile`` of their heights) — a container's rim, not its
+    floor, which is what a pixel inside it sees."""
+    d = np.squeeze(depth).astype(np.float64)
+    v, u = np.nonzero(np.asarray(mask, dtype=bool) & np.isfinite(d) & (d > 0))
+    if len(u) == 0:
+        raise PerceptionFailure("destination mask has no valid depth")
+    z = d[v, u]
+    cam = np.stack([(u - intrinsics.cx) / intrinsics.fx * z,
+                    (v - intrinsics.cy) / intrinsics.fy * z, z], -1)
+    world = cam @ cam_to_world[:3, :3].T + cam_to_world[:3, 3]
+    return np.array([np.median(world[:, 0]), np.median(world[:, 1]),
+                     np.percentile(world[:, 2], top_percentile)])
+
+
 def raycast_2d_to_3d(
     pt: PointToPlace2D,
     depth: np.ndarray,

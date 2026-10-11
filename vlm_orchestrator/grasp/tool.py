@@ -38,6 +38,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+import requests
 
 if TYPE_CHECKING:
     from vlm_orchestrator.motion import MotionPlanner
@@ -386,6 +387,7 @@ class GraspSegMode(str, Enum):
     MOLMO_SAM2 = "molmo_sam2"    # Two-stage: Molmo2 point → SAM2 segment
     VLM_SAM2 = "vlm_sam2"        # Two-stage: orchestrator VLM point → SAM2 segment
     GT_SIM = "gt_sim"            # Ground-truth mask from simulator
+    SAM3_POINT = "sam3_point"    # SAM3 detection under the master's point, else SAM2 grown from it
 
 
 def _build_obstacle_cloud(pc_world, keep_mask, motion_planner):
@@ -878,6 +880,14 @@ class GraspToolExecutor:
                     f"  Molmo+SAM2: '{target_object}' at {bbox} "
                     f"(iou={detection_score:.2f}, "
                     f"mask={mask.sum()} px)"
+                )
+            elif self._seg_mode == GraspSegMode.SAM3_POINT:
+                mask, detection_score, bbox = self._sam3_point_segment(
+                    image, target_object,
+                )
+                logger.info(
+                    f"  SAM3@point: '{target_object}' at {bbox} "
+                    f"(score={detection_score:.2f}, mask={mask.sum()} px)"
                 )
             elif self._seg_mode == GraspSegMode.VLM_SAM2:
                 # ---- VLM + SAM2: orchestrator VLM points → SAM2 segments ----
@@ -2696,6 +2706,31 @@ class GraspToolExecutor:
             )
 
         return self._sam2_from_point(image, target_object, x_norm, y_norm)
+
+    def _sam3_point_segment(
+        self,
+        image: np.ndarray,
+        target_object: str,
+    ) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
+        """The master names the object by phrase and points at it: SAM3's
+        detection of the phrase that covers the point, else SAM2's mask
+        grown from the point (no detection of the phrase is under it)."""
+        if self._target_point is None:
+            raise RuntimeError(
+                "seg_mode='sam3_point' needs the master's point "
+                "(tool_chain --master-points)"
+            )
+        x_norm, y_norm = map(float, self._target_point)
+        try:
+            mask, score, box = self._grasp_client.detect_and_segment(
+                image, target_object, point=(x_norm, y_norm),
+            )
+        except requests.HTTPError as e:
+            if e.response is None or e.response.status_code != 422:
+                raise
+            logger.info(f"  SAM3@point: {e.response.text[:200]}; SAM2 from the point")
+            return self._sam2_from_point(image, target_object, x_norm, y_norm)
+        return mask, score, tuple(box)
 
     def _sam2_from_point(
         self,

@@ -397,6 +397,7 @@ class GraspClient:
         self,
         image: np.ndarray,
         text_prompt: str,
+        point: tuple[float, float] | None = None,
     ) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
         """Detect and segment an object using SAM3 (single model).
 
@@ -411,13 +412,20 @@ class GraspClient:
             Tuple of ``(mask, score, box)`` where *mask* is (H, W) bool,
             *score* is float, and *box* is (x1, y1, x2, y2) in pixel coords.
 
+        With ``point`` (normalised ``(x, y)``) the detection whose mask
+        covers it, among all of the phrase's, is returned.
+
         Raises:
-            requests.HTTPError: if SAM3 is not loaded (501) or no detections.
+            requests.HTTPError: if SAM3 is not loaded (501) or no detection
+                (covers the point) (422).
         """
-        body = self._pack_npz(
+        arrays = dict(
             image=np.asarray(image, dtype=np.uint8),
             text_prompt=np.array(text_prompt, dtype=object),
         )
+        if point is not None:
+            arrays["point"] = np.asarray(point, dtype=np.float64)
+        body = self._pack_npz(**arrays)
 
         resp = requests.post(
             f"{self._perception_url}/detect_and_segment",

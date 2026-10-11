@@ -162,6 +162,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
         master_points: bool = False,
+        place_target: str = "pixel",
     ):
         super().__init__(
             ctx,
@@ -180,6 +181,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
             motion_planner=motion_planner,
             stack_mode_enabled=stack_mode_enabled,
             master_points=master_points,
+            place_target=place_target,
         )
         self.config = config
 

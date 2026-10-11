@@ -58,6 +58,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
+import requests
 
 if TYPE_CHECKING:
     from vlm_orchestrator.motion import MotionPlanner
@@ -69,9 +70,11 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.place.client import PlaceClient
+from vlm_orchestrator.perception.gt_segmentation import gt_object_at, gt_object_mask
 from vlm_orchestrator.place.destination import (
     PerceptionFailure,
     PointToPlace2D,
+    mask_top_target,
     point_to_place_2d,
     raycast_2d_to_3d,
 )
@@ -254,6 +257,9 @@ class DestinationSpec:
 
     relation: Literal["in", "on", "on_top_of"] = "in"
     approach_axis_world: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    # The master's phrase when its point is the target: not a target itself,
+    # read by perception that needs words (the mask_top rule's SAM3).
+    phrase: str | None = None
 
     def describe(self) -> str:
         """Short human-readable label (used for logs / HITL display).
@@ -284,7 +290,7 @@ class DestinationSpec:
         """A tool call's destination: the master's point when it gave one
         (``gt_sim`` resolves it against ground truth), else its phrase."""
         if point is not None:
-            return cls(target_point_2d=point, **kwargs)
+            return cls(target_point_2d=point, phrase=phrase, **kwargs)
         return cls(target_object=phrase, **kwargs)
 
     def validate(self) -> None:
@@ -320,9 +326,13 @@ class PlaceToolExecutor:
         vlm=None,
         motion_planner: "MotionPlanner | None" = None,
         stack_mode_enabled: bool = False,
+        target_rule: str = "pixel",
     ):
         self._client = PlaceClient(url=place_server_url)
         self._seg_mode = PlaceSegMode(seg_mode)
+        # Where the release is measured from: "pixel" (the depth under the
+        # destination pixel) or "mask_top" (the top of the destination's mask).
+        self._target_rule = target_rule
         self._use_front_camera = use_front_camera
         # Master switch (CLI --enable-stack-mode). When False, the per-call
         # ``stack`` arg is ignored and placement uses the historical
@@ -751,11 +761,18 @@ class PlaceToolExecutor:
                 "No depth in obs — cannot raycast.  Ensure --enable-depth on "
                 "the eval client."
             )
+        surface = None
+        if self._target_rule == "mask_top":
+            mask = self._destination_mask(obs, image, pt, dest)
+            if mask is not None:
+                surface = mask_top_target(mask, depth, intrinsics, cam_to_world)
+                self._place_log["mask_top_surface_world"] = surface.tolist()
         resolved = raycast_2d_to_3d(
             pt, depth, intrinsics, cam_to_world,
             relation=dest.relation,
             held_object_height_m=None,
             clearance_m=PLACE_RELEASE_HEIGHT_M,
+            pre_resolved_3d=surface,
             approach_axis_world=dest.approach_axis_world,
         )
         self._resolved_target_world = resolved.target_world
@@ -1475,6 +1492,29 @@ class PlaceToolExecutor:
         if v is None:
             raise RuntimeError("obs missing observation/ee_pos")
         return np.asarray(v, dtype=np.float64).reshape(3)
+
+    def _destination_mask(self, obs, image, pt, dest) -> np.ndarray | None:
+        """The destination's mask under the place pixel, for the mask_top
+        rule: the ground-truth instance under it (gt_sim), else SAM3's
+        detection of the destination phrase that covers it, else SAM2's mask
+        grown from it. None for an open spot ("empty space ..." or no scene
+        object under a ground-truth pixel): the pixel's own depth is the
+        surface."""
+        phrase = (dest.phrase or dest.target_object or "").strip()
+        if phrase.lower().startswith("empty space"):
+            return None
+        point = (pt.x_norm, pt.y_norm)
+        if self._seg_mode == PlaceSegMode.GT_SIM:
+            front = self._use_front_camera
+            name = gt_object_at(obs, point, front=front, radius_px=0)
+            return None if name in (None, "table") else gt_object_mask(obs, name, front=front)
+        if phrase:
+            try:
+                return self._client.detect_and_segment(image, phrase, point=point)[0]
+            except requests.HTTPError as e:
+                if e.response is None or e.response.status_code not in (422, 501):
+                    raise
+        return self._client.segment(image, *point, box=None)[0]
 
     def _extract_image(self, obs: dict) -> np.ndarray:
         key = (

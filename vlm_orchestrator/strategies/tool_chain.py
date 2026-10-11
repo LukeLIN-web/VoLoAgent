@@ -550,6 +550,7 @@ class ToolChainStrategy(SubgoalStrategy):
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
         master_points: bool = False,
+        place_target: str = "pixel",
     ):
         # ``failure_monitor`` and ``recovery_mode`` are forced None /
         # "template" — tool_chain mode does not use the failure-detector
@@ -582,6 +583,7 @@ class ToolChainStrategy(SubgoalStrategy):
             motion_planner=motion_planner,
             stack_mode_enabled=stack_mode_enabled,
             master_points=master_points,
+            place_target=place_target,
         )
         self._tc_config = config
 
@@ -1024,6 +1026,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 vlm=self.ctx.vlm,
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
+                target_rule=self._place_target,
             )
 
         # Optional per-call stack semantics from the VLM tool args. Only

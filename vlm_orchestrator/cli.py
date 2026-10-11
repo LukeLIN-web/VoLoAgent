@@ -361,7 +361,7 @@ def main():
 
     parser.add_argument(
         "--grasp-seg-mode",
-        choices=["gdino_sam2", "sam3", "molmo_sam2", "vlm_sam2", "gt_sim"],
+        choices=["gdino_sam2", "sam3", "molmo_sam2", "vlm_sam2", "gt_sim", "sam3_point"],
         default="sam3",
         help="Segmentation backend for grasp_with_tool pipeline. "
              "'sam3' (default) uses SAM3 for unified text-prompted "
@@ -408,6 +408,16 @@ def main():
         default=30,
         help="tool_chain mode: hard cap on tool calls before forcing "
              "abort (bound runtime / VLM cost). (default: 30)",
+    )
+
+    parser.add_argument(
+        "--place-target",
+        choices=["pixel", "mask_top"],
+        default="pixel",
+        help="Where the place tool measures the release from: the depth under "
+             "the destination pixel (default), or the top of the destination's "
+             "mask under it (ground-truth instance with gt_sim, else SAM3's "
+             "detection covering the pixel, else SAM2 grown from it).",
     )
 
     parser.add_argument(
@@ -1094,6 +1104,7 @@ def _build_strategy(args):
             motion_planner=getattr(args, "motion_planner", "curobo"),
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
             master_points=args.master_points,
+            place_target=args.place_target,
         )
 
     if args.mode == "subgoal":
