@@ -204,6 +204,8 @@ class SAM3Detector:
             eval_mode=True,
             load_from_HF=True,
             enable_segmentation=True,
+            # A local sam3.pt (e.g. from ModelScope) skips the gated HF download.
+            checkpoint_path=os.environ.get("SAM3_CHECKPOINT"),
         )
         if bpe_path is not None:
             kwargs["bpe_path"] = bpe_path
