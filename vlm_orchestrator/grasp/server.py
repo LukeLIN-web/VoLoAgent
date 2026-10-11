@@ -818,7 +818,9 @@ def build_app(
           - ``image``         (H, W, 3) uint8 RGB
           - ``text_prompt``   (scalar) bytes/str — object description
           - ``point``         (2,) float, optional — normalised (x, y); the
-            detection whose mask covers it is returned, 422 when none does
+            detection whose mask is nearest it is returned, if within
+            ``radius_px`` (0: the mask must cover it), else 422
+          - ``radius_px``     (scalar) float, optional, default 0
 
         Returns ``.npz`` with:
           - ``mask``          (H, W) uint8 — best detection mask
@@ -883,13 +885,19 @@ def build_app(
             if "point" in data:
                 h, w = image.shape[:2]
                 px, py = (np.clip(np.asarray(data["point"], dtype=np.float64), 0.0, 1.0 - 1e-6) * [w, h]).astype(int)
-                hits = [r for r in results if r["mask"][py, px]]
-                if not hits:
+                radius = float(data["radius_px"]) if "radius_px" in data else 0.0
+
+                def gap(r):   # pixels from the point to the detection's mask
+                    ys, xs = np.nonzero(r["mask"])
+                    return float(np.sqrt(((xs - px) ** 2 + (ys - py) ** 2).min())) if xs.size else np.inf
+
+                gaps = [gap(r) for r in results]
+                if min(gaps) > radius:
                     raise RuntimeError(
                         f"SAM3: none of {len(results)} detection(s) of "
-                        f"'{text_prompt}' covers the point ({px}, {py})"
+                        f"'{text_prompt}' lies within {radius:g} px of the point ({px}, {py})"
                     )
-                best = max(hits, key=lambda r: r["score"])
+                best = max((r for r, g in zip(results, gaps) if g == min(gaps)), key=lambda r: r["score"])
             elif used_variant and len(results) > 1:
                 color = _extract_color(text_prompt)
                 if color:

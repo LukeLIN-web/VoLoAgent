@@ -421,6 +421,24 @@ def main():
     )
 
     parser.add_argument(
+        "--grasp-topdown-fallback",
+        action="store_true",
+        help="tool_chain mode: when the grasp's top-down filter removes every "
+             "GraspGen grasp, ask again with the server's default threshold "
+             "instead of failing the grasp.",
+    )
+
+    parser.add_argument(
+        "--point-scale",
+        type=float,
+        choices=[1.0, 1000.0],
+        default=1.0,
+        help="tool_chain mode: the master writes its points as [0, 1] floats "
+             "(1, default) or as integers on a 0-1000 grid (1000, the grounding "
+             "format Qwen-VL models answer in).",
+    )
+
+    parser.add_argument(
         "--master-points",
         action="store_true",
         help="tool_chain mode: every grasp / place call carries the master's "
@@ -1105,6 +1123,8 @@ def _build_strategy(args):
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
             master_points=args.master_points,
             place_target=args.place_target,
+            topdown_fallback=args.grasp_topdown_fallback,
+            point_scale=args.point_scale,
         )
 
     if args.mode == "subgoal":

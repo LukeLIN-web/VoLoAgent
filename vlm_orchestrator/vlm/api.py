@@ -209,17 +209,28 @@ POINT_CONVENTION = (
 )
 
 
-def parse_norm_point(value) -> tuple[float, float]:
-    """A normalised image point ``[x, y]`` (see ``POINT_CONVENTION``).
+def point_convention(scale: float = 1.0) -> str:
+    """The prompt's point convention: ``[0, 1]`` floats, or integers on a
+    0-``scale`` grid (Qwen's grounding replies use 0-1000)."""
+    if scale == 1.0:
+        return POINT_CONVENTION
+    s = int(scale)
+    return (f"[x, y] as integers on a 0-{s} scale (x: 0 = left edge, {s} = "
+            f"right edge; y: 0 = top edge, {s} = bottom edge)")
+
+
+def parse_norm_point(value, scale: float = 1.0) -> tuple[float, float]:
+    """A normalised image point ``[x, y]`` from a point written on a
+    0-``scale`` grid (see ``point_convention``).
 
     Raises ValueError for anything else, including points off the image.
     """
     try:
-        x, y = (float(v) for v in value)
+        x, y = (float(v) / scale for v in value)
     except (TypeError, ValueError) as e:
         raise ValueError(f"point must be [x, y] numbers; got {value!r}") from e
     if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-        raise ValueError(f"point must be normalised to [0, 1]; got {value!r}")
+        raise ValueError(f"point must lie on the 0-{scale:g} grid; got {value!r}")
     return x, y
 
 

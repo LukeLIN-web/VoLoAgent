@@ -70,7 +70,7 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.place.client import PlaceClient
-from vlm_orchestrator.perception.gt_segmentation import gt_object_at, gt_object_mask
+from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
 from vlm_orchestrator.place.destination import (
     PerceptionFailure,
     PointToPlace2D,
@@ -1506,11 +1506,11 @@ class PlaceToolExecutor:
         point = (pt.x_norm, pt.y_norm)
         if self._seg_mode == PlaceSegMode.GT_SIM:
             front = self._use_front_camera
-            name = gt_object_at(obs, point, front=front, radius_px=0)
+            name = gt_object_at(obs, point, front=front, radius_px=POINT_SNAP_PX)
             return None if name in (None, "table") else gt_object_mask(obs, name, front=front)
         if phrase:
             try:
-                return self._client.detect_and_segment(image, phrase, point=point)[0]
+                return self._client.detect_and_segment(image, phrase, point=point, radius_px=POINT_SNAP_PX)[0]
             except requests.HTTPError as e:
                 if e.response is None or e.response.status_code not in (422, 501):
                     raise

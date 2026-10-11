@@ -54,7 +54,7 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.grasp.client import GraspClient
-from vlm_orchestrator.perception.gt_segmentation import gt_object_at, gt_object_mask
+from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +183,6 @@ RETREAT_HEIGHT = 0.10
 # A finished grasp counts only if the target touches the gripper and has
 # risen at least this far since perception (RoboLab's "lifted" threshold).
 GRASP_LIFT_THRESHOLD_M = 0.03
-# gt_sim: a master's grasp point this close (px) to a scene object picks that object.
-GT_POINT_SNAP_PX = 15
 
 # Safe height: lift arm to this z before perception (clears camera view)
 SAFE_HEIGHT_Z = 0.45
@@ -441,8 +439,12 @@ class GraspToolExecutor:
         topdown_threshold: float | None = None,
         motion_planner: "MotionPlanner | None" = None,
         stack_mode_enabled: bool = False,
+        topdown_fallback: bool = False,
     ):
         self._grasp_client = GraspClient(url=grasp_server_url)
+        # When the top-down filter removes every grasp, ask again with the
+        # server's default (permissive) threshold instead of failing.
+        self._topdown_fallback = bool(topdown_fallback)
         self._seg_mode = GraspSegMode(seg_mode)
         self._env_mode = GraspEnvMode(env_mode)
         self._use_front_camera = use_front_camera
@@ -1084,7 +1086,7 @@ class GraspToolExecutor:
             # 864×480, RGB/mask 1280×720) passing the RGB size mis-scales the
             # projection and yields 0 mask/point-cloud overlap.  For the
             # exterior camera (RGB==depth res) this is identical to image.shape.
-            grasp_pose, confidence = self._grasp_client.compute_grasp(
+            grasp_kw = dict(
                 point_cloud=point_cloud,
                 mask=mask,
                 image_hw=(intrinsics.height, intrinsics.width),
@@ -1093,9 +1095,21 @@ class GraspToolExecutor:
                 cx_px=intrinsics.cx,
                 cy_px=intrinsics.cy,
                 topdown_gravity=gravity_cam,
-                topdown_threshold=self._topdown_threshold,
                 enable_topdown_filter=enable_td_filter,
             )
+            try:
+                grasp_pose, confidence = self._grasp_client.compute_grasp(
+                    topdown_threshold=self._topdown_threshold, **grasp_kw,
+                )
+            except RuntimeError as e:
+                if not (self._topdown_fallback
+                        and "Top-down filtering removed all grasps" in str(e)):
+                    raise
+                logger.info("  top-down filter removed every grasp; again "
+                            "with the server's default threshold")
+                grasp_pose, confidence = self._grasp_client.compute_grasp(
+                    topdown_threshold=None, **grasp_kw,
+                )
             logger.info(
                 f"  GraspGen: confidence={confidence:.3f} "
                 f"({time.time() - t0:.2f}s)"
@@ -2433,7 +2447,7 @@ class GraspToolExecutor:
 
         An exact scene-object name (GT detector, grasp probe) is taken as
         is. Otherwise the master's point on the target identifies it: the
-        scene object under the point, or within ``GT_POINT_SNAP_PX`` of it.
+        scene object under the point, or within ``POINT_SNAP_PX`` of it.
         """
         if target_object in obs.get("gt_seg/obj_body_id", {}):
             return target_object
@@ -2445,7 +2459,7 @@ class GraspToolExecutor:
         x, y = self._target_point
         name = gt_object_at(
             obs, (x, y), front=self._use_front_camera,
-            radius_px=GT_POINT_SNAP_PX,
+            radius_px=POINT_SNAP_PX,
         )
         if name is None:
             raise RuntimeError(
@@ -2724,6 +2738,7 @@ class GraspToolExecutor:
         try:
             mask, score, box = self._grasp_client.detect_and_segment(
                 image, target_object, point=(x_norm, y_norm),
+                radius_px=POINT_SNAP_PX,
             )
         except requests.HTTPError as e:
             if e.response is None or e.response.status_code != 422:

@@ -28,7 +28,7 @@ import requests
 
 from vlm_orchestrator.grasp.camera import CameraIntrinsics
 from vlm_orchestrator.grasp.client import GraspClient
-from vlm_orchestrator.perception.gt_segmentation import gt_object_at
+from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +415,7 @@ def _gt_sim_point(
                 f"master gave no destination point"
             )
         try:
-            name = gt_object_at(obs, point, front=front, radius_px=0)
+            name = gt_object_at(obs, point, front=front, radius_px=POINT_SNAP_PX)
         except RuntimeError as e:
             raise PerceptionFailure(str(e)) from e
         if name is None:

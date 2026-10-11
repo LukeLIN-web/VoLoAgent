@@ -71,6 +71,11 @@ def _id_image(obs: dict, front: bool) -> tuple[np.ndarray, dict]:
     return ids.reshape(ids.shape[:2]), legend
 
 
+# A master's point this close (px) to an object picks it: the ground-truth
+# instance (gt_sim) or the phrase's SAM3 detection (sam3_point, mask_top).
+POINT_SNAP_PX = 15
+
+
 def gt_object_mask(obs: dict, name: str, *, front: bool) -> np.ndarray:
     """Pixel-exact ``(H, W)`` bool mask of scene object ``name``.
 
