@@ -556,7 +556,9 @@ class ToolChainStrategy(SubgoalStrategy):
         place_target: str = "pixel",
         topdown_fallback: bool = False,
         point_scale: float = 1.0,
+        point_call: bool = False,
     ):
+        self._point_call = point_call   # read by _point_tools, which the base may consult while initialising
         # ``failure_monitor`` and ``recovery_mode`` are forced None /
         # "template" — tool_chain mode does not use the failure-detector
         # / recovery-mode pipeline, the post-tool VLM check supplants
@@ -612,6 +614,13 @@ class ToolChainStrategy(SubgoalStrategy):
                 f"tool_chain: STACK_FORCE={self._stack_force} — overriding all "
                 f"VLM stack decisions (A/B test mode)"
             )
+
+    @property
+    def _point_tools(self) -> frozenset[str]:
+        """No point in the tool call when the tools ask the master for it on
+        their own (``point_call``): the decision prompt is then the same for
+        every grounding source."""
+        return frozenset() if self._point_call else super()._point_tools
 
     # ------------------------------------------------------------------
     # Episode start
@@ -984,6 +993,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
                 topdown_fallback=self._topdown_fallback,
+                point_call=self._point_call,
             )
         if self._hitl is not None:
             state._hitl = self._hitl
@@ -1035,6 +1045,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
                 target_rule=self._place_target,
+                point_call=self._point_call,
             )
 
         # Optional per-call stack semantics from the VLM tool args. Only

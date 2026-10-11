@@ -54,6 +54,7 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.grasp.client import GraspClient
+from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
 
 logger = logging.getLogger(__name__)
@@ -440,8 +441,12 @@ class GraspToolExecutor:
         motion_planner: "MotionPlanner | None" = None,
         stack_mode_enabled: bool = False,
         topdown_fallback: bool = False,
+        point_call: bool = False,
     ):
         self._grasp_client = GraspClient(url=grasp_server_url)
+        # The master's point, when this seg mode reads one and the call gave
+        # none: asked of the master on its own at perception (master_point).
+        self._point_call = bool(point_call)
         # When the top-down filter removes every grasp, ask again with the
         # server's default (permissive) threshold instead of failing.
         self._topdown_fallback = bool(topdown_fallback)
@@ -836,6 +841,11 @@ class GraspToolExecutor:
 
             # ---- 3+4. Detect and segment target object ----
             image = self._extract_image(obs)
+            if (self._point_call and self._target_point is None
+                    and self._seg_mode in (GraspSegMode.VLM_SAM2, GraspSegMode.SAM3_POINT, GraspSegMode.GT_SIM)
+                    and target_object not in obs.get("gt_seg/obj_body_id", {})):
+                self._target_point = master_point(image, target_object)
+                logger.info(f"  master point for '{target_object}': {self._target_point}")
 
             if self._seg_mode == GraspSegMode.GT_SIM:
                 # ---- GT_SIM: use ground-truth mask from simulator ----

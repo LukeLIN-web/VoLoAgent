@@ -219,6 +219,39 @@ def point_convention(scale: float = 1.0) -> str:
             f"right edge; y: 0 = top edge, {s} = bottom edge)")
 
 
+MASTER_POINT_PROMPT = (
+    'Point to the {phrase} in the image. Reply as JSON: {{"point_2d": [x, y]}}, '
+    "with x and y on a 0-1000 scale."
+)
+
+
+def master_point(image: np.ndarray, phrase: str) -> tuple[float, float]:
+    """The master VLM's point on ``phrase`` in ``image``, asked on its own in
+    the grounding format Qwen-VL models answer in (``point_2d`` on a 0-1000
+    grid; the reply may be a list of such objects): a normalised ``(x, y)``.
+    Endpoint and model are the master's (VLM_BASE_URL / VLM_MODEL /
+    VLM_API_KEY); the call is recorded like every master call (chat_create)."""
+    import openai   # optional here: this module is also imported where openai is not installed
+
+    client = openai.OpenAI(
+        base_url=os.environ["VLM_BASE_URL"],
+        api_key=os.environ.get("VLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "EMPTY",
+    )
+    reply = chat_create(
+        client, model=os.environ["VLM_MODEL"], temperature=0.0, max_tokens=128,
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_b64(image)}"}},
+            {"type": "text", "text": MASTER_POINT_PROMPT.format(phrase=phrase)},
+        ]}],
+    ).choices[0].message.content or ""
+    data = parse_json(reply)
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict) or "point_2d" not in data:
+        raise ValueError(f"master point for {phrase!r}: no point_2d in {reply[:200]!r}")
+    return parse_norm_point(data["point_2d"], 1000.0)
+
+
 def parse_norm_point(value, scale: float = 1.0) -> tuple[float, float]:
     """A normalised image point ``[x, y]`` from a point written on a
     0-``scale`` grid (see ``point_convention``).

@@ -439,6 +439,15 @@ def main():
     )
 
     parser.add_argument(
+        "--master-point-call",
+        action="store_true",
+        help="tool_chain mode: a tool that reads the master's point (vlm_sam2, "
+             "sam3_point, gt_sim, vlm_point) asks the master for it on its own "
+             "at perception, in Qwen-VL's grounding format (point_2d, 0-1000), "
+             "instead of taking it from the tool call.",
+    )
+
+    parser.add_argument(
         "--master-points",
         action="store_true",
         help="tool_chain mode: every grasp / place call carries the master's "
@@ -1125,6 +1134,7 @@ def _build_strategy(args):
             place_target=args.place_target,
             topdown_fallback=args.grasp_topdown_fallback,
             point_scale=args.point_scale,
+            point_call=args.master_point_call,
         )
 
     if args.mode == "subgoal":

@@ -70,6 +70,7 @@ from vlm_orchestrator.grasp.camera import (
     pose_opengl_to_opencv,
 )
 from vlm_orchestrator.place.client import PlaceClient
+from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
 from vlm_orchestrator.place.destination import (
     PerceptionFailure,
@@ -327,8 +328,12 @@ class PlaceToolExecutor:
         motion_planner: "MotionPlanner | None" = None,
         stack_mode_enabled: bool = False,
         target_rule: str = "pixel",
+        point_call: bool = False,
     ):
         self._client = PlaceClient(url=place_server_url)
+        # The master's point, when this seg mode reads one and the call gave
+        # none: asked of the master on its own at perception (master_point).
+        self._point_call = bool(point_call)
         self._seg_mode = PlaceSegMode(seg_mode)
         # Where the release is measured from: "pixel" (the depth under the
         # destination pixel) or "mask_top" (the top of the destination's mask).
@@ -710,6 +715,12 @@ class PlaceToolExecutor:
         image = self._extract_image(obs)
         intrinsics = self._intrinsics_for_obs(obs)
         cam_to_world = self._get_camera_to_world(obs)
+        if (self._point_call and dest.target_point_2d is None and dest.target_object
+                and self._seg_mode in (PlaceSegMode.VLM_POINT, PlaceSegMode.GT_SIM)):
+            dest = DestinationSpec.for_call(dest.target_object, master_point(image, dest.target_object),
+                                            relation=dest.relation, approach_axis_world=dest.approach_axis_world)
+            self._destination = dest
+            self._place_log["master_point"] = list(dest.target_point_2d)
         self._intrinsics_used = intrinsics
         self._cam_to_world_used = cam_to_world
 
