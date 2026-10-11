@@ -429,16 +429,6 @@ def main():
     )
 
     parser.add_argument(
-        "--point-scale",
-        type=float,
-        choices=[1.0, 1000.0],
-        default=1.0,
-        help="tool_chain mode: the master writes its points as [0, 1] floats "
-             "(1, default) or as integers on a 0-1000 grid (1000, the grounding "
-             "format Qwen-VL models answer in).",
-    )
-
-    parser.add_argument(
         "--grasp-candidates",
         type=int,
         default=1,
@@ -1142,7 +1132,6 @@ def _build_strategy(args):
             master_points=args.master_points,
             place_target=args.place_target,
             topdown_fallback=args.grasp_topdown_fallback,
-            point_scale=args.point_scale,
             point_call=args.master_point_call,
             grasp_candidates=args.grasp_candidates,
         )

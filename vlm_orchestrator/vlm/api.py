@@ -209,16 +209,6 @@ POINT_CONVENTION = (
 )
 
 
-def point_convention(scale: float = 1.0) -> str:
-    """The prompt's point convention: ``[0, 1]`` floats, or integers on a
-    0-``scale`` grid (Qwen's grounding replies use 0-1000)."""
-    if scale == 1.0:
-        return POINT_CONVENTION
-    s = int(scale)
-    return (f"[x, y] as integers on a 0-{s} scale (x: 0 = left edge, {s} = "
-            f"right edge; y: 0 = top edge, {s} = bottom edge)")
-
-
 MASTER_POINT_PROMPT = (
     'Point to the {phrase} in the image. Reply as JSON: {{"point_2d": [x, y]}}, '
     "with x and y on a 0-1000 scale."
@@ -254,7 +244,7 @@ def master_point(image: np.ndarray, phrase: str) -> tuple[float, float]:
 
 def parse_norm_point(value, scale: float = 1.0) -> tuple[float, float]:
     """A normalised image point ``[x, y]`` from a point written on a
-    0-``scale`` grid (see ``point_convention``).
+    0-``scale`` grid (``POINT_CONVENTION`` is the 0-1 one).
 
     Raises ValueError for anything else, including points off the image.
     """

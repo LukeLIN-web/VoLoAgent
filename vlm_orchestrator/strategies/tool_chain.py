@@ -29,7 +29,7 @@ from .subgoal import SubgoalConfig, SubgoalStrategy
 
 import numpy as np
 
-from vlm_orchestrator.vlm import encode_image_b64, parse_json, parse_norm_point, point_convention
+from vlm_orchestrator.vlm import POINT_CONVENTION, encode_image_b64, parse_json, parse_norm_point
 
 logger = logging.getLogger(__name__)
 
@@ -300,14 +300,14 @@ grasp() that picks that object up.
 Example: {"tool": "grasp", "args": {"target": "blue block", "stack": true}}"""
 
 
-def _tool_chain_point_note(point_tools: frozenset[str], scale: float = 1.0) -> str:
+def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
     """System-prompt addition requiring ``args.point`` on ``point_tools`` calls."""
     tools = sorted(point_tools)
     lines = [
         "",
         "",
         f"POINTS: every {' and '.join(tools)} call also carries `point`: "
-        f"{point_convention(scale)}, in the NOW image.",
+        f"{POINT_CONVENTION}, in the NOW image.",
     ]
     if "grasp" in point_tools:
         lines.append("  - grasp: a point on the object to pick up.")
@@ -316,13 +316,10 @@ def _tool_chain_point_note(point_tools: frozenset[str], scale: float = 1.0) -> s
             "  - place: where the held object should go — on the destination "
             "object, or on the open table spot for an empty-space destination."
         )
-    def pt(x, y):
-        return f"[{x}, {y}]" if scale == 1.0 else f"[{round(x * scale)}, {round(y * scale)}]"
-
     examples = {
-        "grasp": '{"tool": "grasp", "args": {"target": "red block", "point": ' + pt(0.42, 0.57) + '}}',
+        "grasp": '{"tool": "grasp", "args": {"target": "red block", "point": [0.42, 0.57]}}',
         "place": '{"tool": "place", "args": {"destination": "in the blue bowl", '
-                 '"held_object_hint": "red block", "point": ' + pt(0.63, 0.48) + '}}',
+                 '"held_object_hint": "red block", "point": [0.63, 0.48]}}',
     }
     lines.append(
         "The examples above omit `point`; here a "
@@ -400,7 +397,7 @@ def build_tool_chain_user_content(
 # ----------------------------------------------------------------------
 
 def parse_tool_chain_response(
-    raw: str, point_tools: frozenset[str] = frozenset(), point_scale: float = 1.0,
+    raw: str, point_tools: frozenset[str] = frozenset(),
 ) -> ToolChainDecision:
     """Parse a VLM response into a :class:`ToolChainDecision`.
 
@@ -472,7 +469,7 @@ def parse_tool_chain_response(
 
     if decision.tool in point_tools:
         try:
-            decision.args["point"] = parse_norm_point(decision.args.get("point"), point_scale)
+            decision.args["point"] = parse_norm_point(decision.args.get("point"))
         except ValueError as e:
             raise ValueError(f"{decision.tool} needs `args.point`: {e}") from e
 
@@ -555,7 +552,6 @@ class ToolChainStrategy(SubgoalStrategy):
         master_points: bool = False,
         place_target: str = "pixel",
         topdown_fallback: bool = False,
-        point_scale: float = 1.0,
         point_call: bool = False,
         grasp_candidates: int = 1,
     ):
@@ -595,7 +591,6 @@ class ToolChainStrategy(SubgoalStrategy):
         )
         self._tc_config = config
         self._topdown_fallback = topdown_fallback
-        self._point_scale = point_scale
         self._grasp_candidates = grasp_candidates
 
         # Optional forced stack override for A/B testing: when
@@ -843,7 +838,7 @@ class ToolChainStrategy(SubgoalStrategy):
         if self._stack_mode_enabled:
             system_prompt = system_prompt + _TOOL_CHAIN_STACK_NOTE
         if self._point_tools:
-            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._point_scale)
+            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools)
         try:
             raw = self._vlm_call(system_prompt, user_content)
         except Exception as e:
@@ -862,7 +857,7 @@ class ToolChainStrategy(SubgoalStrategy):
         )
 
         try:
-            decision = parse_tool_chain_response(raw, self._point_tools, self._point_scale)
+            decision = parse_tool_chain_response(raw, self._point_tools)
         except ValueError as e:
             logger.warning(
                 f"tool_chain: malformed VLM response ({e}); "
