@@ -782,13 +782,13 @@ def build_app(
                 return _npz_response(
                     boxes=np.zeros((0, 4), dtype=np.int32),
                     scores=np.zeros((0,), dtype=np.float32),
-                    labels=np.array([], dtype=object),
+                    labels=np.array([], dtype=str),
                     num_detections=np.array(0),
                 )
 
             boxes = np.array([d["box"] for d in detections], dtype=np.int32)
             scores = np.array([d["score"] for d in detections], dtype=np.float32)
-            labels = np.array([d["label"] for d in detections], dtype=object)
+            labels = np.array([d["label"] for d in detections], dtype=str)   # not object: no pickle across numpy 1 / 2 clients
 
             logger.info(
                 f"/detect completed in {elapsed:.2f}s  "
