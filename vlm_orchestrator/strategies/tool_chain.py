@@ -549,6 +549,7 @@ class ToolChainStrategy(SubgoalStrategy):
         grasp_topdown_threshold: float | None = None,
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
+        master_points: bool = False,
     ):
         # ``failure_monitor`` and ``recovery_mode`` are forced None /
         # "template" — tool_chain mode does not use the failure-detector
@@ -580,6 +581,7 @@ class ToolChainStrategy(SubgoalStrategy):
             grasp_topdown_threshold=grasp_topdown_threshold,
             motion_planner=motion_planner,
             stack_mode_enabled=stack_mode_enabled,
+            master_points=master_points,
         )
         self._tc_config = config
 
@@ -763,7 +765,8 @@ class ToolChainStrategy(SubgoalStrategy):
                 g_stack = self._stack_force  # A/B override
             self._activate_grasp_for_tool_chain(
                 obs, state, decision.args.get("target", ""), stack=g_stack,
-                point=decision.args.get("point"),
+                point=(decision.args.get("point")
+                       if "grasp" in self._point_consumers else None),
             )
         elif decision.tool == "place":
             self._activate_place_for_tool_chain(obs, state, decision.args)
@@ -1040,7 +1043,10 @@ class ToolChainStrategy(SubgoalStrategy):
         # it directly via vlm_point.  DestinationSpec.relation defaults
         # to "in" but is not consulted in any Z computation under the
         # drop-from-safe-height model.
-        spec = DestinationSpec.for_call(destination, args.get("point"))
+        spec = DestinationSpec.for_call(
+            destination,
+            args.get("point") if "place" in self._point_consumers else None,
+        )
         try:
             state.place_tool_executor.start(
                 spec, obs, state,

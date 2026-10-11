@@ -161,6 +161,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
         max_grasp_attempts: int | None = None,
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
+        master_points: bool = False,
     ):
         super().__init__(
             ctx,
@@ -178,6 +179,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
             max_grasp_attempts=max_grasp_attempts,
             motion_planner=motion_planner,
             stack_mode_enabled=stack_mode_enabled,
+            master_points=master_points,
         )
         self.config = config
 

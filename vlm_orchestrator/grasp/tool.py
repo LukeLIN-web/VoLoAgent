@@ -2603,6 +2603,11 @@ class GraspToolExecutor:
         your OpenAI-compatible VLM for the primary subgoal+replan_tools
         configuration.
         """
+        if self._target_point is not None:
+            # The master already pointed in its tool call: no second call.
+            x_norm, y_norm = map(float, self._target_point)
+            return self._sam2_from_point(image, target_object, x_norm, y_norm)
+
         import json
         import os
         from openai import OpenAI
@@ -2690,7 +2695,16 @@ class GraspToolExecutor:
                 f"(no-silent-fallback design rule)."
             )
 
-        # Hand the normalised point to SAM2 (no box prompt).
+        return self._sam2_from_point(image, target_object, x_norm, y_norm)
+
+    def _sam2_from_point(
+        self,
+        image: np.ndarray,
+        target_object: str,
+        x_norm: float,
+        y_norm: float,
+    ) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
+        """SAM2 point-prompt mask (no box) from the master's normalised point."""
         try:
             mask, iou = self._grasp_client.segment(
                 image, x_norm, y_norm, box=None,

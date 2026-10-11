@@ -411,6 +411,15 @@ def main():
     )
 
     parser.add_argument(
+        "--master-points",
+        action="store_true",
+        help="tool_chain mode: every grasp / place call carries the master's "
+             "point on the NOW image, whatever the tools' grounding source, so "
+             "the master's prompt does not change with it; only gt_sim, "
+             "vlm_sam2 and vlm_point read the point.",
+    )
+
+    parser.add_argument(
         "--max-grasp-attempts",
         type=int,
         default=2,
@@ -1084,6 +1093,7 @@ def _build_strategy(args):
             use_front_camera=getattr(args, "use_front_camera", False),
             motion_planner=getattr(args, "motion_planner", "curobo"),
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
+            master_points=args.master_points,
         )
 
     if args.mode == "subgoal":

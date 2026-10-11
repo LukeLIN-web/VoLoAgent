@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Tool grounding sources that read the master's image point.
+POINT_SEG_MODES = frozenset({"gt_sim", "vlm_sam2", "vlm_point"})
+
 # ======================================================================
 # Shared constants
 # ======================================================================
@@ -432,9 +435,11 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         max_grasp_attempts: int | None = None,
         motion_planner: str = "linear",
         stack_mode_enabled: bool = False,
+        master_points: bool = False,
     ):
         super().__init__(ctx)
         self.initial_strategy = initial_strategy
+        self._master_points = bool(master_points)
         self._client = None
         self._recycle_count = 0
         self._original_subgoals: list[str] = []
@@ -532,12 +537,26 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
 
         Under ``gt_sim`` the point is how the master names an object: the
         tool reads the scene object under it from the ground-truth id image.
+        With ``master_points`` every call carries one, whatever the tool's
+        grounding source, so the master's prompt is the same for all of them;
+        only the tools in :meth:`_point_consumers` read it.
         """
         return frozenset(
             tool for tool, mode in (
                 ("grasp", self._grasp_seg_mode),
                 ("place", self._place_seg_mode),
-            ) if mode == "gt_sim"
+            ) if mode == "gt_sim" or (self._master_points and mode is not None)
+        )
+
+    @property
+    def _point_consumers(self) -> frozenset[str]:
+        """Tools whose grounding is the master's point: ``gt_sim`` (which
+        object), ``vlm_sam2`` / ``vlm_point`` (where, with no second call)."""
+        return frozenset(
+            tool for tool, mode in (
+                ("grasp", self._grasp_seg_mode),
+                ("place", self._place_seg_mode),
+            ) if mode in POINT_SEG_MODES
         )
 
     # ------------------------------------------------------------------
