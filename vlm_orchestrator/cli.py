@@ -439,6 +439,15 @@ def main():
     )
 
     parser.add_argument(
+        "--grasp-candidates",
+        type=int,
+        default=1,
+        help="tool_chain mode: GraspGen grasps the grasp tool tries, best "
+             "first, until one plans (IK and motion); 1 (default) fails the "
+             "grasp when the best one does not.",
+    )
+
+    parser.add_argument(
         "--master-point-call",
         action="store_true",
         help="tool_chain mode: a tool that reads the master's point (vlm_sam2, "
@@ -1135,6 +1144,7 @@ def _build_strategy(args):
             topdown_fallback=args.grasp_topdown_fallback,
             point_scale=args.point_scale,
             point_call=args.master_point_call,
+            grasp_candidates=args.grasp_candidates,
         )
 
     if args.mode == "subgoal":

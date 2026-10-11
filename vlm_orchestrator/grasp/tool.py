@@ -442,11 +442,14 @@ class GraspToolExecutor:
         stack_mode_enabled: bool = False,
         topdown_fallback: bool = False,
         point_call: bool = False,
+        grasp_candidates: int = 1,
     ):
         self._grasp_client = GraspClient(url=grasp_server_url)
         # The master's point, when this seg mode reads one and the call gave
         # none: asked of the master on its own at perception (master_point).
         self._point_call = bool(point_call)
+        # GraspGen candidates tried, best first, until one plans (IK / motion).
+        self._n_grasp_candidates = max(1, int(grasp_candidates))
         # When the top-down filter removes every grasp, ask again with the
         # server's default (permissive) threshold instead of failing.
         self._topdown_fallback = bool(topdown_fallback)
@@ -1107,94 +1110,89 @@ class GraspToolExecutor:
                 topdown_gravity=gravity_cam,
                 enable_topdown_filter=enable_td_filter,
             )
-            try:
-                grasp_pose, confidence = self._grasp_client.compute_grasp(
-                    topdown_threshold=self._topdown_threshold, **grasp_kw,
-                )
-            except RuntimeError as e:
-                if not (self._topdown_fallback
-                        and "Top-down filtering removed all grasps" in str(e)):
-                    raise
-                logger.info("  top-down filter removed every grasp; again "
-                            "with the server's default threshold")
-                grasp_pose, confidence = self._grasp_client.compute_grasp(
-                    topdown_threshold=None, **grasp_kw,
-                )
-            logger.info(
-                f"  GraspGen: confidence={confidence:.3f} "
-                f"({time.time() - t0:.2f}s)"
-            )
-            self._grasp_pose_camera = grasp_pose
-            self._grasp_confidence = confidence
+            candidates = self._grasp_candidates(grasp_kw)
+            for i_cand, (grasp_pose, confidence) in enumerate(candidates):
+                try:
+                    logger.info(
+                        f"  GraspGen: confidence={confidence:.3f} "
+                        f"({time.time() - t0:.2f}s)"
+                    )
+                    self._grasp_pose_camera = grasp_pose
+                    self._grasp_confidence = confidence
 
-            # 🤏 Debug: grasp pose projected on image
-            dbg.vis_grasp_pose(image, grasp_pose, intrinsics,
-                               confidence, hitl=hitl)
+                    # 🤏 Debug: grasp pose projected on image
+                    dbg.vis_grasp_pose(image, grasp_pose, intrinsics,
+                                       confidence, hitl=hitl)
 
-            # ---- 6. Convert grasp to world frame ----
-            # cam_to_world already computed above for gravity
-            grasp_pose_world = cam_to_world @ grasp_pose
+                    # ---- 6. Convert grasp to world frame ----
+                    # cam_to_world already computed above for gravity
+                    grasp_pose_world = cam_to_world @ grasp_pose
 
 
-            self._intrinsics_used = intrinsics
+                    self._intrinsics_used = intrinsics
 
-            approach_world = grasp_pose_world[:3, 2]
-            logger.info(
-                f"  GraspGen approach (world): [{approach_world[0]:.2f}, "
-                f"{approach_world[1]:.2f}, {approach_world[2]:.2f}]"
-            )
+                    approach_world = grasp_pose_world[:3, 2]
+                    logger.info(
+                        f"  GraspGen approach (world): [{approach_world[0]:.2f}, "
+                        f"{approach_world[1]:.2f}, {approach_world[2]:.2f}]"
+                    )
 
-            # ── Diagnostic: compare grasp position to GT object position ──
-            gt_state = obs.get("gt_state", {})
-            gt_objects = gt_state.get("objects", {})
-            gt_obj = gt_objects.get(target_object) or gt_objects.get(
-                target_object.replace(" ", "_")
-            )
-            gt_pos_str = ""
-            if gt_obj is not None:
-                gt_p = np.array(gt_obj["pos"])
-                dist = np.linalg.norm(grasp_pose_world[:3, 3] - gt_p)
-                gt_pos_str = (
-                    f"  GT '{target_object}' pos={gt_p}, "
-                    f"dist_to_grasp={dist:.4f}m"
-                )
+                    # ── Diagnostic: compare grasp position to GT object position ──
+                    gt_state = obs.get("gt_state", {})
+                    gt_objects = gt_state.get("objects", {})
+                    gt_obj = gt_objects.get(target_object) or gt_objects.get(
+                        target_object.replace(" ", "_")
+                    )
+                    gt_pos_str = ""
+                    if gt_obj is not None:
+                        gt_p = np.array(gt_obj["pos"])
+                        dist = np.linalg.norm(grasp_pose_world[:3, 3] - gt_p)
+                        gt_pos_str = (
+                            f"  GT '{target_object}' pos={gt_p}, "
+                            f"dist_to_grasp={dist:.4f}m"
+                        )
 
-            logger.info(
-                f"  Grasp (world): pos={grasp_pose_world[:3, 3]}, "
-                f"approach={grasp_pose_world[:3, 2]}"
-            )
-            if gt_pos_str:
-                logger.info(gt_pos_str)
+                    logger.info(
+                        f"  Grasp (world): pos={grasp_pose_world[:3, 3]}, "
+                        f"approach={grasp_pose_world[:3, 2]}"
+                    )
+                    if gt_pos_str:
+                        logger.info(gt_pos_str)
 
-            self._grasp_log = {
-                "target_object": self._target_object,
-                "confidence": float(confidence),
-                "grasp_camera_pos": grasp_pose[:3, 3].tolist(),
-                "grasp_camera_x_axis": grasp_pose[:3, 0].tolist(),
-                "grasp_camera_z_depth": float(grasp_pose[2, 3]),
-                "grasp_world_pos": grasp_pose_world[:3, 3].tolist(),
-                "grasp_world_approach": grasp_pose_world[:3, 2].tolist(),
-                "grasp_world_x_axis": grasp_pose_world[:3, 0].tolist(),
-                "cam_to_world_pos": cam_to_world[:3, 3].tolist(),
-                "cam_to_world_rot": cam_to_world[:3, :3].tolist(),
-            }
+                    self._grasp_log = {
+                        "target_object": self._target_object,
+                        "confidence": float(confidence),
+                        "grasp_camera_pos": grasp_pose[:3, 3].tolist(),
+                        "grasp_camera_x_axis": grasp_pose[:3, 0].tolist(),
+                        "grasp_camera_z_depth": float(grasp_pose[2, 3]),
+                        "grasp_world_pos": grasp_pose_world[:3, 3].tolist(),
+                        "grasp_world_approach": grasp_pose_world[:3, 2].tolist(),
+                        "grasp_world_x_axis": grasp_pose_world[:3, 0].tolist(),
+                        "cam_to_world_pos": cam_to_world[:3, 3].tolist(),
+                        "cam_to_world_rot": cam_to_world[:3, :3].tolist(),
+                    }
 
-            # ---- 7. Plan trajectory ----
-            self._status_message = "Planning trajectory..."
-            if self._env_mode == GraspEnvMode.LIBERO:
-                self._plan_trajectory_libero(
-                    current_ee_pos, current_ee_quat,
-                    grasp_pose_world,
-                )
-            else:
-                self._plan_trajectory(
-                    current_joints, current_gripper,
-                    grasp_pose_world, current_ee_pos,
-                )
-            logger.info(
-                f"  Trajectory: {len(self._trajectory)} waypoints "
-                f"({len(self._trajectory) // self._action_horizon} chunks)"
-            )
+                    # ---- 7. Plan trajectory ----
+                    self._status_message = "Planning trajectory..."
+                    if self._env_mode == GraspEnvMode.LIBERO:
+                        self._plan_trajectory_libero(
+                            current_ee_pos, current_ee_quat,
+                            grasp_pose_world,
+                        )
+                    else:
+                        self._plan_trajectory(
+                            current_joints, current_gripper,
+                            grasp_pose_world, current_ee_pos,
+                        )
+                    logger.info(
+                        f"  Trajectory: {len(self._trajectory)} waypoints "
+                        f"({len(self._trajectory) // self._action_horizon} chunks)"
+                    )
+                    break
+                except RuntimeError as e:   # IK / motion planning: the next candidate, while any is left
+                    if i_cand == len(candidates) - 1:
+                        raise
+                    logger.info(f"  grasp candidate {i_cand} unplannable ({e}); trying the next")
 
             # 🌍 Debug: world-frame grasp + IK result
             dbg.vis_world_grasp(
@@ -2730,6 +2728,29 @@ class GraspToolExecutor:
             )
 
         return self._sam2_from_point(image, target_object, x_norm, y_norm)
+
+    def _grasp_candidates(self, grasp_kw: dict) -> list:
+        """GraspGen's grasps for this mask, best first, at most
+        ``grasp_candidates`` of them: under the configured top-down threshold,
+        then (``topdown_fallback``) under the server's default one. Raises
+        when there is none."""
+        out, err = [], None
+        thresholds = [self._topdown_threshold] + ([None] if self._topdown_fallback else [])
+        for threshold in thresholds:
+            try:
+                poses, confs = self._grasp_client.compute_grasps(topdown_threshold=threshold, **grasp_kw)
+            except RuntimeError as e:
+                if "Top-down filtering removed all grasps" not in str(e):
+                    raise
+                err = e
+                logger.info(f"  top-down threshold {threshold}: no grasp left")
+                continue
+            out += list(zip(poses, map(float, confs)))[:self._n_grasp_candidates - len(out)]
+            if len(out) >= self._n_grasp_candidates:
+                break
+        if not out:
+            raise err
+        return out
 
     def _sam3_point_segment(
         self,

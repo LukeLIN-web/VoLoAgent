@@ -557,6 +557,7 @@ class ToolChainStrategy(SubgoalStrategy):
         topdown_fallback: bool = False,
         point_scale: float = 1.0,
         point_call: bool = False,
+        grasp_candidates: int = 1,
     ):
         self._point_call = point_call   # read by _point_tools, which the base may consult while initialising
         # ``failure_monitor`` and ``recovery_mode`` are forced None /
@@ -595,6 +596,7 @@ class ToolChainStrategy(SubgoalStrategy):
         self._tc_config = config
         self._topdown_fallback = topdown_fallback
         self._point_scale = point_scale
+        self._grasp_candidates = grasp_candidates
 
         # Optional forced stack override for A/B testing: when
         # STACK_FORCE={true,false} the VLM's per-tool ``stack`` arg is
@@ -994,6 +996,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 stack_mode_enabled=self._stack_mode_enabled,
                 topdown_fallback=self._topdown_fallback,
                 point_call=self._point_call,
+                grasp_candidates=self._grasp_candidates,
             )
         if self._hitl is not None:
             state._hitl = self._hitl
