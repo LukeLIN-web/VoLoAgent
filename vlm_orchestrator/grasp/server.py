@@ -54,6 +54,7 @@ import time
 from typing import Optional
 
 import numpy as np
+from PIL import Image
 
 # FastAPI types imported at module level so that `from __future__ import
 # annotations` (PEP 563 deferred evaluation) doesn't break FastAPI's
@@ -148,6 +149,43 @@ def _prompt_variants(text_prompt: str) -> list[str]:
     # Deduplicate while preserving order
     seen = {text_prompt}
     return [v for v in variants if v not in seen and not seen.add(v)]
+
+
+def _detect_with_variants(image: np.ndarray, text_prompt: str):
+    """SAM3 on the phrase, then on its simpler variants until one detects.
+
+    Returns ``(results, tried, used_variant)``; *tried* lists ``(prompt, top raw score)``."""
+    results = _sam3_detector.detect_and_segment(image, text_prompt)
+    tried = [(text_prompt, _sam3_detector.last_top_score)]
+    for variant in _prompt_variants(text_prompt) if not results else []:
+        logger.info(f"  SAM3 retry with variant: '{variant}' (original: '{text_prompt}')")
+        results = _sam3_detector.detect_and_segment(image, variant)
+        tried.append((variant, _sam3_detector.last_top_score))
+        if results:
+            logger.info(f"  SAM3 variant '{variant}' found {len(results)} detection(s)")
+            return results, tried, True
+    return results, tried, False
+
+
+def _detect_zoomed(image: np.ndarray, text_prompt: str, point: np.ndarray, zoom: int):
+    """``_detect_with_variants`` on the 1/zoom crop around the normalised *point*, blown up to the
+    frame; masks and boxes come back in frame coordinates."""
+    h, w = image.shape[:2]
+    side_w, side_h = w // zoom, h // zoom
+    x0 = int(np.clip(point[0] * w - side_w / 2, 0, w - side_w))
+    y0 = int(np.clip(point[1] * h - side_h / 2, 0, h - side_h))
+    crop = np.asarray(Image.fromarray(image[y0:y0 + side_h, x0:x0 + side_w]).resize((w, h), Image.BICUBIC))
+    results, tried, used_variant = _detect_with_variants(crop, text_prompt)
+    for r in results:
+        small = np.asarray(Image.fromarray(r["mask"].astype(np.uint8)).resize((side_w, side_h), Image.NEAREST))
+        mask = np.zeros((h, w), dtype=bool)
+        mask[y0:y0 + side_h, x0:x0 + side_w] = small > 0
+        r["mask"] = mask
+        x1, y1, x2, y2 = r["box"]
+        r["box"] = [x1 / zoom + x0, y1 / zoom + y0, x2 / zoom + x0, y2 / zoom + y0]
+    if results:
+        logger.info(f"  SAM3 x{zoom} crop at ({x0}, {y0}) found {len(results)} detection(s) of '{text_prompt}'")
+    return results, tried, used_variant
 
 
 def _load_sam3(model_id: str = "facebook/sam3"):
@@ -846,32 +884,14 @@ def build_app(
                 text_prompt = str(text_prompt)
 
             t0 = time.time()
-            results = _sam3_detector.detect_and_segment(image, text_prompt)
-            tried = [(text_prompt, _sam3_detector.last_top_score)]
-            used_variant = False
-
-            # If no detections, retry with prompt variants.
-            # SAM3 was trained on COCO-style category names (plain nouns).
-            # Attribute+noun queries like "black hammer" often score below
-            # threshold, so we try progressively simpler prompts.
-            if not results:
-                variants = _prompt_variants(text_prompt)
-                for variant in variants:
-                    logger.info(
-                        f"  SAM3 retry with variant: '{variant}' "
-                        f"(original: '{text_prompt}')"
-                    )
-                    results = _sam3_detector.detect_and_segment(
-                        image, variant,
-                    )
-                    tried.append((variant, _sam3_detector.last_top_score))
-                    if results:
-                        logger.info(
-                            f"  SAM3 variant '{variant}' found "
-                            f"{len(results)} detection(s)"
-                        )
-                        used_variant = True
-                        break
+            results, tried, used_variant = _detect_with_variants(image, text_prompt)
+            zoom = int(data["zoom"]) if "zoom" in data else 0
+            if not results and "point" in data and zoom > 1:
+                # Small objects: the phrase again on a crop around the point, blown up to the
+                # full frame (a client-side option; RoboLab's protocol stays without it).
+                results, tried_zoomed, used_variant = _detect_zoomed(
+                    image, text_prompt, np.asarray(data["point"], dtype=np.float64), zoom)
+                tried += [(f"{p} @x{zoom}", s) for p, s in tried_zoomed]
 
             elapsed = time.time() - t0
 

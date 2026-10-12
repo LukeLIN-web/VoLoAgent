@@ -70,7 +70,10 @@ from vlm_orchestrator.grasp.camera import (
     overshoulder_left_intrinsics,
     pose_opengl_to_opencv,
 )
-from vlm_orchestrator.grasp.tool import LiberoHoming, libero_stage_chunk
+from vlm_orchestrator.grasp.tool import (
+    LIBERO_ORI_DONE_RAD, LIBERO_ORI_PROGRESS_M_PER_RAD, LIBERO_OVERHEAD_M, LIBERO_STALL_PROGRESS_M,
+    LiberoHoming, libero_overhead_waypoints, libero_rotation_error, libero_stage_chunk,
+)
 from vlm_orchestrator.place.client import PlaceClient
 from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import (
@@ -361,7 +364,9 @@ class PlaceToolExecutor:
         self._cl_target_rot: np.ndarray | None = None
         self._cl_steps = 0
         self._cl_chunks = 0
+        self._cl_best, self._cl_stall = np.inf, 0
         self._stage: dict = {}
+        self._libero_waypoints: list | None = None
         # The master's point, when this seg mode reads one and the call gave
         # none: asked of the master on its own at perception (master_point).
         self._point_call = bool(point_call)
@@ -969,6 +974,7 @@ class PlaceToolExecutor:
         self._libero_pre_place = target - PLACE_PRE_OFFSET * approach
         self._libero_place = target.copy()
         self._stage: dict = {}
+        self._libero_waypoints = None   # overhead approach: built once the base has staged, from the EE then
         self._place_log["R_target_world"] = R_target.tolist()
         self._place_log["ee_target_world"] = target.tolist()
         self._set_cl_segment(self._libero_pre_place, R_target, LIBERO_STEPS["approach"])
@@ -985,24 +991,34 @@ class PlaceToolExecutor:
         self._cl_target_rot = None if target_rot is None else np.asarray(target_rot, dtype=np.float64)
         self._cl_steps = int(steps)
         self._cl_chunks = 0
+        self._cl_best, self._cl_stall = np.inf, 0
 
     def _step_trajectory_libero(self, obs: dict, state) -> dict:
         """One closed-loop chunk toward the current segment's target (APPROACHING / FINAL_APPROACH / RETREATING).
 
         Position: the remaining delta spread over the segment's remaining step estimate, capped per step.
         Orientation: likewise from the current ee_quat when the segment has a target rotation, else zero.
-        The segment ends within ``LIBERO_PHASE_DONE_M`` of its target, or after ``LIBERO_MAX_CHUNKS`` chunks.
+        The segment ends within ``LIBERO_PHASE_DONE_M`` of its target, or after ``LIBERO_MAX_CHUNKS`` chunks
+        (with the overhead approach: ``LIBERO_MAX_CHUNKS`` chunks without getting closer, and a segment with
+        a target rotation also has to reach it within ``LIBERO_ORI_DONE_RAD``).
         """
         if self._cl_target_pos is None:
             return self._noop_response(obs)
         if self._phase == PlacePhase.APPROACHING:
-            chunk = libero_stage_chunk(obs, self._cl_target_pos, self._g_close, self._horizon, self._stage)
+            stage_target = self._libero_pre_place if LIBERO_OVERHEAD_M > 0 else self._cl_target_pos
+            chunk = libero_stage_chunk(obs, stage_target, self._g_close, self._horizon, self._stage)
             if chunk is not None:
                 self._status_message = "Driving the base toward the destination..."
                 return {"actions": chunk}
+            if LIBERO_OVERHEAD_M > 0 and self._libero_waypoints is None:
+                self._libero_waypoints = libero_overhead_waypoints(
+                    self._extract_ee_pos(obs), self._libero_pre_place, self._cl_target_rot)
+                self._set_cl_segment(*self._libero_waypoints.pop(0), LIBERO_STEPS["approach"])
         ee = self._extract_ee_pos(obs)
         delta = self._cl_target_pos - ee
         dist = float(np.linalg.norm(delta))
+        angle = libero_rotation_error(obs, self._cl_target_rot) if LIBERO_OVERHEAD_M > 0 else 0.0
+        done = dist <= LIBERO_PHASE_DONE_M and angle <= LIBERO_ORI_DONE_RAD
         per_step = np.clip(delta / max(self._cl_steps, LIBERO_EXEC_STEPS), -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA)
         ori = np.zeros(3)
         if self._cl_target_rot is not None:
@@ -1016,8 +1032,17 @@ class PlaceToolExecutor:
         actions = self._tile(action)
         self._cl_steps = max(1, self._cl_steps - 1)
         self._cl_chunks += 1
-        if dist <= LIBERO_PHASE_DONE_M or self._cl_chunks >= LIBERO_MAX_CHUNKS:
-            if self._cl_chunks >= LIBERO_MAX_CHUNKS:
+        if LIBERO_OVERHEAD_M > 0:
+            progress = dist + LIBERO_ORI_PROGRESS_M_PER_RAD * angle
+            if progress < self._cl_best - LIBERO_STALL_PROGRESS_M:
+                self._cl_best, self._cl_stall = progress, 0
+            else:
+                self._cl_stall += 1
+            stalled = self._cl_stall >= LIBERO_MAX_CHUNKS
+        else:
+            stalled = self._cl_chunks >= LIBERO_MAX_CHUNKS
+        if done or stalled:
+            if not done:
                 if dist > LIBERO_STALL_FAIL_M and self._phase != PlacePhase.RETREATING:
                     self._cl_target_pos = None
                     self._fail("motion_blocked", f"arm stalled {dist * 100:.1f} cm short of the {self._phase.value} target")
@@ -1025,7 +1050,11 @@ class PlaceToolExecutor:
                     return self._noop_response(obs)
                 logger.warning(f"  place {self._phase.value}: segment not converged after {self._cl_chunks} chunks (dist {dist*100:.1f} cm), advancing")
             self._place_log[f"segment_{self._phase.value}_final_dist_m"] = dist
-            if self._phase == PlacePhase.APPROACHING:
+            if self._phase == PlacePhase.APPROACHING and self._libero_waypoints:
+                self._set_cl_segment(*self._libero_waypoints.pop(0), LIBERO_STEPS["approach"])
+                logger.info(f"  overhead approach: next waypoint {np.round(self._cl_target_pos, 3)}, "
+                            f"{len(self._libero_waypoints)} to go")
+            elif self._phase == PlacePhase.APPROACHING:
                 logger.info("  Approach complete → FINAL_APPROACH")
                 self._phase = PlacePhase.FINAL_APPROACH
                 self._status_message = "Final approach to release pose..."

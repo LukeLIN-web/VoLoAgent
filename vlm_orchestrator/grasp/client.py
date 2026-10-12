@@ -403,6 +403,7 @@ class GraspClient:
         text_prompt: str,
         point: tuple[float, float] | None = None,
         radius_px: float = 0.0,
+        zoom: int = 0,
     ) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
         """Detect and segment an object using SAM3 (single model).
 
@@ -421,6 +422,8 @@ class GraspClient:
         nearest it, among all of the phrase's, is returned, if within
         ``radius_px`` (0: the mask must cover it); a client built with
         ``single_detection`` gets the phrase's only detection regardless.
+        ``zoom`` > 1: when the frame has no detection, the server looks
+        again at the 1/zoom crop around the point blown up to the frame.
 
         Raises:
             requests.HTTPError: if SAM3 is not loaded (501) or no detection
@@ -435,6 +438,8 @@ class GraspClient:
             arrays["radius_px"] = np.asarray(radius_px, dtype=np.float64)
             if self._single_detection:
                 arrays["single_detection"] = np.asarray(True)
+            if zoom > 1:
+                arrays["zoom"] = np.asarray(zoom, dtype=np.int64)
         body = self._pack_npz(**arrays)
 
         resp = requests.post(

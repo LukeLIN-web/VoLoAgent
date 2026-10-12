@@ -336,11 +336,18 @@ def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: 
         logger.info("  base staging: base not moving toward the target (blocked), approaching from here")
         st["off"], st["staging"] = True, False
         return None
+    clearance = libero_forward_clearance(obs) if LIBERO_BUMPER_M > 0 else np.inf
+    cmd_max = min(LIBERO_BASE_CMD_MAX, (clearance - LIBERO_BUMPER_M) / LIBERO_BASE_CHUNK_TRAVEL_M)
+    if cmd_max < 0.05:
+        logger.info(f"  base staging: something {clearance * 100:.0f} cm ahead of the arm's base (bumper "
+                    f"{LIBERO_BUMPER_M * 100:.0f} cm), approaching from here")
+        st["off"], st["staging"], st["bumper_m"] = True, False, round(clearance, 3)
+        return None
     st["staging"] = True
     yaw = float(np.asarray(yaw).flatten()[0])
     c, s = np.cos(yaw), np.sin(yaw)
     v_base = np.array([c * v[0] + s * v[1], -s * v[0] + c * v[1]])
-    cmd = np.clip(v_base * 3.0, -LIBERO_BASE_CMD_MAX, LIBERO_BASE_CMD_MAX)
+    cmd = np.clip(v_base * 3.0, -cmd_max, cmd_max)
     row = np.concatenate([np.zeros(6), [gripper_cmd], cmd])
     return np.tile(row, (horizon, 1))
 
@@ -354,10 +361,11 @@ class LiberoHoming:
     start-of-episode gripper position, kept relative to the base) and ``observation/base_home`` (the base's
     start position, world x y).  Three closed-loop segments, each skipped when it stalls: straight up to the
     home height (the gripper leaves a drawer or the counter edge first), the base back to where it started,
-    then the arm across to the home position.  ``chunk`` returns the next action chunk, None when the motion
-    is over."""
+    then the arm across to the home position (``GRASP_LIBERO_HOME_SEGMENTS`` picks which of the three; ``up``
+    alone leaves the base and the arm's x y where the tool ended, the master's next image is from there).
+    ``chunk`` returns the next action chunk, None when the motion is over."""
 
-    SEGMENTS = ("up", "base", "across")
+    SEGMENTS = tuple(os.environ.get("GRASP_LIBERO_HOME_SEGMENTS", "up,base,across").split(","))
 
     @staticmethod
     def wanted(obs: dict) -> bool:
@@ -404,6 +412,106 @@ class LiberoHoming:
 
 LIBERO_CLOSE_DURING_FINAL = os.environ.get("GRASP_LIBERO_CLOSE_DURING_FINAL", "1") == "1"
 LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
+# 1: the chunk between arriving at the grasp point and closing is a zero delta (LIBERO's historical path
+# replays the final segment's last row, a step along the approach, for that chunk).
+LIBERO_HOLD_BEFORE_CLOSE = os.environ.get("GRASP_LIBERO_HOLD_BEFORE_CLOSE", "0") == "1"
+# sam3_point: when the frame has no detection of the phrase, SAM3 again on the 1/zoom crop around the
+# master's point blown up to the frame (small objects); 0 = off.
+LIBERO_SAM3_ZOOM = int(os.environ.get("GRASP_LIBERO_SAM3_ZOOM", "0"))
+# Overhead approach (> 0): after the base has staged, the arm goes straight up to max(where it is, the
+# pre-grasp + this), across at that height while turning to the grasp orientation, then straight down to
+# the pre-grasp — a target below a counter top or inside a sink is reached from above instead of along the
+# straight line from the start pose, which cuts through the counter edge.  Segments with a target
+# orientation also end only once it is within LIBERO_ORI_DONE_RAD.  0 = the straight line (LIBERO).
+LIBERO_OVERHEAD_M = float(os.environ.get("GRASP_LIBERO_OVERHEAD_M", "0"))
+LIBERO_ORI_DONE_RAD = 0.15
+LIBERO_ORI_PROGRESS_M_PER_RAD = 0.05   # what a radian of orientation error counts as in the stall rule
+
+
+def libero_rotation_error(obs: dict, target_rot: np.ndarray | None) -> float:
+    """Angle (rad) from the EE's orientation to *target_rot*; 0 without a target or an ee_quat (w x y z)."""
+    from scipy.spatial.transform import Rotation as R_scipy   # the perception server imports this module without scipy
+    q = obs.get("observation/ee_quat")
+    if target_rot is None or q is None:
+        return 0.0
+    q = np.asarray(q, dtype=np.float64).flatten()
+    cur = R_scipy.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    return float(np.linalg.norm(R_scipy.from_matrix(target_rot @ cur.T).as_rotvec()))
+
+
+def libero_overhead_waypoints(cur: np.ndarray, pre: np.ndarray, rot: np.ndarray | None) -> list[tuple[np.ndarray, np.ndarray | None]]:
+    """(position, orientation or None) segments up from *cur*, across, and down to *pre*."""
+    z = max(float(cur[2]), float(pre[2]) + LIBERO_OVERHEAD_M)
+    return [(np.array([cur[0], cur[1], z]), None), (np.array([pre[0], pre[1], z]), rot),
+            (np.asarray(pre, dtype=np.float64).copy(), rot)]
+
+
+# 1: of GraspGen's candidates (grasp_candidates of them, best first) take the one needing the least wrist
+# rotation from where the EE is — a 90° turn next to a coffee machine or under a cabinet door swings the
+# forearm into it.  0 = GraspGen's best (LIBERO).
+LIBERO_LEAST_ROTATION = os.environ.get("GRASP_LIBERO_LEAST_ROTATION", "0") == "1"
+
+
+def libero_grasp_rotation(current_ee_quat: np.ndarray | None, grasp_pose_world: np.ndarray) -> tuple:
+    """The EE rotation for a GraspGen pose — its axes turned LIBERO_GRASPGEN_TO_EE_YAW_RAD about the approach,
+    of the two finger-symmetric ones the one the wrist is nearer — and the angle (rad) from the EE's current
+    orientation (w x y z; None: the first one, angle nan)."""
+    from scipy.spatial.transform import Rotation as R_scipy   # the perception server imports this module without scipy
+    grasp_rot = R_scipy.from_matrix(grasp_pose_world[:3, :3])
+    if LIBERO_GRASPGEN_TO_EE_YAW_RAD != 0.0:
+        grasp_rot = grasp_rot * R_scipy.from_euler("z", LIBERO_GRASPGEN_TO_EE_YAW_RAD)
+    if current_ee_quat is None:
+        return grasp_rot, float("nan")
+    q = np.asarray(current_ee_quat, dtype=np.float64).flatten()
+    current_rot = R_scipy.from_quat([q[1], q[2], q[3], q[0]])
+    best = min((grasp_rot, grasp_rot * R_scipy.from_euler("z", np.pi)),
+               key=lambda r: float(np.linalg.norm((r * current_rot.inv()).as_rotvec())))
+    return best, float(np.linalg.norm((best * current_rot.inv()).as_rotvec()))
+
+
+# Base staging slows down and stops by the tool camera's depth: the nearest point ahead of the arm's base
+# (robot0_right_center) in the band an open drawer front or a counter front occupies — the arm's base link
+# (8.5 cm ahead of that site, 0.6–0.9 m high) otherwise pushes an open drawer shut on the way.  The base
+# command is capped so a chunk's travel stays short of the obstacle, and staging ends inside this distance.
+# 0 = off.
+LIBERO_BUMPER_M = float(os.environ.get("GRASP_LIBERO_BUMPER_M", "0"))
+LIBERO_BUMPER_FWD_M = (0.12, 1.5)      # ahead of the site: beyond the robot's own base link, up to here
+LIBERO_BUMPER_LATERAL_M = 0.30
+LIBERO_BUMPER_Z_M = (0.02, 0.25)       # above the mobile base's body (top at the site's height), up to a counter top
+LIBERO_BUMPER_STRIDE = 4
+LIBERO_BASE_CHUNK_TRAVEL_M = 0.15      # m the base covers per unit command over the LIBERO_EXEC_STEPS of a chunk
+
+
+def libero_forward_clearance(obs: dict) -> float:
+    """Distance (m) from robot0_right_center to the nearest depth point in the bumper band ahead; inf
+    without depth or points."""
+    keys = ("observation/depth_for_grasp", "observation/camera_K", "observation/camera_extrinsic",
+            "observation/base_pos", "observation/base_yaw")
+    depth, K, T, base, yaw = (obs.get(k) for k in keys)
+    if any(v is None for v in (depth, K, T, base, yaw)):
+        return np.inf
+    s = LIBERO_BUMPER_STRIDE
+    d = np.squeeze(np.asarray(depth, dtype=np.float64))[::s, ::s]
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    v, u = (g * s for g in np.mgrid[0:d.shape[0], 0:d.shape[1]])
+    ok = np.isfinite(d) & (d > 0)
+    z = d[ok]
+    cam = np.stack([(u[ok] - K[0, 2]) / K[0, 0] * z, (v[ok] - K[1, 2]) / K[1, 1] * z, z], -1)
+    rel = cam @ T[:3, :3].T + T[:3, 3] - np.asarray(base, dtype=np.float64).flatten()[:3]
+    yaw = float(np.asarray(yaw).flatten()[0])
+    fwd = rel[:, 0] * np.cos(yaw) + rel[:, 1] * np.sin(yaw)
+    lat = -rel[:, 0] * np.sin(yaw) + rel[:, 1] * np.cos(yaw)
+    keep = ((fwd > LIBERO_BUMPER_FWD_M[0]) & (fwd < LIBERO_BUMPER_FWD_M[1]) & (np.abs(lat) < LIBERO_BUMPER_LATERAL_M)
+            & (rel[:, 2] > LIBERO_BUMPER_Z_M[0]) & (rel[:, 2] < LIBERO_BUMPER_Z_M[1]))
+    return float(fwd[keep].min()) if keep.any() else np.inf
+
+
+# Final approach: a stall this close to the grasp point (and within LIBERO_FINAL_CLOSE_LATERAL_M of the
+# approach line, short along it) closes the gripper where it is instead of failing — the fingertips, 1.3 cm
+# past the grip site, are on the surface or the object.  0 = off (LIBERO).
+LIBERO_FINAL_CLOSE_M = float(os.environ.get("GRASP_LIBERO_FINAL_CLOSE_M", "0"))
+LIBERO_FINAL_CLOSE_LATERAL_M = 0.01
 
 # Perception-lift parameters for LIBERO. Without this lift, the robot arm
 # itself sits between the agentview camera and the workspace, occluding the
@@ -659,6 +767,7 @@ class GraspToolExecutor:
         # consumed by _step_trajectory_libero_closed_loop.
         self._libero_pre_grasp_pos: np.ndarray | None = None
         self._libero_grasp_pos: np.ndarray | None = None
+        self._libero_waypoints: list | None = None
         self._libero_seg_target_pos: np.ndarray | None = None
         # Target rotation matrix (3×3, world-frame) for closed-loop
         # orientation tracking.  None means "hold current orientation"
@@ -1172,6 +1281,10 @@ class GraspToolExecutor:
                 enable_topdown_filter=enable_td_filter,
             )
             candidates = self._grasp_candidates(grasp_kw)
+            if self._env_mode == GraspEnvMode.LIBERO and LIBERO_LEAST_ROTATION and len(candidates) > 1:
+                turns = [libero_grasp_rotation(current_ee_quat, cam_to_world @ pose)[1] for pose, _ in candidates]
+                candidates = [c for _, c in sorted(zip(turns, candidates), key=lambda t: t[0])]
+                logger.info(f"  least wrist rotation first: {np.round(sorted(turns), 2).tolist()} rad")
             for i_cand, (grasp_pose, confidence) in enumerate(candidates):
                 try:
                     logger.info(
@@ -1512,35 +1625,56 @@ class GraspToolExecutor:
         """
         from scipy.spatial.transform import Rotation as _R
         if self._phase == GraspPhase.APPROACHING:
-            chunk = libero_stage_chunk(obs, self._libero_seg_target_pos, self._gripper_open, self._action_horizon, self._libero_stage)
+            stage_target = self._libero_pre_grasp_pos if LIBERO_OVERHEAD_M > 0 else self._libero_seg_target_pos
+            chunk = libero_stage_chunk(obs, stage_target, self._gripper_open, self._action_horizon, self._libero_stage)
             if chunk is not None:
                 self._status_message = "Driving the base toward the target..."
                 return {"actions": chunk}
+            if LIBERO_OVERHEAD_M > 0 and self._libero_waypoints is None:
+                self._libero_waypoints = libero_overhead_waypoints(
+                    self._extract_ee_pos(obs), self._libero_pre_grasp_pos, self._libero_seg_target_rot)
+                self._libero_next_waypoint()
         cur = self._extract_ee_pos(obs)
         target = self._libero_seg_target_pos
         delta_m = target - cur
         dist = float(np.linalg.norm(delta_m))
+        angle = libero_rotation_error(obs, self._libero_seg_target_rot) if LIBERO_OVERHEAD_M > 0 else 0.0
+        done = dist <= LIBERO_PHASE_DONE_M and angle <= LIBERO_ORI_DONE_RAD
+        progress = dist + LIBERO_ORI_PROGRESS_M_PER_RAD * angle
         # A segment that stops getting closer (contact, joint limit, out of reach) fails the grasp so the
         # master can retry, instead of commanding the same delta until the episode's horizon.
         key = tuple(np.round(target, 4))
         if getattr(self, "_libero_stall_key", None) != key:
             self._libero_stall_key, self._libero_best_dist, self._libero_stall_chunks = key, np.inf, 0
-        if dist < self._libero_best_dist - LIBERO_STALL_PROGRESS_M:
-            self._libero_best_dist, self._libero_stall_chunks = dist, 0
+        if progress < self._libero_best_dist - LIBERO_STALL_PROGRESS_M:
+            self._libero_best_dist, self._libero_stall_chunks = progress, 0
         else:
             self._libero_stall_chunks += 1
-        if (self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M
+        if (self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and not done
                 and self._phase == GraspPhase.LIFTING):
             logger.warning(f"  LIBERO lifting: EE stalled {dist * 100:.1f} cm from the lift target; perceiving from here")
             self._advance_phase_after_trajectory(obs, state)
             return self._noop_response(obs)
-        if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M:
+        if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and not done:
+            if (self._phase == GraspPhase.FINAL_APPROACH and dist <= LIBERO_FINAL_CLOSE_M
+                    and self._libero_seg_target_rot is not None):
+                axis = self._libero_seg_target_rot[:, 2]
+                along = float(delta_m @ axis)
+                lateral = float(np.linalg.norm(delta_m - along * axis))
+                if along > 0 and lateral <= LIBERO_FINAL_CLOSE_LATERAL_M:
+                    logger.warning(f"  LIBERO final approach: EE stalled {dist * 100:.1f} cm short along the "
+                                   f"approach ({lateral * 100:.1f} cm off it); closing here")
+                    state.log({"type": "grasp_contact_close", "short_m": round(dist, 4),
+                               "along_m": round(along, 4), "lateral_m": round(lateral, 4)})
+                    self._phase = GraspPhase.MEASURING
+                    return self._step_measuring(obs, state)
             logger.warning(
                 f"  LIBERO {self._phase.value}: EE stalled {dist * 100:.1f} cm from the target "
-                f"for {LIBERO_STALL_CHUNKS} chunks → FAILED"
+                f"({angle:.2f} rad off the orientation) for {LIBERO_STALL_CHUNKS} chunks → FAILED"
             )
             state.log({   # the geometry of the stall, for the readout (not shown to the master)
                 "type": "grasp_stall", "phase": self._phase.value, "short_m": round(dist, 4),
+                "ori_err_rad": round(angle, 4),
                 "target_world": np.round(target, 4).tolist(), "ee_world": np.round(cur, 4).tolist(),
                 "base_pos": None if obs.get("observation/base_pos") is None else np.round(obs["observation/base_pos"], 4).tolist(),
                 "base_yaw": None if obs.get("observation/base_yaw") is None else round(float(np.asarray(obs["observation/base_yaw"]).flatten()[0]), 4),
@@ -1598,10 +1732,19 @@ class GraspToolExecutor:
         )
 
         # Phase-done check: advance once we're close enough.
-        if dist <= LIBERO_PHASE_DONE_M:
+        if done and self._libero_waypoints:
+            self._libero_next_waypoint()
+        elif done:
             self._advance_phase_after_trajectory(obs, state)
 
         return {"actions": actions}
+
+    def _libero_next_waypoint(self) -> None:
+        self._libero_seg_target_pos, self._libero_seg_target_rot = self._libero_waypoints.pop(0)
+        self._libero_seg_ori_per_step_norm = np.zeros(3)
+        self._libero_seg_remaining_steps_estimate = LIBERO_INTERP_APPROACH
+        logger.info(f"  overhead approach: next waypoint {np.round(self._libero_seg_target_pos, 3)}, "
+                    f"{len(self._libero_waypoints)} to go")
 
     def _step_closing(self, obs: dict, state) -> dict:
         """Hold position with gripper closed and check for grasp success."""
@@ -1766,6 +1909,12 @@ class GraspToolExecutor:
         self._phase = GraspPhase.CLOSING
         self._step_at_close_start = state.episode_step
         self._status_message = "Closing gripper..."
+        if self._env_mode == GraspEnvMode.LIBERO and LIBERO_HOLD_BEFORE_CLOSE:
+            # A zero delta: the final segment's last row is a step along the approach, replaying it
+            # for a chunk pushes the open gripper on past the grasp point.
+            hold = np.zeros(self._action_dim)
+            hold[-1] = self._gripper_close if LIBERO_CLOSE_DURING_FINAL else self._gripper_open
+            return {"actions": np.tile(hold, (self._action_horizon, 1))}
         last_action = self._seg_final[-1] if self._seg_final else self._trajectory[-1]
         return {"actions": np.tile(last_action, (self._action_horizon, 1))}
 
@@ -2889,6 +3038,7 @@ class GraspToolExecutor:
             mask, score, box = self._grasp_client.detect_and_segment(
                 image, target_object, point=(x_norm, y_norm),
                 radius_px=POINT_SNAP_PX,
+                zoom=LIBERO_SAM3_ZOOM if self._env_mode == GraspEnvMode.LIBERO else 0,
             )
         except requests.HTTPError as e:
             if e.response is None or e.response.status_code != 422:
@@ -3311,40 +3461,13 @@ class GraspToolExecutor:
         # Pre-grasp: offset along negative approach direction
         pre_grasp_pos = grasp_pos - approach_dir * LIBERO_PRE_GRASP_OFFSET
 
-        # Compute total orientation delta (current → grasp frame).
-        # Grasp frame rotation from the planner.
-        grasp_rot = R.from_matrix(grasp_pose_world[:3, :3])
-
-        # Convert GraspGen axis convention (X=open) → panda_hand convention
-        # (Y=open) by post-rotating about the grasp's own Z (approach) axis.
-        # See LIBERO_GRASPGEN_TO_EE_YAW_RAD docstring above.
-        if LIBERO_GRASPGEN_TO_EE_YAW_RAD != 0.0:
-            grasp_rot = grasp_rot * R.from_euler(
-                "z", LIBERO_GRASPGEN_TO_EE_YAW_RAD,
-            )
-
-        if current_ee_quat is not None:
-            # current_ee_quat is (w, x, y, z) → scipy expects (x, y, z, w)
-            current_rot = R.from_quat([
-                current_ee_quat[1], current_ee_quat[2],
-                current_ee_quat[3], current_ee_quat[0],
-            ])
-        else:
-            # No orientation data — assume identity; orientation deltas
-            # will still be computed but may be inaccurate.
-            current_rot = R.identity()
-
-        # Total rotation delta: current → grasp, as axis-angle (radians).
-        # OSC_POSE applies orientation delta as `goal = R_delta @ R_current`
-        # (left-multiplication, see robosuite control_utils.set_goal_orientation),
-        # so delta must be expressed in the WORLD frame:
-        #     R_delta_world = R_grasp @ R_current.inv()
-        # A two-finger gripper closes the same way turned 180° about its approach axis: take the
-        # candidate the wrist is closer to (the other one often sits beyond a joint limit).
-        alt_rot = grasp_rot * R.from_euler("z", np.pi)
-        if current_ee_quat is not None and (np.linalg.norm((alt_rot * current_rot.inv()).as_rotvec())
-                                            < np.linalg.norm((grasp_rot * current_rot.inv()).as_rotvec())):
-            grasp_rot = alt_rot
+        # The EE rotation for the grasp (GraspGen's axes turned to panda_hand's, the finger-symmetric
+        # alternative the wrist is nearer) and the delta from the current orientation, as axis-angle in
+        # the WORLD frame: OSC_POSE applies it as `goal = R_delta @ R_current` (robosuite
+        # control_utils.set_goal_orientation).  Without ee_quat the current orientation is taken as identity.
+        grasp_rot, _ = libero_grasp_rotation(current_ee_quat, grasp_pose_world)
+        current_rot = (R.from_quat([current_ee_quat[1], current_ee_quat[2], current_ee_quat[3], current_ee_quat[0]])
+                       if current_ee_quat is not None else R.identity())
         rot_delta = (grasp_rot * current_rot.inv()).as_rotvec()
         # Spread orientation change across approach phase only
         n_approach = LIBERO_INTERP_APPROACH
@@ -3364,6 +3487,7 @@ class GraspToolExecutor:
         self._libero_pre_grasp_pos = pre_grasp_pos.copy()
         self._libero_grasp_pos = grasp_pos.copy()
         self._libero_stage = {}
+        self._libero_waypoints = None   # overhead approach: built once the base has staged, from the EE then
         self._libero_seg_target_pos = pre_grasp_pos.copy()
         self._libero_seg_target_rot = grasp_rot.as_matrix()
         self._libero_seg_ori_per_step_norm = (
@@ -3531,6 +3655,7 @@ class GraspToolExecutor:
         self._gt_name = None
         self._libero_pre_grasp_pos = None
         self._libero_grasp_pos = None
+        self._libero_waypoints = None
         self._libero_seg_target_pos = None
         self._libero_seg_target_rot = None
         self._libero_seg_ori_per_step_norm = np.zeros(3)

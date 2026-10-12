@@ -301,23 +301,40 @@ grasp() that picks that object up.
 Example: {"tool": "grasp", "args": {"target": "blue block", "stack": true}}"""
 
 
-# Robosuite branch: the master gets only the NOW image (the system prompt's input list is rewritten).
+# Robosuite branch: the master gets only the NOW image (the system prompt's input list is rewritten);
+# with several tool cameras (observation/camera_views) it gets one labelled NOW image per camera.
 _BEFORE_NOW_LINES = "  - a BEFORE image (start of the episode)\n  - a NOW image (current scene)"
 _NOW_ONLY_LINE = "  - a NOW image (the current scene; the tools see this same image)"
+_NOW_VIEWS_LINE = ("  - one NOW image per camera, each labelled `camera=<name>` (the current scene; "
+                   "the tools see these same images)")
 assert _BEFORE_NOW_LINES in TOOL_CHAIN_SYSTEM_PROMPT
+_VIEW_KEYS = {"image": "observation/image_for_grasp", "depth": "observation/depth_for_grasp",
+              "K": "observation/camera_K", "extrinsic": "observation/camera_extrinsic"}
+
+
+def _camera_view_obs(obs: dict, camera: str | None) -> dict:
+    """The obs a tool perceives from: with several cameras, the chosen view on the tool-camera keys."""
+    views = obs.get("observation/camera_views")
+    if not views or camera is None:
+        return obs
+    view = views[camera]
+    return {**obs, **{key: view[name] for name, key in _VIEW_KEYS.items()},
+            "observation/image_raw": view["image"]}
 
 
 def _call_signature(decision: "ToolChainDecision") -> tuple:
-    """(tool, phrase, point) of a decision, the identity used to spot a verbatim resend."""
+    """(tool, phrase, point, camera) of a decision, the identity used to spot a verbatim resend."""
     phrase = decision.args.get("target" if decision.tool == "grasp" else "destination") or ""
     point = decision.args.get("point")
     point = tuple(round(float(v), 2) for v in point) if point is not None else None
-    return (decision.tool, " ".join(str(phrase).lower().split()), point)
+    return (decision.tool, " ".join(str(phrase).lower().split()), point, decision.args.get("camera"))
 
 
-def _tool_chain_point_note(point_tools: frozenset[str], refuses_repeats: bool = False) -> str:
+def _tool_chain_point_note(point_tools: frozenset[str], refuses_repeats: bool = False,
+                           cameras: tuple[str, ...] = ()) -> str:
     """System-prompt addition requiring ``args.point`` on ``point_tools`` calls; with
-    *refuses_repeats* it also says a failed call is not to be resent verbatim."""
+    *refuses_repeats* it also says a failed call is not to be resent verbatim; with
+    *cameras* the call also names the labelled NOW image the point is in."""
     tools = sorted(point_tools)
     lines = [
         "",
@@ -325,6 +342,13 @@ def _tool_chain_point_note(point_tools: frozenset[str], refuses_repeats: bool = 
         f"POINTS: every {' and '.join(tools)} call also carries `point`: "
         f"{POINT_CONVENTION}, in the NOW image.",
     ]
+    if cameras:
+        lines.append(
+            f"  Every {' and '.join(tools)} call also carries `camera`, one of "
+            f"{', '.join(cameras)}: the label of the NOW image the point is in. Pick the camera "
+            "whose image shows the target; a point is read only in that image. If no image shows "
+            "the target, do not point at the image centre: replan and say what is not visible."
+        )
     if "grasp" in point_tools:
         lines.append("  - grasp: a point on the object to pick up.")
     if "grasp" in point_tools and refuses_repeats:
@@ -338,14 +362,15 @@ def _tool_chain_point_note(point_tools: frozenset[str], refuses_repeats: bool = 
             "  - place: where the held object should go — on the destination "
             "object, or on the open table spot for an empty-space destination."
         )
+    cam = f'"camera": "{cameras[0]}", ' if cameras else ""
     examples = {
-        "grasp": '{"tool": "grasp", "args": {"target": "red block", "point": [0.42, 0.57]}}',
-        "place": '{"tool": "place", "args": {"destination": "in the blue bowl", '
-                 '"held_object_hint": "red block", "point": [0.63, 0.48]}}',
+        "grasp": f'{{"tool": "grasp", "args": {{"target": "red block", {cam}"point": [0.42, 0.57]}}}}',
+        "place": f'{{"tool": "place", "args": {{"destination": "in the blue bowl", '
+                 f'"held_object_hint": "red block", {cam}"point": [0.63, 0.48]}}}}',
     }
     lines.append(
-        "The examples above omit `point`; here a "
-        f"{' or '.join(tools)} call without it is rejected. Examples:"
+        f"The examples above omit `point`{' and `camera`' if cameras else ''}; here a "
+        f"{' or '.join(tools)} call without {'them' if cameras else 'it'} is rejected. Examples:"
     )
     lines += [f"  {examples[t]}" for t in tools]
     return "\n".join(lines)
@@ -366,12 +391,15 @@ def build_tool_chain_user_content(
     last_args: dict[str, Any] | None,
     last_status: str | None,
     last_reason: str | None,
+    now_views: dict[str, np.ndarray] | None = None,
 ) -> list[dict]:
     """Build the user-content list for one tool_chain VLM call.
 
     Returns a list of message-content dicts compatible with
     OpenAI / NVIDIA-inference chat.completions: a leading text block
-    describing the plan + history, then BEFORE and NOW images.
+    describing the plan + history, then BEFORE and NOW images; with
+    *now_views* (camera label → image) one labelled NOW image per camera
+    instead of *now_image*.
     """
     lines = [f"Task: {task}", "", "Subgoals:"]
     if not subgoals:
@@ -405,12 +433,15 @@ def build_tool_chain_user_content(
                 "url": f"data:image/jpeg;base64,{encode_image_b64(before_image)}",
             },
         })
-    user_content.append({
-        "type": "image_url",
-        "image_url": {
-            "url": f"data:image/jpeg;base64,{encode_image_b64(now_image)}",
-        },
-    })
+    for label, image in (now_views or {None: now_image}).items():
+        if label is not None:
+            user_content.append({"type": "text", "text": f"NOW image, camera={label}:"})
+        user_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{encode_image_b64(image)}",
+            },
+        })
     return user_content
 
 
@@ -419,12 +450,14 @@ def build_tool_chain_user_content(
 # ----------------------------------------------------------------------
 
 def parse_tool_chain_response(
-    raw: str, point_tools: frozenset[str] = frozenset(),
+    raw: str, point_tools: frozenset[str] = frozenset(), cameras: tuple[str, ...] = (),
 ) -> ToolChainDecision:
     """Parse a VLM response into a :class:`ToolChainDecision`.
 
     Calls of a tool in ``point_tools`` must carry ``args.point``
     (normalised ``[x, y]`` in the NOW image); it is stored as a tuple.
+    With ``cameras`` (the labelled NOW images) they must also carry
+    ``args.camera``, one of them: the image the point is in.
 
     Raises:
         ValueError when the JSON is malformed or required fields are
@@ -494,6 +527,11 @@ def parse_tool_chain_response(
             decision.args["point"] = parse_norm_point(decision.args.get("point"))
         except ValueError as e:
             raise ValueError(f"{decision.tool} needs `args.point`: {e}") from e
+        if cameras and decision.args.get("camera") not in cameras:
+            raise ValueError(
+                f"{decision.tool} needs `args.camera`, one of {cameras}; "
+                f"got {decision.args.get('camera')!r}"
+            )
 
     # Pairing rule: advance / replan / abort never run a tool.  The
     # strategy will silently drop the tool field anyway (it returns
@@ -876,6 +914,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 obs, state, decision.args.get("target", ""), stack=g_stack,
                 point=(decision.args.get("point")
                        if "grasp" in self._point_consumers else None),
+                camera=decision.args.get("camera"),
             )
         elif decision.tool == "place":
             self._activate_place_for_tool_chain(obs, state, decision.args)
@@ -911,6 +950,8 @@ class ToolChainStrategy(SubgoalStrategy):
         decision which silently re-introduces the kind of fallback
         the design rules warn against).
         """
+        views = obs.get("observation/camera_views") if self._robosuite else None
+        cameras = tuple(views) if views else ()
         user_content = build_tool_chain_user_content(
             task=state.original_instruction or "",
             subgoals=list(state.subgoals),
@@ -921,11 +962,12 @@ class ToolChainStrategy(SubgoalStrategy):
             last_args=state.tool_chain_last_args,
             last_status=state.tool_chain_last_status,
             last_reason=state.tool_chain_last_reason,
+            now_views={label: view["image"] for label, view in views.items()} if views else None,
         )
         t0 = time.time()
         system_prompt = TOOL_CHAIN_SYSTEM_PROMPT
         if self._robosuite:
-            system_prompt = system_prompt.replace(_BEFORE_NOW_LINES, _NOW_ONLY_LINE)
+            system_prompt = system_prompt.replace(_BEFORE_NOW_LINES, _NOW_VIEWS_LINE if views else _NOW_ONLY_LINE)
         if self._use_front_camera:
             system_prompt = system_prompt + _TOOL_CHAIN_FRONT_CAM_NOTE
         # Only expose the `stack` arg to the planner when the master switch
@@ -934,7 +976,7 @@ class ToolChainStrategy(SubgoalStrategy):
         if self._stack_mode_enabled:
             system_prompt = system_prompt + _TOOL_CHAIN_STACK_NOTE
         if self._point_tools:
-            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._robosuite)
+            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._robosuite, cameras)
         try:
             raw = self._vlm_call(system_prompt, user_content)
         except Exception as e:
@@ -953,7 +995,7 @@ class ToolChainStrategy(SubgoalStrategy):
         )
 
         try:
-            decision = parse_tool_chain_response(raw, self._point_tools)
+            decision = parse_tool_chain_response(raw, self._point_tools, cameras)
         except ValueError as e:
             logger.warning(
                 f"tool_chain: malformed VLM response ({e}); "
@@ -1058,7 +1100,7 @@ class ToolChainStrategy(SubgoalStrategy):
 
     def _activate_grasp_for_tool_chain(
         self, obs, state, target: str, stack: bool = True,
-        point: tuple[float, float] | None = None,
+        point: tuple[float, float] | None = None, camera: str | None = None,
     ) -> None:
         """Direct grasp activation for tool_chain mode.
 
@@ -1069,6 +1111,7 @@ class ToolChainStrategy(SubgoalStrategy):
         ``stack`` couples the grasp to the intended placement: when stack-mode
         is enabled and ``stack=False`` (drop-from-above), the grasp's top-down
         filter is disabled so all GraspGen candidates are kept.
+        ``camera`` is the labelled NOW image the point is in (several tool cameras).
         """
         target = (target or "").strip()
         if not target:
@@ -1076,6 +1119,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 "tool_chain: grasp request with empty target; skipping"
             )
             return
+        obs = _camera_view_obs(obs, camera)
         from vlm_orchestrator.grasp.tool import GraspToolExecutor
         if state.grasp_tool_executor is None:
             state.grasp_tool_executor = GraspToolExecutor(
@@ -1130,6 +1174,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 "tool_chain: place request with empty destination; skipping"
             )
             return
+        obs = _camera_view_obs(obs, args.get("camera"))
 
         if state.place_tool_executor is None:
             state.place_tool_executor = PlaceToolExecutor(
