@@ -348,17 +348,12 @@ class TestGraspToolGTSIM:
         with pytest.raises(RuntimeError, match="not on a scene object"):
             executor._resolve_gt_target(obs, "red block")
 
-    def test_grasp_verdict_needs_held_and_lifted(self):
-        executor = GraspToolExecutor(seg_mode=GraspSegMode.GT_SIM, env_mode="libero")
-
-        def obs(z, contacts):
-            return {"gt_state": {
-                "objects": {"red_block": {"pos": [0.3, 0.0, z]}},
-                "robot": {"objects_in_contact_raw": contacts},
-            }}
-
-        assert executor._judge_grasp(obs(0.15, ["red_block"])) is None  # no target resolved
-        executor._gt_name, executor._target_z0 = "red_block", 0.10
-        assert executor._judge_grasp(obs(0.15, ["red_block"]))[0] is True
-        assert executor._judge_grasp(obs(0.11, ["red_block"]))[0] is False
-        assert executor._judge_grasp(obs(0.15, []))[0] is False
+    def test_gt_sim_grasp_gets_no_ground_truth_verdict(self):
+        """An empty gt_sim grasp is DONE, as in the perception seg modes."""
+        executor = GraspToolExecutor(seg_mode=GraspSegMode.GT_SIM)
+        executor._gt_name = "red_block"
+        obs = {"gt_state": {
+            "objects": {"red_block": {"pos": [0.3, 0.0, 0.10]}},
+            "robot": {"objects_in_contact_raw": []},
+        }}
+        assert executor._judge_grasp(obs) is None

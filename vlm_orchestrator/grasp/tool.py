@@ -181,9 +181,6 @@ GRASP_ROBOLAB_CLEAN_IK = (
 
 # Retreat offset: lift straight up in world frame (metres)
 RETREAT_HEIGHT = 0.10
-# A finished grasp counts only if the target touches the gripper and has
-# risen at least this far since perception (RoboLab's "lifted" threshold).
-GRASP_LIFT_THRESHOLD_M = 0.03
 
 # Safe height: lift arm to this z before perception (clears camera view)
 SAFE_HEIGHT_Z = 0.45
@@ -633,12 +630,10 @@ class GraspToolExecutor:
 
         # Settle counter (wait for object to land before perception)
         self._settle_remaining: int = 0
-        # gt_sim: the master's point on the target, the scene object the
-        # target resolved to, and its gt_state height at perception (the
-        # baseline of the post-retreat verdict).
+        # gt_sim: the master's point on the target and the scene object the
+        # target resolved to.
         self._target_point: tuple[float, float] | None = None
         self._gt_name: str | None = None
-        self._target_z0: float | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -910,7 +905,6 @@ class GraspToolExecutor:
             if self._seg_mode == GraspSegMode.GT_SIM:
                 # ---- GT_SIM: use ground-truth mask from simulator ----
                 self._gt_name = self._resolve_gt_target(obs, target_object)
-                self._target_z0 = self._gt_height(obs)
                 mask = gt_object_mask(
                     obs, self._gt_name, front=self._use_front_camera,
                 )
@@ -1754,8 +1748,11 @@ class GraspToolExecutor:
     def _step_verifying(self, obs: dict, state) -> dict:
         """Hold for one chunk and judge the grasp on the post-retreat obs.
 
-        Called exactly once after RETREATING ends. Without gt_state for the
-        target there is nothing to judge, and the grasp is DONE.
+        Called exactly once after RETREATING ends. Only a check the robot can
+        make itself judges (the robosuite branch's finger opening); otherwise
+        the grasp is DONE and the master tells held from empty on its next look
+        at the scene. Ground truth is never handed back, so gt_sim gets the same
+        feedback as the perception seg modes.
         """
         verdict = self._judge_grasp(obs)
         if verdict is None or verdict[0]:
@@ -1769,38 +1766,21 @@ class GraspToolExecutor:
             state.log({
                 "type": "grasp_verdict",
                 "target": self._target_object,
-                "object": self._gt_name,
                 "success": verdict[0],
                 "reason": verdict[1],
             })
         return self._noop_response(obs)
 
-    def _gt_height(self, obs: dict) -> float | None:
-        """gt_state height of the resolved target, or None without one."""
-        obj = (obs.get("gt_state") or {}).get("objects", {}).get(self._gt_name)
-        return None if obj is None else float(obj["pos"][2])
-
     def _judge_grasp(self, obs: dict) -> tuple[bool, str] | None:
-        """(success, reason) for the finished grasp, or None without GT for the target."""
-        z = self._gt_height(obs)
-        if z is None or self._target_z0 is None:
-            if self._env_mode == GraspEnvMode.LIBERO and LIBERO_EMPTY_GRASP_POS > 0:
-                # No ground truth: a parallel gripper that closed all the way holds nothing
-                # (gripper_position 0 open / 1 closed, read after the retreat).
-                g = self._extract_gripper(obs)
-                return g < LIBERO_EMPTY_GRASP_POS, f"fingers {'stopped at' if g < LIBERO_EMPTY_GRASP_POS else 'closed to'} gripper_position {g:.2f}"
+        """(success, reason) for the finished grasp, or None without a verdict.
+
+        Only the robosuite branch judges: a parallel gripper that closed all the
+        way holds nothing (gripper_position 0 open / 1 closed, read after the retreat).
+        """
+        if self._env_mode != GraspEnvMode.LIBERO or LIBERO_EMPTY_GRASP_POS <= 0:
             return None
-        # The ungated contact sensor: the eval client's ``objects_in_contact``
-        # drops contacts below a gripper-closure gate that a wide held object
-        # can stall the fingers under.
-        contacts = obs["gt_state"].get("robot", {}).get("objects_in_contact_raw", [])
-        held = self._gt_name in contacts
-        lift = z - self._target_z0
-        reason = (
-            f"'{self._gt_name}' {'touching' if held else 'not touching'} the "
-            f"gripper, raised {lift * 100:.1f} cm"
-        )
-        return held and lift >= GRASP_LIFT_THRESHOLD_M, reason
+        g = self._extract_gripper(obs)
+        return g < LIBERO_EMPTY_GRASP_POS, f"fingers {'stopped at' if g < LIBERO_EMPTY_GRASP_POS else 'closed to'} gripper_position {g:.2f}"
 
     def _do_post_move_log(self, obs: dict, state) -> None:
         """Capture post-move position/orientation metrics and save debug images."""
@@ -3495,7 +3475,6 @@ class GraspToolExecutor:
         self._T_flange_to_tcp = None
         self._target_point = None
         self._gt_name = None
-        self._target_z0 = None
         self._libero_pre_grasp_pos = None
         self._libero_grasp_pos = None
         self._libero_seg_target_pos = None
