@@ -355,8 +355,8 @@ LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
 LIBERO_PERCEPTION_LIFT_DZ = float(os.environ.get("GRASP_LIBERO_LIFT_DZ", "0.25"))    # m up from current EE
 LIBERO_PERCEPTION_LIFT_DX = float(os.environ.get("GRASP_LIBERO_LIFT_DX", "-0.12"))   # m back toward robot base (world x)
 LIBERO_INTERP_PERCEPTION_LIFT = 6   # steps (≥ Δ/MAX_DELTA per axis)
-# A SAM2 mask grown from the master's point that covers more of the image than any graspable
-# object could is the counter / cabinet under a wrong point, not the target.
+# Robosuite branch: a SAM2 mask grown from the master's point that covers more of the image
+# than any graspable object could is the counter / cabinet under a wrong point, not the target.
 POINT_MASK_MAX_FRAC = 0.05
 
 # Axis-convention correction: GraspGen's grasp frame uses
@@ -807,7 +807,15 @@ class GraspToolExecutor:
         except Exception as e:
             logger.error(f"grasp_with_tool lift failed: {e}", exc_info=True)
             self._phase = GraspPhase.FAILED
-            self._status_message = f"Failed: {e}"
+            self._status_message = self._failure_text(e)
+
+    def _failure_text(self, e: Exception) -> str:
+        """What the master reads when a phase raises. The robosuite branch passes on the
+        perception server's reason (phrases tried, best scores); RoboLab's protocol is frozen
+        on the bare exception text."""
+        if self._env_mode == GraspEnvMode.LIBERO and getattr(e, "detail", None):
+            return f"Failed: {e.detail}"
+        return f"Failed: {e}"
 
     def _start_perception(self, obs: dict, state) -> None:
         """Run the perception pipeline (detection → segmentation → grasp).
@@ -2122,7 +2130,7 @@ class GraspToolExecutor:
             except Exception as e:
                 logger.error(f"Perception after lift failed: {e}", exc_info=True)
                 self._phase = GraspPhase.FAILED
-                self._status_message = f"Failed: {e}"
+                self._status_message = self._failure_text(e)
             return
 
         elif self._phase == GraspPhase.APPROACHING:
@@ -2874,7 +2882,10 @@ class GraspToolExecutor:
             if e.response is None or e.response.status_code != 422:
                 raise
             logger.info(f"  SAM3@point: {e.response.text[:200]}; SAM2 from the point")
-            return self._sam2_from_point(image, target_object, x_norm, y_norm)
+            return self._sam2_from_point(
+                image, target_object, x_norm, y_norm,
+                note=getattr(e, "detail", None) if self._env_mode == GraspEnvMode.LIBERO else None,
+            )
         return mask, score, tuple(box)
 
     def _sam2_from_point(
@@ -2883,8 +2894,13 @@ class GraspToolExecutor:
         target_object: str,
         x_norm: float,
         y_norm: float,
+        note: str | None = None,
     ) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
-        """SAM2 point-prompt mask (no box) from the master's normalised point."""
+        """SAM2 point-prompt mask (no box) from the master's normalised point.
+
+        *note* (robosuite branch): why SAM3 had nothing under the point, prefixed to the
+        failure text so the master reads the detector's scores too."""
+        prefix = f"{note}; " if note else ""
         try:
             mask, iou = self._grasp_client.segment(
                 image, x_norm, y_norm, box=None,
@@ -2901,15 +2917,15 @@ class GraspToolExecutor:
         )
         if mask.sum() < 50:
             raise RuntimeError(
-                f"SAM2 from VLM point returned degenerate mask "
+                f"{prefix}SAM2 from VLM point returned degenerate mask "
                 f"({int(mask.sum())} px, iou={iou:.3f}) for "
                 f"{target_object!r} at ({x_norm:.3f}, {y_norm:.3f}). "
                 f"VLM likely pointed at the wrong object — retry "
                 f"with a more specific phrase."
             )
-        if mask.sum() > POINT_MASK_MAX_FRAC * mask.size:
+        if self._env_mode == GraspEnvMode.LIBERO and mask.sum() > POINT_MASK_MAX_FRAC * mask.size:
             raise RuntimeError(
-                f"SAM2 from the point ({x_norm:.3f}, {y_norm:.3f}) grew into "
+                f"{prefix}SAM2 from the point ({x_norm:.3f}, {y_norm:.3f}) grew into "
                 f"{int(mask.sum())} px ({mask.sum() / mask.size:.0%} of the image): the point is on a "
                 f"surface, not on {target_object!r} — it is not there in the current image"
             )

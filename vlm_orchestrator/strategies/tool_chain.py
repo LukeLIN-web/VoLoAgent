@@ -309,8 +309,9 @@ def _call_signature(decision: "ToolChainDecision") -> tuple:
     return (decision.tool, " ".join(str(phrase).lower().split()), point)
 
 
-def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
-    """System-prompt addition requiring ``args.point`` on ``point_tools`` calls."""
+def _tool_chain_point_note(point_tools: frozenset[str], refuses_repeats: bool = False) -> str:
+    """System-prompt addition requiring ``args.point`` on ``point_tools`` calls; with
+    *refuses_repeats* it also says a failed call is not to be resent verbatim."""
     tools = sorted(point_tools)
     lines = [
         "",
@@ -320,6 +321,7 @@ def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
     ]
     if "grasp" in point_tools:
         lines.append("  - grasp: a point on the object to pick up.")
+    if "grasp" in point_tools and refuses_repeats:
         lines.append(
             "    If a grasp FAILED because nothing was detected at your point, the object is "
             "not at that point in the NOW image: find it again in the NOW image and give a new "
@@ -538,7 +540,8 @@ class ToolChainConfig:
     """Hard cap on tool calls before forcing abort (bound runtime cost)."""
 
     max_identical_calls: int = 2
-    """A call with the same tool, phrase and point as the one that just FAILED may be
+    """Robosuite branch (--env libero) only; RoboLab's protocol is frozen without it.
+    A call with the same tool, phrase and point as the one that just FAILED may be
     re-issued this many times in a row (the first retry is legitimate: the arm moved);
     after that the strategy refuses it and tells the master to change phrase or point."""
 
@@ -611,6 +614,9 @@ class ToolChainStrategy(SubgoalStrategy):
         self._tc_config = config
         self._topdown_fallback = topdown_fallback
         self._grasp_candidates = grasp_candidates
+        # Robosuite (RoboCasa) branch only: refuse a verbatim resend of a FAILED call and say so
+        # in the prompt. RoboLab's master input stays as frozen for the paper's tables.
+        self._refuses_repeats = env_mode == "libero"
 
         # Optional forced stack override for A/B testing: when
         # STACK_FORCE={true,false} the VLM's per-tool ``stack`` arg is
@@ -807,7 +813,7 @@ class ToolChainStrategy(SubgoalStrategy):
             state.tool_chain_repeats += 1
         else:
             state.tool_chain_repeats = 0
-        if state.tool_chain_repeats >= self._tc_config.max_identical_calls:
+        if self._refuses_repeats and state.tool_chain_repeats >= self._tc_config.max_identical_calls:
             logger.warning(
                 f"tool_chain: {decision.tool}({decision.args}) refused — the identical call "
                 f"already failed {state.tool_chain_repeats}x in a row"
@@ -899,7 +905,7 @@ class ToolChainStrategy(SubgoalStrategy):
         if self._stack_mode_enabled:
             system_prompt = system_prompt + _TOOL_CHAIN_STACK_NOTE
         if self._point_tools:
-            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools)
+            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._refuses_repeats)
         try:
             raw = self._vlm_call(system_prompt, user_content)
         except Exception as e:
