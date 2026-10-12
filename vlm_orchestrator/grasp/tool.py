@@ -288,8 +288,63 @@ LIBERO_MAX_ORI_DELTA = 0.5      # rad — full OSC_POSE per-step limit
 LIBERO_INTERP_APPROACH = 8      # steps for approach phase
 LIBERO_INTERP_FINAL = 3         # steps for final approach
 LIBERO_INTERP_RETREAT = 4       # steps for retreat
-LIBERO_RETREAT_HEIGHT = 0.08    # m to lift after grasping
+LIBERO_RETREAT_HEIGHT = float(os.environ.get("GRASP_LIBERO_RETREAT_M", "0.08"))  # m to lift after grasping
 LIBERO_PRE_GRASP_OFFSET = 0.06  # m above grasp pose
+
+# Other robosuite envs (RoboCasa365: PandaOmron, OSC_POSE, upright renders) reuse the LIBERO branch;
+# the launcher sets these knobs, LIBERO keeps the defaults.
+#   GRASP_LIBERO_GRIP_DEPTH_M   EE (grip site, between the finger pads) target = GraspGen origin + this × approach axis.
+#                               GraspGen's origin is the Panda hand frame, its contact point GRASPGEN_GRIPPER_DEPTH_M deeper;
+#                               LIBERO's historical path drives the grip site to the hand origin (0).
+#   GRASP_LIBERO_CLOSE_DURING_FINAL  1: command close while descending pre-grasp → grasp (LIBERO); 0: close only after arriving.
+#   GRASP_LIBERO_MIRROR_X       1: LIBERO renders are mirrored, so images, depth and the master's points get x-flipped; 0: upright.
+LIBERO_GRIP_DEPTH_M = float(os.environ.get("GRASP_LIBERO_GRIP_DEPTH_M", "0"))
+# The eval client executes this many steps of every chunk before asking again, so a chunk must not cover more
+# than the remaining delta: the per-step delta is the remainder over at least this many steps.
+LIBERO_EXEC_STEPS = int(os.environ.get("GRASP_LIBERO_EXEC_STEPS", "5"))
+LIBERO_STALL_CHUNKS = 12          # closed-loop chunks without getting closer before the grasp fails
+LIBERO_STALL_PROGRESS_M = 0.005   # what counts as getting closer
+# Mobile-base staging (RoboCasa365's PandaOmron; the client sends observation/base_pos + base_yaw and executes 9-D rows
+# [arm 0×6, gripper, base forward, base lateral] in base mode): a target farther than this from the arm's base is first
+# driven toward, like Harness-VLA's navigate_to / move_base staging.  0 = fixed base (LIBERO), no staging.
+LIBERO_REACH_M = float(os.environ.get("GRASP_LIBERO_REACH_M", "0"))
+LIBERO_STAGE_DONE_M = 0.03        # stop driving this much inside the reach (hysteresis)
+LIBERO_STAGE_MAX_CHUNKS = 40
+LIBERO_STAGE_STUCK_CHUNKS = 3     # chunks the base fails to move LIBERO_STAGE_MIN_MOVE_M before giving up (blocked by a fixture)
+LIBERO_STAGE_MIN_MOVE_M = 0.005
+LIBERO_BASE_CMD_MAX = 0.5
+
+
+def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: dict):
+    """Base-staging chunk toward ``target`` (world) when it is beyond LIBERO_REACH_M horizontally, else ``None``.
+
+    ``st`` is the caller's staging state (reset to ``{}`` when a new target is planned): hysteresis, chunk count,
+    and the stuck detector that stops staging when the base no longer moves (blocked by the counter).
+    """
+    base, yaw = obs.get("observation/base_pos"), obs.get("observation/base_yaw")
+    if LIBERO_REACH_M <= 0 or base is None or yaw is None or target is None or st.get("off"):
+        return None
+    base = np.asarray(base, dtype=np.float64).flatten()[:2]
+    v = np.asarray(target, dtype=np.float64)[:2] - base
+    if float(np.linalg.norm(v)) <= LIBERO_REACH_M - (LIBERO_STAGE_DONE_M if st.get("staging") else 0.0):
+        st["staging"] = False
+        return None
+    prev = st.get("prev")
+    st["stuck"] = 0 if prev is None or float(np.linalg.norm(base - prev)) > LIBERO_STAGE_MIN_MOVE_M else st.get("stuck", 0) + 1
+    st["prev"], st["chunks"] = base, st.get("chunks", 0) + 1
+    if st["stuck"] >= LIBERO_STAGE_STUCK_CHUNKS or st["chunks"] > LIBERO_STAGE_MAX_CHUNKS:
+        logger.info("  base staging: base not moving toward the target (blocked), approaching from here")
+        st["off"], st["staging"] = True, False
+        return None
+    st["staging"] = True
+    yaw = float(np.asarray(yaw).flatten()[0])
+    c, s = np.cos(yaw), np.sin(yaw)
+    v_base = np.array([c * v[0] + s * v[1], -s * v[0] + c * v[1]])
+    cmd = np.clip(v_base * 3.0, -LIBERO_BASE_CMD_MAX, LIBERO_BASE_CMD_MAX)
+    row = np.concatenate([np.zeros(6), [gripper_cmd], cmd])
+    return np.tile(row, (horizon, 1))
+LIBERO_CLOSE_DURING_FINAL = os.environ.get("GRASP_LIBERO_CLOSE_DURING_FINAL", "1") == "1"
+LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
 
 # Perception-lift parameters for LIBERO. Without this lift, the robot arm
 # itself sits between the agentview camera and the workspace, occluding the
@@ -297,8 +352,8 @@ LIBERO_PRE_GRASP_OFFSET = 0.06  # m above grasp pose
 # the arm out of the camera's line of sight. (The agentview camera is fixed
 # above and in front of the robot base — pulling the EE backward toward the
 # base + upward clears the FOV.)
-LIBERO_PERCEPTION_LIFT_DZ = 0.25    # m up from current EE
-LIBERO_PERCEPTION_LIFT_DX = -0.12   # m back toward robot base (world x)
+LIBERO_PERCEPTION_LIFT_DZ = float(os.environ.get("GRASP_LIBERO_LIFT_DZ", "0.25"))    # m up from current EE
+LIBERO_PERCEPTION_LIFT_DX = float(os.environ.get("GRASP_LIBERO_LIFT_DX", "-0.12"))   # m back toward robot base (world x)
 LIBERO_INTERP_PERCEPTION_LIFT = 6   # steps (≥ Δ/MAX_DELTA per axis)
 
 # Axis-convention correction: GraspGen's grasp frame uses
@@ -490,6 +545,7 @@ class GraspToolExecutor:
             self._action_dim = LIBERO_ACTION_DIM
             self._gripper_open = LIBERO_GRIPPER_OPEN
             self._gripper_close = LIBERO_GRIPPER_CLOSE
+            self._libero_stage: dict = {}
         else:
             self._intrinsics = intrinsics or overshoulder_left_intrinsics()
             self._action_horizon = ACTION_HORIZON
@@ -771,7 +827,7 @@ class GraspToolExecutor:
         from vlm_orchestrator.grasp import debug as dbg
         dbg.set_state(
             state,
-            pip_x_flip=(self._env_mode == GraspEnvMode.LIBERO),
+            pip_x_flip=(self._env_mode == GraspEnvMode.LIBERO and LIBERO_MIRROR_X),
         )
 
         hitl = getattr(state, "_hitl", None)
@@ -1446,14 +1502,39 @@ class GraspToolExecutor:
         target — prevents over-shoot at the segment boundary.
         """
         from scipy.spatial.transform import Rotation as _R
+        if self._phase == GraspPhase.APPROACHING:
+            chunk = libero_stage_chunk(obs, self._libero_seg_target_pos, self._gripper_open, self._action_horizon, self._libero_stage)
+            if chunk is not None:
+                self._status_message = "Driving the base toward the target..."
+                return {"actions": chunk}
         cur = self._extract_ee_pos(obs)
         target = self._libero_seg_target_pos
         delta_m = target - cur
         dist = float(np.linalg.norm(delta_m))
+        # A segment that stops getting closer (contact, joint limit, out of reach) fails the grasp so the
+        # master can retry, instead of commanding the same delta until the episode's horizon.
+        key = tuple(np.round(target, 4))
+        if getattr(self, "_libero_stall_key", None) != key:
+            self._libero_stall_key, self._libero_best_dist, self._libero_stall_chunks = key, np.inf, 0
+        if dist < self._libero_best_dist - LIBERO_STALL_PROGRESS_M:
+            self._libero_best_dist, self._libero_stall_chunks = dist, 0
+        else:
+            self._libero_stall_chunks += 1
+        if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M:
+            logger.warning(
+                f"  LIBERO {self._phase.value}: EE stalled {dist * 100:.1f} cm from the target "
+                f"for {LIBERO_STALL_CHUNKS} chunks → FAILED"
+            )
+            self._status_message = (
+                f"Failed: arm stalled {dist * 100:.1f} cm short of the {self._phase.value} "
+                f"target (blocked or unreachable)"
+            )
+            self._phase = GraspPhase.FAILED
+            return self._noop_response(obs)
 
         # Per-step delta in metres, capped at LIBERO_MAX_POS_DELTA per axis.
         per_step_m = np.clip(
-            delta_m / max(self._libero_seg_remaining_steps_estimate, 1),
+            delta_m / max(self._libero_seg_remaining_steps_estimate, LIBERO_EXEC_STEPS),
             -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA,
         )
         per_step_norm = per_step_m / OSC_POSE_POS_SCALE
@@ -1473,7 +1554,7 @@ class GraspToolExecutor:
                 rot_delta = _R.from_matrix(R_delta_world).as_rotvec()
                 per_step_rad = np.clip(
                     rot_delta / max(
-                        self._libero_seg_remaining_steps_estimate, 1,
+                        self._libero_seg_remaining_steps_estimate, LIBERO_EXEC_STEPS,
                     ),
                     -LIBERO_MAX_ORI_DELTA, LIBERO_MAX_ORI_DELTA,
                 )
@@ -1484,7 +1565,7 @@ class GraspToolExecutor:
             ori_norm = self._libero_seg_ori_per_step_norm
         gripper = (
             self._gripper_close
-            if self._phase == GraspPhase.FINAL_APPROACH
+            if self._phase == GraspPhase.FINAL_APPROACH and LIBERO_CLOSE_DURING_FINAL
             else self._gripper_open
         )
 
@@ -3037,7 +3118,7 @@ class GraspToolExecutor:
             img = obs.get(key)
             if img is not None and hasattr(img, "shape"):
                 arr = np.asarray(img, dtype=np.uint8)
-                if self._env_mode == GraspEnvMode.LIBERO:
+                if self._env_mode == GraspEnvMode.LIBERO and LIBERO_MIRROR_X:
                     arr = np.ascontiguousarray(arr[:, ::-1])
                 return arr
         raise RuntimeError("No RGB image found in observation")
@@ -3072,7 +3153,7 @@ class GraspToolExecutor:
         d = obs.get("observation/depth_agentview")
         if d is not None:
             arr = np.asarray(d, dtype=np.float32)
-            if self._env_mode == GraspEnvMode.LIBERO:
+            if self._env_mode == GraspEnvMode.LIBERO and LIBERO_MIRROR_X:
                 arr = np.ascontiguousarray(arr[:, ::-1])
             return arr
         # Last resort: front depth (even when not explicitly requested,
@@ -3183,8 +3264,8 @@ class GraspToolExecutor:
         """
         from scipy.spatial.transform import Rotation as R
 
-        grasp_pos = grasp_pose_world[:3, 3]
         approach_dir = grasp_pose_world[:3, 2]  # z-axis of grasp frame
+        grasp_pos = grasp_pose_world[:3, 3] + LIBERO_GRIP_DEPTH_M * approach_dir
 
         # Pre-grasp: offset along negative approach direction
         pre_grasp_pos = grasp_pos - approach_dir * LIBERO_PRE_GRASP_OFFSET
@@ -3217,6 +3298,12 @@ class GraspToolExecutor:
         # (left-multiplication, see robosuite control_utils.set_goal_orientation),
         # so delta must be expressed in the WORLD frame:
         #     R_delta_world = R_grasp @ R_current.inv()
+        # A two-finger gripper closes the same way turned 180° about its approach axis: take the
+        # candidate the wrist is closer to (the other one often sits beyond a joint limit).
+        alt_rot = grasp_rot * R.from_euler("z", np.pi)
+        if current_ee_quat is not None and (np.linalg.norm((alt_rot * current_rot.inv()).as_rotvec())
+                                            < np.linalg.norm((grasp_rot * current_rot.inv()).as_rotvec())):
+            grasp_rot = alt_rot
         rot_delta = (grasp_rot * current_rot.inv()).as_rotvec()
         # Spread orientation change across approach phase only
         n_approach = LIBERO_INTERP_APPROACH
@@ -3235,6 +3322,7 @@ class GraspToolExecutor:
         # unavailable.
         self._libero_pre_grasp_pos = pre_grasp_pos.copy()
         self._libero_grasp_pos = grasp_pos.copy()
+        self._libero_stage = {}
         self._libero_seg_target_pos = pre_grasp_pos.copy()
         self._libero_seg_target_rot = grasp_rot.as_matrix()
         self._libero_seg_ori_per_step_norm = (

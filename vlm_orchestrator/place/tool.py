@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import requests
+from scipy.spatial.transform import Rotation as R_scipy
 
 if TYPE_CHECKING:
     from vlm_orchestrator.motion import MotionPlanner
@@ -69,6 +70,7 @@ from vlm_orchestrator.grasp.camera import (
     overshoulder_left_intrinsics,
     pose_opengl_to_opencv,
 )
+from vlm_orchestrator.grasp.tool import libero_stage_chunk
 from vlm_orchestrator.place.client import PlaceClient
 from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
@@ -176,6 +178,20 @@ PLACE_IK_ROT_TOL = 2e-2         # ~1.15° rotation tolerance
 PLACE_ROBOLAB_CLEAN_IK = (
     os.environ.get("PLACE_ROBOLAB_CLEAN_IK", "1") not in ("0", "false", "False")
 )
+
+# robosuite (``--env libero``) branch: 7-D OSC_POSE deltas ``[dpos/0.05, drotvec/0.5, gripper]`` in the world
+# frame, gripper -1 open / +1 close, chunk 10 — the same layout as the grasp tool's LIBERO branch.
+LIBERO_ACTION_HORIZON = 10
+LIBERO_GRIPPER_OPEN = -1.0
+LIBERO_GRIPPER_CLOSE = 1.0
+LIBERO_MAX_POS_DELTA = 0.05       # m per step at |input| = 1
+LIBERO_MAX_ORI_DELTA = 0.5        # rad per step at |input| = 1
+LIBERO_PHASE_DONE_M = 0.02        # closed-loop segment done within this distance of its target
+LIBERO_STEPS = {"approach": 10, "final": 4, "retreat": 6}   # per-segment step estimates (delta spread)
+LIBERO_EXEC_STEPS = int(os.environ.get("GRASP_LIBERO_EXEC_STEPS", "5"))   # steps the client executes per chunk: a chunk never covers more than the remainder
+LIBERO_STALL_FAIL_M = 0.05        # a segment still this far from its target after LIBERO_MAX_CHUNKS fails the place (arm blocked)
+LIBERO_MAX_CHUNKS = 12            # give up converging a segment after this many chunks
+LIBERO_RETREAT_M = float(os.environ.get("PLACE_LIBERO_RETREAT_M", str(PLACE_RETREAT_HEIGHT)))   # lift after release
 
 
 def _topdown_rotation_with_yaw(R_current: np.ndarray) -> np.ndarray:
@@ -329,8 +345,20 @@ class PlaceToolExecutor:
         stack_mode_enabled: bool = False,
         target_rule: str = "pixel",
         point_call: bool = False,
+        env_mode: str = "robolab",
     ):
         self._client = PlaceClient(url=place_server_url)
+        # robosuite envs (LIBERO, RoboCasa365: ``--env libero``) take 7-D OSC_POSE deltas in the world frame
+        # and send no joint readings: the approach / release / retreat run closed-loop on ee_pos + ee_quat,
+        # mirroring the grasp tool's LIBERO branch.  Everything from perception up to the target point is shared.
+        self._libero = str(env_mode) == "libero"
+        self._g_open, self._g_close = (LIBERO_GRIPPER_OPEN, LIBERO_GRIPPER_CLOSE) if self._libero else (GRIPPER_OPEN, GRIPPER_CLOSE)
+        self._horizon = LIBERO_ACTION_HORIZON if self._libero else ACTION_HORIZON
+        self._cl_target_pos: np.ndarray | None = None
+        self._cl_target_rot: np.ndarray | None = None
+        self._cl_steps = 0
+        self._cl_chunks = 0
+        self._stage: dict = {}
         # The master's point, when this seg mode reads one and the call gave
         # none: asked of the master on its own at perception (master_point).
         self._point_call = bool(point_call)
@@ -603,12 +631,10 @@ class PlaceToolExecutor:
         (or immediately when the gripper is already closed).
         """
         gripper_pos = float(self._extract_gripper(obs))
-        already_closed = gripper_pos < PLACE_GRIPPER_CLOSED_THRESHOLD
+        already_closed = self._is_closed(gripper_pos)
 
         # Build hold-position + close-gripper action
-        joints = self._extract_joints(obs)
-        action = np.concatenate([joints, [GRIPPER_CLOSE]])
-        actions = np.tile(action, (ACTION_HORIZON, 1))
+        actions = self._tile(self._hold_vec(obs, self._g_close))
 
         if already_closed:
             logger.info(
@@ -652,11 +678,14 @@ class PlaceToolExecutor:
         ``failure_reason='perception_no_target'`` rather than silently
         producing a bad target.
         """
-        from vlm_orchestrator.grasp.ik import forward_kinematics
+        if self._libero:
+            current_z = float(self._extract_ee_pos(obs)[2])
+        else:
+            from vlm_orchestrator.grasp.ik import forward_kinematics
 
-        current_joints = self._extract_joints(obs)
-        T_ee = forward_kinematics(current_joints)
-        current_z = float(T_ee[2, 3])
+            current_joints = self._extract_joints(obs)
+            T_ee = forward_kinematics(current_joints)
+            current_z = float(T_ee[2, 3])
         logger.info(
             f"  PERCEIVING from current pose (z={current_z:.3f}, "
             f"no canonical-joints prelift)"
@@ -806,6 +835,11 @@ class PlaceToolExecutor:
         """Plan APPROACHING + FINAL_APPROACH segments and switch phase."""
         self._phase = PlacePhase.PLANNING
         self._status_message = "Place: planning trajectory..."
+        if self._libero:
+            self._plan_trajectory_libero(obs)
+            self._phase = PlacePhase.APPROACHING
+            self._status_message = "Approaching pre-place (closed-loop EE deltas)"
+            return self._step_trajectory_libero(obs, state)
         self._plan_trajectory(obs, state)
         # Load segment 1
         self._trajectory = self._seg_approach
@@ -821,6 +855,8 @@ class PlaceToolExecutor:
 
     def _step_trajectory(self, obs: dict, state) -> dict:
         """Serve the next ACTION_HORIZON waypoints."""
+        if self._libero:
+            return self._step_trajectory_libero(obs, state)
         chunk: list[np.ndarray] = []
         for _ in range(ACTION_HORIZON):
             if self._traj_cursor < len(self._trajectory):
@@ -865,6 +901,8 @@ class PlaceToolExecutor:
         self._phase = PlacePhase.RELEASING
         self._step_at_release_start = state.episode_step
         self._status_message = "Releasing held object..."
+        if self._libero:
+            return {"actions": self._tile(self._hold_vec(obs, self._g_open))}
         # Last commanded waypoint, but with gripper OPEN
         last = (
             self._seg_final[-1] if self._seg_final
@@ -876,9 +914,7 @@ class PlaceToolExecutor:
 
     def _step_releasing(self, obs: dict, state) -> dict:
         """Hold position with gripper open."""
-        joints = self._extract_joints(obs)
-        action = np.concatenate([joints, [GRIPPER_OPEN]])
-        actions = np.tile(action, (ACTION_HORIZON, 1))
+        actions = self._tile(self._hold_vec(obs, self._g_open))
         if (state.episode_step - self._step_at_release_start
                 >= RELEASE_HOLD_STEPS):
             logger.info("  Release complete → SETTLING")
@@ -889,11 +925,9 @@ class PlaceToolExecutor:
 
     def _step_settling(self, obs: dict, state) -> dict:
         """Hold open while the object lands."""
-        joints = self._extract_joints(obs)
-        action = np.concatenate([joints, [GRIPPER_OPEN]])
-        actions = np.tile(action, (ACTION_HORIZON, 1))
+        actions = self._tile(self._hold_vec(obs, self._g_open))
         # Settle is sim-step-counted: decrement once per chunk's worth of steps.
-        self._settle_remaining -= ACTION_HORIZON
+        self._settle_remaining -= self._horizon
         if self._settle_remaining <= 0:
             logger.info("  Settle complete → planning retreat")
             self._plan_retreat(obs)
@@ -901,6 +935,105 @@ class PlaceToolExecutor:
             self._phase = PlacePhase.RETREATING
             self._status_message = "Retreating..."
         return {"actions": actions}
+
+    # ------------------------------------------------------------------
+    # robosuite (--env libero) branch: closed-loop EE deltas, no IK
+    # ------------------------------------------------------------------
+
+    def _plan_trajectory_libero(self, obs: dict) -> None:
+        """Pre-place above the resolved object-centre target, then the target itself.
+
+        The grip site (between the finger pads) holds the object, so the EE target is the
+        object-centre target directly; the pre-place is ``PLACE_PRE_OFFSET`` back along the
+        approach axis.  Release rotation: top-down keeping the current yaw (``stack=False``),
+        or the current rotation (``stack=True``, as the robolab branch's first candidate).
+        """
+        target = np.asarray(self._resolved_target_world, dtype=np.float64)
+        approach = np.asarray(self._approach_axis_world, dtype=np.float64)
+        approach = approach / max(float(np.linalg.norm(approach)), 1e-9)
+        q = self._extract_ee_quat(obs)
+        R_cur = R_scipy.from_quat([q[1], q[2], q[3], q[0]]).as_matrix() if q is not None else np.eye(3)
+        R_target = R_cur if self._stack else _topdown_rotation_with_yaw(R_cur)
+        self._libero_pre_place = target - PLACE_PRE_OFFSET * approach
+        self._libero_place = target.copy()
+        self._stage: dict = {}
+        self._place_log["R_target_world"] = R_target.tolist()
+        self._place_log["ee_target_world"] = target.tolist()
+        self._set_cl_segment(self._libero_pre_place, R_target, LIBERO_STEPS["approach"])
+
+    def _plan_retreat_libero(self, obs: dict) -> None:
+        """Lift straight up after release, holding the orientation."""
+        ee = self._extract_ee_pos(obs)
+        self._q_at_release = None
+        self._set_cl_segment(ee + np.array([0.0, 0.0, LIBERO_RETREAT_M]), None, LIBERO_STEPS["retreat"])
+        self._place_log["retreat_m"] = LIBERO_RETREAT_M
+
+    def _set_cl_segment(self, target_pos: np.ndarray, target_rot: np.ndarray | None, steps: int) -> None:
+        self._cl_target_pos = np.asarray(target_pos, dtype=np.float64)
+        self._cl_target_rot = None if target_rot is None else np.asarray(target_rot, dtype=np.float64)
+        self._cl_steps = int(steps)
+        self._cl_chunks = 0
+
+    def _step_trajectory_libero(self, obs: dict, state) -> dict:
+        """One closed-loop chunk toward the current segment's target (APPROACHING / FINAL_APPROACH / RETREATING).
+
+        Position: the remaining delta spread over the segment's remaining step estimate, capped per step.
+        Orientation: likewise from the current ee_quat when the segment has a target rotation, else zero.
+        The segment ends within ``LIBERO_PHASE_DONE_M`` of its target, or after ``LIBERO_MAX_CHUNKS`` chunks.
+        """
+        if self._cl_target_pos is None:
+            return self._noop_response(obs)
+        if self._phase == PlacePhase.APPROACHING:
+            chunk = libero_stage_chunk(obs, self._cl_target_pos, self._g_close, self._horizon, self._stage)
+            if chunk is not None:
+                self._status_message = "Driving the base toward the destination..."
+                return {"actions": chunk}
+        ee = self._extract_ee_pos(obs)
+        delta = self._cl_target_pos - ee
+        dist = float(np.linalg.norm(delta))
+        per_step = np.clip(delta / max(self._cl_steps, LIBERO_EXEC_STEPS), -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA)
+        ori = np.zeros(3)
+        if self._cl_target_rot is not None:
+            q = self._extract_ee_quat(obs)
+            if q is not None:
+                R_cur = R_scipy.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+                rotvec = R_scipy.from_matrix(self._cl_target_rot @ R_cur.T).as_rotvec()
+                ori = np.clip(rotvec / max(self._cl_steps, LIBERO_EXEC_STEPS), -LIBERO_MAX_ORI_DELTA, LIBERO_MAX_ORI_DELTA) / LIBERO_MAX_ORI_DELTA
+        grip = self._g_open if self._phase == PlacePhase.RETREATING else self._g_close
+        action = np.concatenate([per_step / LIBERO_MAX_POS_DELTA, ori, [grip]])
+        actions = self._tile(action)
+        self._cl_steps = max(1, self._cl_steps - 1)
+        self._cl_chunks += 1
+        if dist <= LIBERO_PHASE_DONE_M or self._cl_chunks >= LIBERO_MAX_CHUNKS:
+            if self._cl_chunks >= LIBERO_MAX_CHUNKS:
+                if dist > LIBERO_STALL_FAIL_M and self._phase != PlacePhase.RETREATING:
+                    self._cl_target_pos = None
+                    self._fail("motion_blocked", f"arm stalled {dist * 100:.1f} cm short of the {self._phase.value} target")
+                    return self._noop_response(obs)
+                logger.warning(f"  place {self._phase.value}: segment not converged after {self._cl_chunks} chunks (dist {dist*100:.1f} cm), advancing")
+            self._place_log[f"segment_{self._phase.value}_final_dist_m"] = dist
+            if self._phase == PlacePhase.APPROACHING:
+                logger.info("  Approach complete → FINAL_APPROACH")
+                self._phase = PlacePhase.FINAL_APPROACH
+                self._status_message = "Final approach to release pose..."
+                self._set_cl_segment(self._libero_place, self._cl_target_rot, LIBERO_STEPS["final"])
+            elif self._phase == PlacePhase.FINAL_APPROACH:
+                logger.info("  Final approach complete → MEASURING")
+                self._phase = PlacePhase.MEASURING
+                self._status_message = "Measuring post-move pose..."
+                self._cl_target_pos = None
+            elif self._phase == PlacePhase.RETREATING:
+                logger.info("  Retreat complete → DONE")
+                self._phase = PlacePhase.DONE
+                self._status_message = "Place complete"
+                self._cl_target_pos = None
+                self._save_place_log()
+        return {"actions": actions}
+
+    @staticmethod
+    def _extract_ee_quat(obs: dict) -> np.ndarray | None:
+        q = obs.get("observation/ee_quat")   # (w, x, y, z), world frame
+        return None if q is None else np.asarray(q, dtype=np.float64).reshape(4)
 
     # ------------------------------------------------------------------
     # Trajectory planning
@@ -1320,6 +1453,8 @@ class PlaceToolExecutor:
 
     def _plan_retreat(self, obs: dict) -> None:
         """Lift straight up after release."""
+        if self._libero:
+            return self._plan_retreat_libero(obs)
         from vlm_orchestrator.grasp.ik import (
             forward_kinematics,
             inverse_kinematics_multistart,
@@ -1380,9 +1515,16 @@ class PlaceToolExecutor:
             # frame.  Compare *that* against the resolved object-centre
             # target — not the flange itself, otherwise the delta is
             # off by ~GRIPPER_DEPTH_M (~10 cm) systematically.
-            joints = self._extract_joints(obs)
-            R_flange = _fk(joints)[:3, :3]
-            object_pos_est = ee_pos + R_flange @ self._object_in_flange
+            if self._libero:
+                # ee_pos is the grip site between the finger pads: the held object sits there.
+                q = self._extract_ee_quat(obs)
+                R_flange = (R_scipy.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+                            if q is not None else np.eye(3))
+                object_pos_est = ee_pos.copy()
+            else:
+                joints = self._extract_joints(obs)
+                R_flange = _fk(joints)[:3, :3]
+                object_pos_est = ee_pos + R_flange @ self._object_in_flange
             self._place_log["post_move_ee_pos"] = ee_pos.tolist()
             self._place_log["post_move_object_pos_est"] = (
                 object_pos_est.tolist()
@@ -1452,29 +1594,41 @@ class PlaceToolExecutor:
 
     def _noop_response(self, obs: dict) -> dict:
         """Hold-position chunk with gripper at its current state."""
-        return {"actions": np.tile(self._hold_action(obs), (ACTION_HORIZON, 1))}
+        return {"actions": self._tile(self._hold_action(obs))}
+
+    def _tile(self, action: np.ndarray) -> np.ndarray:
+        return np.tile(action, (self._horizon, 1))
+
+    def _hold_vec(self, obs: dict, gripper_cmd: float) -> np.ndarray:
+        """Hold the arm where it is with this gripper command: zero EE delta (robosuite) or the current joints (robolab)."""
+        if self._libero:
+            a = np.zeros(7)
+            a[-1] = gripper_cmd
+            return a
+        return np.concatenate([self._extract_joints(obs), [gripper_cmd]])
 
     def _hold_action(self, obs: dict) -> np.ndarray:
-        joints = self._extract_joints(obs)
         gripper_pos = float(self._extract_gripper(obs))
         gripper_cmd = (
-            GRIPPER_OPEN
+            self._g_open
             if self._phase in (
                 PlacePhase.RELEASING,
                 PlacePhase.SETTLING,
                 PlacePhase.RETREATING,
                 PlacePhase.DONE,
             )
-            else GRIPPER_CLOSE
+            else self._g_close
         )
         # If we don't have a clear policy (very early), echo current state.
         if self._phase == PlacePhase.IDLE:
-            gripper_cmd = (
-                GRIPPER_CLOSE
-                if gripper_pos < PLACE_GRIPPER_CLOSED_THRESHOLD
-                else GRIPPER_OPEN
-            )
-        return np.concatenate([joints, [gripper_cmd]])
+            gripper_cmd = self._g_close if self._is_closed(gripper_pos) else self._g_open
+        return self._hold_vec(obs, gripper_cmd)
+
+    def _is_closed(self, gripper_pos: float) -> bool:
+        """robosuite clients send 0 open / 1 closed; robolab's reading is closed below the threshold."""
+        if self._libero:
+            return gripper_pos > 0.5
+        return gripper_pos < PLACE_GRIPPER_CLOSED_THRESHOLD
 
     # ------------------------------------------------------------------
     # Obs extraction (mirrors grasp/tool.py — robolab joint-space only)
@@ -1528,6 +1682,10 @@ class PlaceToolExecutor:
         return self._client.segment(image, *point, box=None)[0]
 
     def _extract_image(self, obs: dict) -> np.ndarray:
+        # robosuite clients pack the tool camera as image_for_grasp / depth_for_grasp (same as the grasp tool reads)
+        img = obs.get("observation/image_for_grasp")
+        if img is not None:
+            return np.asarray(img)
         key = (
             "observation/front_image_left"
             if self._use_front_camera
@@ -1542,6 +1700,9 @@ class PlaceToolExecutor:
         return np.asarray(img)
 
     def _extract_depth(self, obs: dict) -> np.ndarray | None:
+        d = obs.get("observation/depth_for_grasp")
+        if d is not None:
+            return np.asarray(d, dtype=np.float32)
         if self._use_front_camera:
             d = obs.get("observation/depth_front")
             if d is not None:

@@ -2301,6 +2301,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
                 target_rule=self._place_target,
+                env_mode=self._env_mode,
             )
 
         spec = DestinationSpec.for_call(target, point, relation=relation)

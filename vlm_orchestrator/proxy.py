@@ -95,14 +95,21 @@ def _make_hold_chunk_for_obs(obs: dict) -> np.ndarray:
     8-step horizon to match Pi05's expected chunk length.  Used by the
     proxy's ``tool_chain`` bypass branch when no tool is active and
     we don't want to forward to the VLA.
+
+    robosuite envs (LIBERO, RoboCasa) send no joint positions and take
+    7-D OSC_POSE deltas: hold = zero delta + the gripper kept where it is
+    (``gripper_position`` is 0 open / 1 closed; the action is -1 open / +1 close).
     """
-    joints = np.asarray(
-        obs.get("observation/joint_position", np.zeros(7)),
-        dtype=np.float64,
-    ).reshape(-1)[:7]
     gripper = float(np.asarray(
         obs.get("observation/gripper_position", [0.0]),
     ).reshape(-1)[0])
+    if obs.get("observation/joint_position") is None:
+        action = np.zeros(7)
+        action[-1] = 1.0 if gripper > 0.5 else -1.0
+        return np.tile(action, (10, 1))
+    joints = np.asarray(
+        obs.get("observation/joint_position"), dtype=np.float64,
+    ).reshape(-1)[:7]
     action = np.concatenate([joints, [gripper]])
     return np.tile(action, (8, 1))
 

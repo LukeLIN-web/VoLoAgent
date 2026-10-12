@@ -1044,6 +1044,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 stack_mode_enabled=self._stack_mode_enabled,
                 target_rule=self._place_target,
                 point_call=self._point_call,
+                env_mode=self._env_mode,
             )
 
         # Optional per-call stack semantics from the VLM tool args. Only
