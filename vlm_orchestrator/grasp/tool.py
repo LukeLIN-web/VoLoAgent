@@ -1246,7 +1246,18 @@ class GraspToolExecutor:
 
         Returns a dict compatible with the VLA response format:
         ``{"actions": np.ndarray shape (horizon, action_dim)}``.
+        A phase that raises (e.g. no motion plan for the retreat) fails the
+        grasp instead of ending the proxy's session, as the place tool does.
         """
+        try:
+            return self._step_phase(obs, state)
+        except Exception as e:
+            logger.error(f"grasp tool step() crashed: {e}", exc_info=True)
+            self._phase = GraspPhase.FAILED
+            self._status_message = f"Failed: {e}"
+            return self._noop_response(obs)
+
+    def _step_phase(self, obs: dict, state) -> dict:
         if self._phase == GraspPhase.RELEASING:
             return self._step_releasing(obs, state)
 
