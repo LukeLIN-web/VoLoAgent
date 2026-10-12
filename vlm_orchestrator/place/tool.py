@@ -350,7 +350,7 @@ class PlaceToolExecutor:
         point_call: bool = False,
         env_mode: str = "robolab",
     ):
-        self._client = PlaceClient(url=place_server_url)
+        self._client = PlaceClient(url=place_server_url, single_detection=str(env_mode) == "libero")
         # robosuite envs (LIBERO, RoboCasa365: ``--env libero``) take 7-D OSC_POSE deltas in the world frame
         # and send no joint readings: the approach / release / retreat run closed-loop on ee_pos + ee_quat,
         # mirroring the grasp tool's LIBERO branch.  Everything from perception up to the target point is shared.

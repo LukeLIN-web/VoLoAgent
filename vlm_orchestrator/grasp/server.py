@@ -895,9 +895,11 @@ def build_app(
                     return float(np.sqrt(((xs - px) ** 2 + (ys - py) ** 2).min())) if xs.size else np.inf
 
                 gaps = [gap(r) for r in results]
-                if len(results) == 1 and not used_variant:
-                    # The phrase's only detection is the object the master named: the point had
-                    # nothing to choose between, so it need not touch the mask.
+                single = "single_detection" in data and bool(data["single_detection"])
+                if single and len(results) == 1 and not used_variant:
+                    # Robosuite clients (GraspClient single_detection): the phrase's only detection is
+                    # the object the master named, the point had nothing to choose between, so it need
+                    # not touch the mask.  Absent the field (RoboLab) the point rule below applies.
                     best = results[0]
                     logger.info(
                         f"  point ({px}, {py}) is {gaps[0]:.0f} px from the only detection of "

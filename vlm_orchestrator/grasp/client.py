@@ -67,11 +67,15 @@ class GraspClient:
         self,
         url: str | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        single_detection: bool = False,
     ):
         self._url = (url or _default_grasp_url()).rstrip("/")
         self._perception_url = _default_perception_url(self._url).rstrip("/")
         self._planner_url = _default_planner_url(self._url).rstrip("/")
         self._timeout = timeout
+        # Robosuite branch: a phrase's only detection is used whatever the point's distance to it
+        # (the point had nothing to choose between).  RoboLab's protocol is frozen without this.
+        self._single_detection = single_detection
 
     # ------------------------------------------------------------------
     # helpers
@@ -415,7 +419,8 @@ class GraspClient:
 
         With ``point`` (normalised ``(x, y)``) the detection whose mask is
         nearest it, among all of the phrase's, is returned, if within
-        ``radius_px`` (0: the mask must cover it).
+        ``radius_px`` (0: the mask must cover it); a client built with
+        ``single_detection`` gets the phrase's only detection regardless.
 
         Raises:
             requests.HTTPError: if SAM3 is not loaded (501) or no detection
@@ -428,6 +433,8 @@ class GraspClient:
         if point is not None:
             arrays["point"] = np.asarray(point, dtype=np.float64)
             arrays["radius_px"] = np.asarray(radius_px, dtype=np.float64)
+            if self._single_detection:
+                arrays["single_detection"] = np.asarray(True)
         body = self._pack_npz(**arrays)
 
         resp = requests.post(

@@ -46,8 +46,8 @@ class PlaceClient(GraspClient):
     URL resolution differs (see :func:`default_place_url`).
     """
 
-    def __init__(self, url: str | None = None, timeout: float | None = None):
+    def __init__(self, url: str | None = None, timeout: float | None = None, single_detection: bool = False):
         kwargs: dict = {}
         if timeout is not None:
             kwargs["timeout"] = timeout
-        super().__init__(url=url or default_place_url(), **kwargs)
+        super().__init__(url=url or default_place_url(), single_detection=single_detection, **kwargs)

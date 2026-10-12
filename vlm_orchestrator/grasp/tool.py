@@ -562,7 +562,7 @@ class GraspToolExecutor:
         point_call: bool = False,
         grasp_candidates: int = 1,
     ):
-        self._grasp_client = GraspClient(url=grasp_server_url)
+        self._grasp_client = GraspClient(url=grasp_server_url, single_detection=GraspEnvMode(env_mode) == GraspEnvMode.LIBERO)
         # The master's point, when this seg mode reads one and the call gave
         # none: asked of the master on its own at perception (master_point).
         self._point_call = bool(point_call)
