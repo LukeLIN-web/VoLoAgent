@@ -420,11 +420,11 @@ LIBERO_HOLD_BEFORE_CLOSE = os.environ.get("GRASP_LIBERO_HOLD_BEFORE_CLOSE", "0")
 # sam3_point: when the frame has no detection of the phrase, SAM3 again on the 1/zoom crop around the
 # master's point blown up to the frame (small objects); 0 = off.
 LIBERO_SAM3_ZOOM = int(os.environ.get("GRASP_LIBERO_SAM3_ZOOM", "0"))
-# Overhead approach (> 0): after the base has staged, the arm goes straight up to max(where it is, the
-# pre-grasp + this), across at that height while turning to the grasp orientation, then straight down to
-# the pre-grasp — a target below a counter top or inside a sink is reached from above instead of along the
-# straight line from the start pose, which cuts through the counter edge.  Segments with a target
-# orientation also end only once it is within LIBERO_ORI_DONE_RAD.  0 = the straight line (LIBERO).
+# Overhead approach (> 0): after the base has staged, the arm goes vertically to the pre-grasp + this (no
+# higher than where it is), across at that height while turning to the grasp orientation, then straight
+# down to the pre-grasp — a target below a counter top or inside a sink is reached from above instead of
+# along the straight line from the start pose, which cuts through the counter edge.  Segments with a
+# target orientation also end only once it is within LIBERO_ORI_DONE_RAD.  0 = the straight line (LIBERO).
 LIBERO_OVERHEAD_M = float(os.environ.get("GRASP_LIBERO_OVERHEAD_M", "0"))
 LIBERO_ORI_DONE_RAD = 0.15
 LIBERO_ORI_PROGRESS_M_PER_RAD = 0.05   # what a radian of orientation error counts as in the stall rule
@@ -441,9 +441,15 @@ def libero_rotation_error(obs: dict, target_rot: np.ndarray | None) -> float:
     return float(np.linalg.norm(R_scipy.from_matrix(target_rot @ cur.T).as_rotvec()))
 
 
-def libero_overhead_waypoints(cur: np.ndarray, pre: np.ndarray, rot: np.ndarray | None) -> list[tuple[np.ndarray, np.ndarray | None]]:
-    """(position, orientation or None) segments up from *cur*, across, and down to *pre*."""
-    z = max(float(cur[2]), float(pre[2]) + LIBERO_OVERHEAD_M)
+LIBERO_WAYPOINT_DONE_M = 0.05   # the up and across waypoints are passed within this; the segment after them corrects
+
+
+def libero_overhead_waypoints(cur: np.ndarray, pre: np.ndarray, rot: np.ndarray | None,
+                              clearance: float = LIBERO_OVERHEAD_M) -> list[tuple[np.ndarray, np.ndarray | None]]:
+    """(position, orientation or None) segments: vertically from *cur* to *pre* + *clearance* (no higher than
+    *cur*, which the homing has already lifted: every extra centimetre of height costs reach on a far target),
+    across, then down to *pre*."""
+    z = min(float(cur[2]), float(pre[2]) + clearance)
     return [(np.array([cur[0], cur[1], z]), None), (np.array([pre[0], pre[1], z]), rot),
             (np.asarray(pre, dtype=np.float64).copy(), rot)]
 
@@ -517,7 +523,7 @@ def libero_forward_clearance(obs: dict) -> float:
 # approach line, short along it) closes the gripper where it is instead of failing — the fingertips, 1.3 cm
 # past the grip site, are on the surface or the object.  0 = off (LIBERO).
 LIBERO_FINAL_CLOSE_M = float(os.environ.get("GRASP_LIBERO_FINAL_CLOSE_M", "0"))
-LIBERO_FINAL_CLOSE_LATERAL_M = 0.01
+LIBERO_FINAL_CLOSE_LATERAL_M = 0.02
 
 # Perception-lift parameters for LIBERO. Without this lift, the robot arm
 # itself sits between the agentview camera and the workspace, occluding the
@@ -1646,7 +1652,8 @@ class GraspToolExecutor:
         delta_m = target - cur
         dist = float(np.linalg.norm(delta_m))
         angle = libero_rotation_error(obs, self._libero_seg_target_rot) if LIBERO_OVERHEAD_M > 0 else 0.0
-        done = dist <= LIBERO_PHASE_DONE_M and angle <= LIBERO_ORI_DONE_RAD
+        tol = LIBERO_WAYPOINT_DONE_M if self._libero_waypoints else LIBERO_PHASE_DONE_M
+        done = dist <= tol and angle <= LIBERO_ORI_DONE_RAD
         progress = dist + LIBERO_ORI_PROGRESS_M_PER_RAD * angle
         # A segment that stops getting closer (contact, joint limit, out of reach) fails the grasp so the
         # master can retry, instead of commanding the same delta until the episode's horizon.

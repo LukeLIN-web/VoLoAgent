@@ -72,7 +72,7 @@ from vlm_orchestrator.grasp.camera import (
 )
 from vlm_orchestrator.grasp.tool import (
     LIBERO_ORI_DONE_RAD, LIBERO_ORI_PROGRESS_M_PER_RAD, LIBERO_OVERHEAD_M, LIBERO_STALL_PROGRESS_M,
-    LiberoHoming, libero_overhead_waypoints, libero_rotation_error, libero_stage_chunk,
+    LIBERO_WAYPOINT_DONE_M, LiberoHoming, libero_overhead_waypoints, libero_rotation_error, libero_stage_chunk,
 )
 from vlm_orchestrator.place.client import PlaceClient
 from vlm_orchestrator.vlm import master_point
@@ -1012,14 +1012,17 @@ class PlaceToolExecutor:
                 return {"actions": chunk}
             if LIBERO_OVERHEAD_M > 0 and self._libero_waypoints is None:
                 self._stage["off"] = True   # the arm's path is built from here; no more driving under it
+                # the pre-place already sits PLACE_PRE_OFFSET + PLACE_RELEASE_HEIGHT_M above the destination: no
+                # extra clearance, which would cost reach on a far destination
                 self._libero_waypoints = libero_overhead_waypoints(
-                    self._extract_ee_pos(obs), self._libero_pre_place, self._cl_target_rot)
+                    self._extract_ee_pos(obs), self._libero_pre_place, self._cl_target_rot, clearance=0.0)
                 self._set_cl_segment(*self._libero_waypoints.pop(0), LIBERO_STEPS["approach"])
         ee = self._extract_ee_pos(obs)
         delta = self._cl_target_pos - ee
         dist = float(np.linalg.norm(delta))
         angle = libero_rotation_error(obs, self._cl_target_rot) if LIBERO_OVERHEAD_M > 0 else 0.0
-        done = dist <= LIBERO_PHASE_DONE_M and angle <= LIBERO_ORI_DONE_RAD
+        tol = LIBERO_WAYPOINT_DONE_M if self._libero_waypoints else LIBERO_PHASE_DONE_M
+        done = dist <= tol and angle <= LIBERO_ORI_DONE_RAD
         per_step = np.clip(delta / max(self._cl_steps, LIBERO_EXEC_STEPS), -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA)
         ori = np.zeros(3)
         if self._cl_target_rot is not None:
