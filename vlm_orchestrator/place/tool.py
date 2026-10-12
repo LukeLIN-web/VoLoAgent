@@ -73,7 +73,9 @@ from vlm_orchestrator.grasp.camera import (
 from vlm_orchestrator.grasp.tool import libero_stage_chunk
 from vlm_orchestrator.place.client import PlaceClient
 from vlm_orchestrator.vlm import master_point
-from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
+from vlm_orchestrator.perception.gt_segmentation import (
+    POINT_SNAP_PX, gt_ids_available, gt_object_at, gt_object_mask, gt_object_under,
+)
 from vlm_orchestrator.place.destination import (
     PerceptionFailure,
     PointToPlace2D,
@@ -801,12 +803,18 @@ class PlaceToolExecutor:
                 "No depth in obs — cannot raycast.  Ensure --enable-depth on "
                 "the eval client."
             )
-        surface = None
+        surface = mask = None
         if self._target_rule == "mask_top":
             mask = self._destination_mask(obs, image, pt, dest)
             if mask is not None:
                 surface = mask_top_target(mask, depth, intrinsics, cam_to_world)
                 self._place_log["mask_top_surface_world"] = surface.tolist()
+        front = self._use_front_camera
+        if not self._libero and gt_ids_available(obs, front=front):
+            # What the release is measured from: the destination mask's object, else the object under the pixel.
+            state.log({"type": "tool_target", "tool": "place", "object": (
+                gt_object_under(obs, mask, front=front) if mask is not None
+                else gt_object_at(obs, (pt.x_norm, pt.y_norm), front=front, radius_px=0))})
         resolved = raycast_2d_to_3d(
             pt, depth, intrinsics, cam_to_world,
             relation=dest.relation,

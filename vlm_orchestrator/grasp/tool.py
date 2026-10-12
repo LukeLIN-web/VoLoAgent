@@ -55,7 +55,9 @@ from vlm_orchestrator.grasp.camera import (
 )
 from vlm_orchestrator.grasp.client import GraspClient
 from vlm_orchestrator.vlm import master_point
-from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_at, gt_object_mask
+from vlm_orchestrator.perception.gt_segmentation import (
+    POINT_SNAP_PX, gt_ids_available, gt_object_at, gt_object_mask, gt_object_under,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -985,6 +987,10 @@ class GraspToolExecutor:
                     f"  Mask: {mask.sum()} pixels "
                     f"({mask.sum()*100/mask.size:.1f}% of image)"
                 )
+            if (self._env_mode == GraspEnvMode.ROBOLAB
+                    and gt_ids_available(obs, front=self._use_front_camera)):
+                state.log({"type": "tool_target", "tool": "grasp",
+                           "object": gt_object_under(obs, mask, front=self._use_front_camera)})
 
             # 🔍 Debug: detection result
             dbg.vis_detection(image, bbox, target_object, detection_score,

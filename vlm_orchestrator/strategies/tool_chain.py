@@ -29,6 +29,7 @@ from .subgoal import SubgoalConfig, SubgoalStrategy
 
 import numpy as np
 
+from vlm_orchestrator.perception.gt_segmentation import gt_ids_available, gt_object_at
 from vlm_orchestrator.vlm import POINT_CONVENTION, encode_image_b64, parse_json, parse_norm_point
 
 logger = logging.getLogger(__name__)
@@ -710,7 +711,7 @@ class ToolChainStrategy(SubgoalStrategy):
             return obs, state
 
         # Log every cycle so post-hoc analysis can reconstruct the loop.
-        state.log({
+        step_entry = {
             "type": "tool_chain_step",
             "subgoal_action": decision.subgoal_action,
             "tool": decision.tool,
@@ -722,7 +723,16 @@ class ToolChainStrategy(SubgoalStrategy):
             "last_status": state.tool_chain_last_status,
             "tool_calls_in_subgoal": state.tool_chain_subgoal_calls,
             "tool_calls_in_episode": state.tool_chain_tool_calls,
-        })
+        }
+        point = decision.args.get("point")
+        if (point is not None and self._env_mode == "robolab"
+                and gt_ids_available(obs, front=self._use_front_camera)):
+            # The scene object under the point on the image the master saw, for
+            # master_sft.py to match against the tool's tool_target.
+            step_entry["point_object"] = gt_object_at(
+                obs, point, front=self._use_front_camera, radius_px=0,
+            )
+        state.log(step_entry)
 
         # 6. Apply subgoal action.
         if decision.subgoal_action == "advance":

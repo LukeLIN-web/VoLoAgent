@@ -353,6 +353,24 @@ class TestStepTransitions:
         assert state.tool_chain_tool_calls == 1
         assert state.tool_chain_pending_tool == "grasp"
 
+    def test_step_records_the_object_under_the_point(self):
+        s = ToolChainStrategy(_ctx(), _config(), grasp_seg_mode="sam3",
+                              place_seg_mode="molmo_point", master_points=True)
+        s.ctx.get_vlm_image = lambda obs: _img()
+        ids = np.full((480, 640), -1, dtype=np.int32)
+        ids[200:280, 300:380] = 4
+        gt = {"gt_seg/body_ids": ids, "gt_seg/obj_body_id": {"cube": 4}}
+        for point, obs, expected in [((0.53, 0.5), {**_obs(), **gt}, "cube"),
+                                     ((0.1, 0.1), {**_obs(), **gt}, None),
+                                     ((0.53, 0.5), _obs(), "unrecorded")]:
+            state = _state()
+            _patch_vlm(s, {"subgoal_action": "continue", "tool": "grasp",
+                           "args": {"target": "cube", "point": list(point)}, "reason": "pick"})
+            with patch.object(s, "_activate_grasp_for_tool_chain"):
+                s._on_step(obs, state)
+            step, = [e for e in state.log_entries if e.get("type") == "tool_chain_step"]
+            assert step.get("point_object", "unrecorded") == expected
+
     def test_advance_to_next_subgoal(self):
         s = _make_strategy()
         state = _state()

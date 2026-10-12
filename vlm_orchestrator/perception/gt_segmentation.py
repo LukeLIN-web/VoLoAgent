@@ -39,8 +39,12 @@ When GT segmentation is active, eval clients add to the wire observation:
 The LIBERO client builds them with :class:`RobosuiteSegProvider`; RoboLab's
 VoLo client forwards its instance-segmentation object-id images. The grasp
 and place tools (``gt_sim``) read them through
-:func:`gt_object_mask` / :func:`gt_object_at`. The proxy strips every
-``gt_seg/`` key before forwarding to the VLA policy server.
+:func:`gt_object_mask` / :func:`gt_object_at`. On RoboLab the tool_chain
+loop also records, never showing it to the master, the object under each
+call's point (``tool_chain_step``'s ``point_object``) and the object the
+tool then acts on (``tool_target``, via :func:`gt_object_under` for the
+grasp mask). The proxy strips every ``gt_seg/`` key before forwarding to
+the VLA policy server.
 """
 
 from __future__ import annotations
@@ -110,6 +114,23 @@ def gt_object_at(
     d2 = (xs - u) ** 2 + (ys - v) ** 2
     i = int(np.argmin(d2))
     return names[int(ids[ys[i], xs[i]])] if d2[i] <= radius_px ** 2 else None
+
+
+def gt_ids_available(obs: dict, *, front: bool) -> bool:
+    """Whether the eval client sent the camera's id image and its legend."""
+    return ("gt_seg/body_ids_front" if front else "gt_seg/body_ids") in obs and "gt_seg/obj_body_id" in obs
+
+
+def gt_object_under(obs: dict, mask: np.ndarray, *, front: bool) -> str | None:
+    """The scene object covering most of ``mask``'s pixels; None when it covers none."""
+    ids, legend = _id_image(obs, front)
+    ys, xs = np.nonzero(mask)
+    hit = ids[ys * ids.shape[0] // mask.shape[0], xs * ids.shape[1] // mask.shape[1]]
+    hit = hit[np.isin(hit, list(legend.values()))]
+    if hit.size == 0:
+        return None
+    values, counts = np.unique(hit, return_counts=True)
+    return {int(v): k for k, v in legend.items()}[int(values[np.argmax(counts)])]
 
 
 # ======================================================================

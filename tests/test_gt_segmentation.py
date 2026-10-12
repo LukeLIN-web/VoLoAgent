@@ -14,7 +14,9 @@ from vlm_orchestrator.perception.gt_segmentation import (
     IsaacLabSegProvider,
     RobosuiteSegProvider,
     create_seg_provider,
+    gt_ids_available,
     gt_object_mask,
+    gt_object_under,
 )
 from vlm_orchestrator.grasp.tool import GraspSegMode, GraspToolExecutor
 
@@ -319,6 +321,25 @@ class TestGraspToolGTSIM:
     def test_unknown_name_raises(self):
         with pytest.raises(ValueError, match="not a scene object"):
             gt_object_mask(self._obs(), "red", front=False)
+
+    def test_ids_available_per_camera(self):
+        obs = self._obs()
+        assert gt_ids_available(obs, front=False)
+        assert not gt_ids_available(obs, front=True)
+        assert not gt_ids_available({"gt_seg/body_ids": obs["gt_seg/body_ids"]}, front=False)
+
+    def test_object_under_a_mask_is_the_majority_object(self):
+        obs = self._obs()
+        mask = np.zeros((256, 256), dtype=bool)
+        mask[140:180, 100:140] = True   # the cup, spilling onto background
+        mask[175:205, 100:110] = True   # and a sliver of the table
+        assert gt_object_under(obs, mask, front=False) == "blue_cup"
+        half = np.zeros((128, 128), dtype=bool)
+        half[20:40, 30:60] = True       # the block, at half the id image's resolution
+        assert gt_object_under(obs, half, front=False) == "red_block"
+        background = np.zeros((256, 256), dtype=bool)
+        background[0:20, 0:20] = True
+        assert gt_object_under(obs, background, front=False) is None
 
     def test_mask_to_bbox(self):
         mask = np.zeros((100, 100), dtype=bool)
