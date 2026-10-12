@@ -1011,6 +1011,7 @@ class PlaceToolExecutor:
                 self._status_message = "Driving the base toward the destination..."
                 return {"actions": chunk}
             if LIBERO_OVERHEAD_M > 0 and self._libero_waypoints is None:
+                self._stage["off"] = True   # the arm's path is built from here; no more driving under it
                 self._libero_waypoints = libero_overhead_waypoints(
                     self._extract_ee_pos(obs), self._libero_pre_place, self._cl_target_rot)
                 self._set_cl_segment(*self._libero_waypoints.pop(0), LIBERO_STEPS["approach"])
@@ -1043,9 +1044,10 @@ class PlaceToolExecutor:
             stalled = self._cl_chunks >= LIBERO_MAX_CHUNKS
         if done or stalled:
             if not done:
-                if dist > LIBERO_STALL_FAIL_M and self._phase != PlacePhase.RETREATING:
+                if (dist > LIBERO_STALL_FAIL_M or angle > LIBERO_ORI_DONE_RAD) and self._phase != PlacePhase.RETREATING:
                     self._cl_target_pos = None
-                    self._fail("motion_blocked", f"arm stalled {dist * 100:.1f} cm short of the {self._phase.value} target")
+                    self._fail("motion_blocked", f"arm stalled {dist * 100:.1f} cm short of the {self._phase.value} target"
+                               + (f", {angle:.2f} rad off its orientation" if angle > LIBERO_ORI_DONE_RAD else ""))
                     self._home_libero(obs)
                     return self._noop_response(obs)
                 logger.warning(f"  place {self._phase.value}: segment not converged after {self._cl_chunks} chunks (dist {dist*100:.1f} cm), advancing")

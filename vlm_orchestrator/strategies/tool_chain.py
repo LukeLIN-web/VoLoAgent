@@ -527,11 +527,11 @@ def parse_tool_chain_response(
             decision.args["point"] = parse_norm_point(decision.args.get("point"))
         except ValueError as e:
             raise ValueError(f"{decision.tool} needs `args.point`: {e}") from e
-        if cameras and decision.args.get("camera") not in cameras:
-            raise ValueError(
-                f"{decision.tool} needs `args.camera`, one of {cameras}; "
-                f"got {decision.args.get('camera')!r}"
-            )
+    if cameras and decision.tool in ("grasp", "place") and decision.args.get("camera") not in cameras:
+        raise ValueError(
+            f"{decision.tool} needs `args.camera`, one of {cameras}; "
+            f"got {decision.args.get('camera')!r}"
+        )
 
     # Pairing rule: advance / replan / abort never run a tool.  The
     # strategy will silently drop the tool field anyway (it returns
@@ -692,6 +692,14 @@ class ToolChainStrategy(SubgoalStrategy):
         their own (``point_call``): the decision prompt is then the same for
         every grounding source."""
         return frozenset() if self._point_call else super()._point_tools
+
+    def process(self, obs: dict, state: SessionState) -> tuple[dict, SessionState]:
+        """With several tool cameras, every observation a running tool sees carries the camera the
+        master named for it (perception runs in a later step than ``start()``; base staging reads
+        the depth every chunk)."""
+        if self._robosuite and obs.get("observation/camera_views") and (state.grasp_tool_active or state.place_tool_active):
+            obs = _camera_view_obs(obs, (state.tool_chain_pending_args or {}).get("camera"))
+        return super().process(obs, state)
 
     # ------------------------------------------------------------------
     # Episode start

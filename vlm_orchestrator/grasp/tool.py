@@ -336,17 +336,19 @@ def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: 
         logger.info("  base staging: base not moving toward the target (blocked), approaching from here")
         st["off"], st["staging"] = True, False
         return None
-    clearance = libero_forward_clearance(obs) if LIBERO_BUMPER_M > 0 else np.inf
-    cmd_max = min(LIBERO_BASE_CMD_MAX, (clearance - LIBERO_BUMPER_M) / LIBERO_BASE_CHUNK_TRAVEL_M)
-    if cmd_max < 0.05:
-        logger.info(f"  base staging: something {clearance * 100:.0f} cm ahead of the arm's base (bumper "
-                    f"{LIBERO_BUMPER_M * 100:.0f} cm), approaching from here")
-        st["off"], st["staging"], st["bumper_m"] = True, False, round(clearance, 3)
-        return None
-    st["staging"] = True
     yaw = float(np.asarray(yaw).flatten()[0])
     c, s = np.cos(yaw), np.sin(yaw)
     v_base = np.array([c * v[0] + s * v[1], -s * v[0] + c * v[1]])
+    cmd_max = LIBERO_BASE_CMD_MAX
+    if LIBERO_BUMPER_M > 0 and v_base[0] > 0:   # the bumper looks ahead: only forward drives are capped
+        clearance = libero_forward_clearance(obs)
+        cmd_max = min(cmd_max, (clearance - LIBERO_BUMPER_M) / LIBERO_BASE_CHUNK_TRAVEL_M)
+        if cmd_max < 0.05:
+            logger.info(f"  base staging: something {clearance * 100:.0f} cm ahead of the arm's base (bumper "
+                        f"{LIBERO_BUMPER_M * 100:.0f} cm), approaching from here")
+            st["off"], st["staging"], st["bumper_m"] = True, False, round(clearance, 3)
+            return None
+    st["staging"] = True
     cmd = np.clip(v_base * 3.0, -cmd_max, cmd_max)
     row = np.concatenate([np.zeros(6), [gripper_cmd], cmd])
     return np.tile(row, (horizon, 1))
@@ -480,6 +482,10 @@ LIBERO_BUMPER_LATERAL_M = 0.30
 LIBERO_BUMPER_Z_M = (0.02, 0.25)       # above the mobile base's body (top at the site's height), up to a counter top
 LIBERO_BUMPER_STRIDE = 4
 LIBERO_BASE_CHUNK_TRAVEL_M = 0.15      # m the base covers per unit command over the LIBERO_EXEC_STEPS of a chunk
+# The stop distance has to lie inside the band, else an obstacle closer than the band's near edge vanishes
+# from the reading and the base speeds up again.
+assert LIBERO_BUMPER_M <= 0 or LIBERO_BUMPER_M >= LIBERO_BUMPER_FWD_M[0] + 0.01, (
+    f"GRASP_LIBERO_BUMPER_M={LIBERO_BUMPER_M} must be at least {LIBERO_BUMPER_FWD_M[0] + 0.01:.3f}")
 
 
 def libero_forward_clearance(obs: dict) -> float:
@@ -1631,6 +1637,7 @@ class GraspToolExecutor:
                 self._status_message = "Driving the base toward the target..."
                 return {"actions": chunk}
             if LIBERO_OVERHEAD_M > 0 and self._libero_waypoints is None:
+                self._libero_stage["off"] = True   # the arm's path is built from here; no more driving under it
                 self._libero_waypoints = libero_overhead_waypoints(
                     self._extract_ee_pos(obs), self._libero_pre_grasp_pos, self._libero_seg_target_rot)
                 self._libero_next_waypoint()
@@ -1657,7 +1664,10 @@ class GraspToolExecutor:
             return self._noop_response(obs)
         if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and not done:
             if (self._phase == GraspPhase.FINAL_APPROACH and dist <= LIBERO_FINAL_CLOSE_M
-                    and self._libero_seg_target_rot is not None):
+                    and self._libero_seg_target_rot is not None and not LIBERO_CLOSE_DURING_FINAL
+                    and obs.get("observation/ee_quat") is not None
+                    and libero_rotation_error(obs, self._libero_seg_target_rot) <= LIBERO_ORI_DONE_RAD
+                    and self._extract_gripper(obs) <= 0.2):
                 axis = self._libero_seg_target_rot[:, 2]
                 along = float(delta_m @ axis)
                 lateral = float(np.linalg.norm(delta_m - along * axis))
@@ -1743,6 +1753,7 @@ class GraspToolExecutor:
         self._libero_seg_target_pos, self._libero_seg_target_rot = self._libero_waypoints.pop(0)
         self._libero_seg_ori_per_step_norm = np.zeros(3)
         self._libero_seg_remaining_steps_estimate = LIBERO_INTERP_APPROACH
+        self._libero_stall_key, self._libero_best_dist, self._libero_stall_chunks = None, np.inf, 0   # a waypoint can share the last one's position
         logger.info(f"  overhead approach: next waypoint {np.round(self._libero_seg_target_pos, 3)}, "
                     f"{len(self._libero_waypoints)} to go")
 
@@ -1909,9 +1920,10 @@ class GraspToolExecutor:
         self._phase = GraspPhase.CLOSING
         self._step_at_close_start = state.episode_step
         self._status_message = "Closing gripper..."
-        if self._env_mode == GraspEnvMode.LIBERO and LIBERO_HOLD_BEFORE_CLOSE:
+        if self._env_mode == GraspEnvMode.LIBERO and (LIBERO_HOLD_BEFORE_CLOSE or LIBERO_FINAL_CLOSE_M > 0):
             # A zero delta: the final segment's last row is a step along the approach, replaying it
-            # for a chunk pushes the open gripper on past the grasp point.
+            # for a chunk pushes the open gripper on past the grasp point (and a close on a stall must
+            # not push either).
             hold = np.zeros(self._action_dim)
             hold[-1] = self._gripper_close if LIBERO_CLOSE_DURING_FINAL else self._gripper_open
             return {"actions": np.tile(hold, (self._action_horizon, 1))}
@@ -3656,6 +3668,7 @@ class GraspToolExecutor:
         self._libero_pre_grasp_pos = None
         self._libero_grasp_pos = None
         self._libero_waypoints = None
+        self._libero_stall_key, self._libero_best_dist, self._libero_stall_chunks = None, np.inf, 0
         self._libero_seg_target_pos = None
         self._libero_seg_target_rot = None
         self._libero_seg_ori_per_step_norm = np.zeros(3)
