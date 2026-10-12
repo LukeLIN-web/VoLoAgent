@@ -895,12 +895,22 @@ def build_app(
                     return float(np.sqrt(((xs - px) ** 2 + (ys - py) ** 2).min())) if xs.size else np.inf
 
                 gaps = [gap(r) for r in results]
-                if min(gaps) > radius:
+                if len(results) == 1 and not used_variant:
+                    # The phrase's only detection is the object the master named: the point had
+                    # nothing to choose between, so it need not touch the mask.
+                    best = results[0]
+                    logger.info(
+                        f"  point ({px}, {py}) is {gaps[0]:.0f} px from the only detection of "
+                        f"'{text_prompt}'; using it"
+                    )
+                elif min(gaps) > radius:
                     raise RuntimeError(
                         f"SAM3: none of {len(results)} detection(s) of "
-                        f"'{text_prompt}' lies within {radius:g} px of the point ({px}, {py})"
+                        f"'{text_prompt}' lies within {radius:g} px of the point ({px}, {py}); "
+                        f"the nearest is {min(gaps):.0f} px away"
                     )
-                best = max((r for r, g in zip(results, gaps) if g == min(gaps)), key=lambda r: r["score"])
+                else:
+                    best = max((r for r, g in zip(results, gaps) if g == min(gaps)), key=lambda r: r["score"])
             elif used_variant and len(results) > 1:
                 color = _extract_color(text_prompt)
                 if color:

@@ -315,18 +315,18 @@ LIBERO_STAGE_MIN_MOVE_M = 0.005
 LIBERO_BASE_CMD_MAX = 0.5
 
 
-def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: dict):
-    """Base-staging chunk toward ``target`` (world) when it is beyond LIBERO_REACH_M horizontally, else ``None``.
+def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: dict, reach_m: float = LIBERO_REACH_M):
+    """Base-staging chunk toward ``target`` (world) when it is beyond ``reach_m`` horizontally, else ``None``.
 
     ``st`` is the caller's staging state (reset to ``{}`` when a new target is planned): hysteresis, chunk count,
     and the stuck detector that stops staging when the base no longer moves (blocked by the counter).
     """
     base, yaw = obs.get("observation/base_pos"), obs.get("observation/base_yaw")
-    if LIBERO_REACH_M <= 0 or base is None or yaw is None or target is None or st.get("off"):
+    if reach_m <= 0 or base is None or yaw is None or target is None or st.get("off"):
         return None
     base = np.asarray(base, dtype=np.float64).flatten()[:2]
     v = np.asarray(target, dtype=np.float64)[:2] - base
-    if float(np.linalg.norm(v)) <= LIBERO_REACH_M - (LIBERO_STAGE_DONE_M if st.get("staging") else 0.0):
+    if float(np.linalg.norm(v)) <= reach_m - (LIBERO_STAGE_DONE_M if st.get("staging") else 0.0):
         st["staging"] = False
         return None
     prev = st.get("prev")
@@ -343,6 +343,65 @@ def libero_stage_chunk(obs: dict, target, gripper_cmd: float, horizon: int, st: 
     cmd = np.clip(v_base * 3.0, -LIBERO_BASE_CMD_MAX, LIBERO_BASE_CMD_MAX)
     row = np.concatenate([np.zeros(6), [gripper_cmd], cmd])
     return np.tile(row, (horizon, 1))
+
+
+LIBERO_HOME_BASE_M = 2 * LIBERO_STAGE_DONE_M   # the base drives home when farther than this, to within LIBERO_STAGE_DONE_M
+
+
+class LiberoHoming:
+    """Robosuite branch: a tool ends where the episode started, so the master's next look at the scene is the
+    image the next tool perceives from.  Wanted when the eval client sends ``observation/ee_pos_home`` (the
+    start-of-episode gripper position, kept relative to the base) and ``observation/base_home`` (the base's
+    start position, world x y).  Three closed-loop segments, each skipped when it stalls: straight up to the
+    home height (the gripper leaves a drawer or the counter edge first), the base back to where it started,
+    then the arm across to the home position.  ``chunk`` returns the next action chunk, None when the motion
+    is over."""
+
+    SEGMENTS = ("up", "base", "across")
+
+    @staticmethod
+    def wanted(obs: dict) -> bool:
+        return obs.get("observation/ee_pos_home") is not None
+
+    def __init__(self):
+        self._i, self._stage, self._best, self._stall, self._steps = 0, {}, np.inf, 0, None
+
+    def chunk(self, obs: dict, gripper_cmd: float, horizon: int) -> np.ndarray | None:
+        while self._i < len(self.SEGMENTS):
+            seg = self.SEGMENTS[self._i]
+            if seg == "base":
+                home = obs.get("observation/base_home")
+                out = None if home is None else libero_stage_chunk(obs, home, gripper_cmd, horizon, self._stage, LIBERO_HOME_BASE_M)
+            else:
+                out = self._ee_chunk(obs, seg, gripper_cmd, horizon)
+            if out is not None:
+                return out
+            self._i, self._best, self._stall, self._steps = self._i + 1, np.inf, 0, None
+        return None
+
+    def _ee_chunk(self, obs: dict, seg: str, gripper_cmd: float, horizon: int) -> np.ndarray | None:
+        cur = np.asarray(obs["observation/ee_pos"], dtype=np.float64).flatten()[:3]
+        home = np.asarray(obs["observation/ee_pos_home"], dtype=np.float64).flatten()[:3]
+        target = np.array([cur[0], cur[1], max(home[2], cur[2])]) if seg == "up" else home
+        delta = target - cur
+        dist = float(np.linalg.norm(delta))
+        if dist <= LIBERO_PHASE_DONE_M:
+            return None
+        if dist < self._best - LIBERO_STALL_PROGRESS_M:
+            self._best, self._stall = dist, 0
+        else:
+            self._stall += 1
+        if self._stall >= LIBERO_STALL_CHUNKS:
+            logger.warning(f"  homing {seg}: EE stalled {dist * 100:.1f} cm short; skipping the segment")
+            return None
+        if self._steps is None:
+            self._steps = int(np.ceil(np.abs(delta).max() / LIBERO_MAX_POS_DELTA)) + 2
+        per_step = np.clip(delta / max(self._steps, LIBERO_EXEC_STEPS), -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA)
+        self._steps = max(1, self._steps - 1)
+        row = np.concatenate([per_step / OSC_POSE_POS_SCALE, np.zeros(3), [gripper_cmd]])
+        return np.tile(row, (horizon, 1))
+
+
 LIBERO_CLOSE_DURING_FINAL = os.environ.get("GRASP_LIBERO_CLOSE_DURING_FINAL", "1") == "1"
 LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
 
@@ -433,6 +492,7 @@ class GraspPhase(str, Enum):
     INTEGRAL_SETTLE = "integral_settle"  # ROBOLAB: integral correction of P-controller undershoot
     MEASURING = "measuring"           # one-shot: capture post-move metrics, then DONE
     VERIFYING = "verifying"           # one-shot: judge held-and-lifted after the retreat
+    HOMING = "homing"                 # robosuite: back to the episode-start pose, then the verdict
     DONE = "done"
     FAILED = "failed"
 
@@ -570,6 +630,8 @@ class GraspToolExecutor:
         # object.  Set every time we tile / build an action.
         self._last_commanded_gripper: float = self._gripper_open
         self._last_obs: dict | None = None  # stash obs for calibration
+        self._homing: LiberoHoming | None = None   # robosuite: the end-of-grasp return to the episode-start pose
+        self._final: tuple[GraspPhase, str] | None = None   # the verdict HOMING ends with
 
         # Perception results
         self._grasp_pose_camera: np.ndarray | None = None  # 4×4 in camera frame
@@ -735,75 +797,6 @@ class GraspToolExecutor:
             self._status_message = "Releasing held object..."
             # Stash skip_lift so _step_releasing can resume correctly
             self._skip_lift_after_release = skip_lift
-            return
-
-            if self._env_mode == GraspEnvMode.LIBERO:
-                # LIBERO: no joint-space IK available, but the agentview
-                # camera is FIXED in front of and above the robot — the
-                # arm itself sits between the camera and the workspace
-                # and blocks the target object. Use OSC_POSE EE-delta
-                # to lift the arm up and back before perception, so
-                # GDino / SAM see the unobstructed scene.
-                ee_pos_now = self._libero_extract_ee_pos(obs)
-                if ee_pos_now is None:
-                    logger.warning(
-                        "  LIBERO perception lift skipped — no ee_pos in obs"
-                    )
-                    self._start_perception(obs, state)
-                    return
-                self._plan_perception_lift_libero(ee_pos_now, obs.get("observation/ee_pos_home"))
-                if self._trajectory:
-                    self._phase = GraspPhase.LIFTING
-                    self._traj_cursor = 0
-                    self._status_message = (
-                        f"LIBERO: lifting arm out of camera view "
-                        f"for '{target_object}'..."
-                    )
-                    logger.info(
-                        f"  LIBERO perception lift: "
-                        f"{len(self._trajectory)} EE-delta waypoints"
-                    )
-                    return
-                logger.info(
-                    "  LIBERO perception lift produced no waypoints "
-                    "— perceiving from current pose"
-                )
-                self._start_perception(obs, state)
-                return
-
-            if skip_lift:
-                # ---- Operator chose to skip the lift ----
-                logger.info(
-                    "  skip_pre_grasp_lift is ON — "
-                    "perceiving from current arm position"
-                )
-                self._start_perception(obs, state)
-                return
-
-            # ---- 0. Move arm to perception pose first ----
-            # Always move to a known retracted joint config so the
-            # over-shoulder camera has a clear, unoccluded view.
-            current_joints = self._extract_joints(obs)
-            self._plan_lift_to_safe(current_joints)
-
-            if self._trajectory:
-                self._phase = GraspPhase.LIFTING
-                self._traj_cursor = 0
-                self._status_message = (
-                    f"Moving arm to perception pose for '{target_object}'..."
-                )
-                logger.info(
-                    f"  Moving to perception pose: "
-                    f"{len(self._trajectory)} waypoints "
-                    f"({len(self._trajectory) // self._action_horizon} chunks)"
-                )
-                # Perception will start after lift completes
-                # (triggered in _advance_phase_after_trajectory)
-                return
-            else:
-                # Already at perception pose — go straight to perception
-                logger.info("  Arm already at perception pose, skipping lift")
-                self._start_perception(obs, state)
         except Exception as e:
             logger.error(f"grasp_with_tool lift failed: {e}", exc_info=True)
             self._phase = GraspPhase.FAILED
@@ -1353,6 +1346,9 @@ class GraspToolExecutor:
         if self._phase == GraspPhase.VERIFYING:
             return self._step_verifying(obs, state)
 
+        if self._phase == GraspPhase.HOMING:
+            return self._step_homing(obs, state)
+
         if self._phase in (GraspPhase.DONE, GraspPhase.FAILED):
             # Shouldn't be called but return a no-op
             return self._noop_response(obs)
@@ -1387,16 +1383,17 @@ class GraspToolExecutor:
         """Continue the grasp pipeline after the gripper release."""
         try:
             if self._env_mode == GraspEnvMode.LIBERO:
-                # Same rationale as start(): the agentview camera is fixed
-                # but the arm is still in its FOV — lift before perceiving.
+                # The previous tool ended at the episode-start pose (LiberoHoming), so the
+                # master's image is this one: perceive from here.
                 ee_pos_now = self._libero_extract_ee_pos(obs)
-                if ee_pos_now is None:
-                    logger.warning(
-                        "  LIBERO perception lift skipped — no ee_pos in obs"
-                    )
+                if ee_pos_now is None or LiberoHoming.wanted(obs):
+                    if ee_pos_now is None:
+                        logger.warning("  LIBERO perception lift skipped — no ee_pos in obs")
                     self._start_perception(obs, state)
                     return
-                self._plan_perception_lift_libero(ee_pos_now, obs.get("observation/ee_pos_home"))
+                # Plain LIBERO: the agentview camera is fixed but the arm is still in its
+                # FOV — lift before perceiving.
+                self._plan_perception_lift_libero(ee_pos_now)
                 if self._trajectory:
                     self._phase = GraspPhase.LIFTING
                     self._traj_cursor = 0
@@ -1535,7 +1532,6 @@ class GraspToolExecutor:
         if (self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M
                 and self._phase == GraspPhase.LIFTING):
             logger.warning(f"  LIBERO lifting: EE stalled {dist * 100:.1f} cm from the lift target; perceiving from here")
-            self._libero_lift_targets = []
             self._advance_phase_after_trajectory(obs, state)
             return self._noop_response(obs)
         if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M:
@@ -1543,11 +1539,16 @@ class GraspToolExecutor:
                 f"  LIBERO {self._phase.value}: EE stalled {dist * 100:.1f} cm from the target "
                 f"for {LIBERO_STALL_CHUNKS} chunks → FAILED"
             )
-            self._status_message = (
+            state.log({   # the geometry of the stall, for the readout (not shown to the master)
+                "type": "grasp_stall", "phase": self._phase.value, "short_m": round(dist, 4),
+                "target_world": np.round(target, 4).tolist(), "ee_world": np.round(cur, 4).tolist(),
+                "base_pos": None if obs.get("observation/base_pos") is None else np.round(obs["observation/base_pos"], 4).tolist(),
+                "base_yaw": None if obs.get("observation/base_yaw") is None else round(float(np.asarray(obs["observation/base_yaw"]).flatten()[0]), 4),
+            })
+            self._end_libero(obs, GraspPhase.FAILED, (
                 f"Failed: arm stalled {dist * 100:.1f} cm short of the {self._phase.value} "
                 f"target (blocked or unreachable)"
-            )
-            self._phase = GraspPhase.FAILED
+            ))
             return self._noop_response(obs)
 
         # Per-step delta in metres, capped at LIBERO_MAX_POS_DELTA per axis.
@@ -1779,11 +1780,10 @@ class GraspToolExecutor:
         """
         verdict = self._judge_grasp(obs)
         if verdict is None or verdict[0]:
-            self._phase = GraspPhase.DONE
-            self._status_message = "Grasp complete — handing back to VLA"
+            final, message = GraspPhase.DONE, "Grasp complete — handing back to VLA"
         else:
-            self._phase = GraspPhase.FAILED
-            self._status_message = f"Failed: {verdict[1]}"
+            final, message = GraspPhase.FAILED, f"Failed: {verdict[1]}"
+        self._end_libero(obs, final, message)
         if verdict is not None:
             logger.info(f"  Grasp verdict: success={verdict[0]} ({verdict[1]})")
             state.log({
@@ -1792,6 +1792,24 @@ class GraspToolExecutor:
                 "success": verdict[0],
                 "reason": verdict[1],
             })
+        return self._noop_response(obs)
+
+    def _end_libero(self, obs: dict, final: "GraspPhase", message: str) -> None:
+        """End the grasp with ``final`` (DONE / FAILED) and ``message``; on the robosuite branch with
+        a homing client (LiberoHoming.wanted) the arm and base first go back to the episode-start
+        pose, so the master's next image is the one the next tool perceives from."""
+        if self._env_mode == GraspEnvMode.LIBERO and LiberoHoming.wanted(obs):
+            self._homing, self._final = LiberoHoming(), (final, message)
+            self._phase = GraspPhase.HOMING
+            self._status_message = "Back to the episode-start pose..."
+            return
+        self._phase, self._status_message = final, message
+
+    def _step_homing(self, obs: dict, state) -> dict:
+        chunk = self._homing.chunk(obs, self._last_commanded_gripper, self._action_horizon)
+        if chunk is not None:
+            return {"actions": chunk}
+        self._phase, self._status_message = self._final
         return self._noop_response(obs)
 
     def _judge_grasp(self, obs: dict) -> tuple[bool, str] | None:
@@ -2116,12 +2134,6 @@ class GraspToolExecutor:
     def _advance_phase_after_trajectory(self, obs, state):
         """Called when the current trajectory segment is fully consumed."""
         if self._phase == GraspPhase.LIFTING:
-            if getattr(self, "_libero_lift_targets", None):
-                cur = self._extract_ee_pos(obs)
-                self._libero_seg_target_pos = self._libero_lift_targets.pop(0)
-                self._libero_seg_remaining_steps_estimate = self._libero_lift_steps(cur, self._libero_seg_target_pos)
-                logger.info(f"  Lift segment done → next lift target {np.round(self._libero_seg_target_pos, 3)}")
-                return
             # Lift complete → start perception with fresh obs
             logger.info("  Lift complete → starting perception")
             self._last_obs = obs  # use the latest obs after lift
@@ -3432,15 +3444,7 @@ class GraspToolExecutor:
             return None
         return np.asarray(ee_pos, dtype=np.float64).flatten()[:3]
 
-    @staticmethod
-    def _libero_lift_steps(start: np.ndarray, target: np.ndarray) -> int:
-        """Step budget for one lift segment: the fixed budget, or enough 5 cm steps to get there."""
-        far = int(np.ceil(np.abs(target - start).max() / LIBERO_MAX_POS_DELTA)) + 2
-        return max(LIBERO_INTERP_PERCEPTION_LIFT, far)
-
-    def _plan_perception_lift_libero(
-        self, current_ee_pos: np.ndarray, home_pos=None,
-    ) -> None:
+    def _plan_perception_lift_libero(self, current_ee_pos: np.ndarray) -> None:
         """Plan an EE-delta lift that clears the arm from the agentview FOV.
 
         Sets the closed-loop target so ``_step_trajectory_libero_closed_loop``
@@ -3449,30 +3453,18 @@ class GraspToolExecutor:
         target).  The pre-computed open-loop trajectory is also populated
         as a backup / step-budget reference.
         """
-        if home_pos is None:
-            targets = [current_ee_pos + np.array([
-                LIBERO_PERCEPTION_LIFT_DX,
-                0.0,
-                LIBERO_PERCEPTION_LIFT_DZ,
-            ])]
-        else:
-            # Back to where the arm started the episode (the eval client keeps it relative
-            # to the base): straight up first so the gripper leaves a drawer or the counter
-            # edge before travelling sideways.
-            home_pos = np.asarray(home_pos, dtype=np.float64).flatten()[:3]
-            targets = []
-            if home_pos[2] > current_ee_pos[2] + 0.02:
-                targets.append(np.array([current_ee_pos[0], current_ee_pos[1], home_pos[2]]))
-            targets.append(home_pos.copy())
-        target_pos = targets[0]
-        self._libero_lift_targets = targets[1:]
+        target_pos = current_ee_pos + np.array([
+            LIBERO_PERCEPTION_LIFT_DX,
+            0.0,
+            LIBERO_PERCEPTION_LIFT_DZ,
+        ])
         # Closed-loop target for LIFTING phase: hold orientation,
         # only translate.  target_rot=None tells the closed-loop step
         # to use the zero-delta open-loop fallback for orientation.
         self._libero_seg_target_pos = target_pos.copy()
         self._libero_seg_target_rot = None
         self._libero_seg_ori_per_step_norm = np.zeros(3)
-        self._libero_seg_remaining_steps_estimate = self._libero_lift_steps(current_ee_pos, target_pos)
+        self._libero_seg_remaining_steps_estimate = LIBERO_INTERP_PERCEPTION_LIFT
 
         # Open-loop fallback (used only when closed-loop is disabled).
         deltas = self._interpolate_ee_deltas(
@@ -3523,6 +3515,7 @@ class GraspToolExecutor:
         self._target_object = ""
         self._status_message = ""
         self._last_obs = None
+        self._homing = self._final = None
         self._grasp_pose_camera = None
         self._grasp_confidence = 0.0
         self._intrinsics_used = None

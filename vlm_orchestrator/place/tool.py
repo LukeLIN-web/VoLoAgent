@@ -70,7 +70,7 @@ from vlm_orchestrator.grasp.camera import (
     overshoulder_left_intrinsics,
     pose_opengl_to_opencv,
 )
-from vlm_orchestrator.grasp.tool import libero_stage_chunk
+from vlm_orchestrator.grasp.tool import LiberoHoming, libero_stage_chunk
 from vlm_orchestrator.place.client import PlaceClient
 from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import (
@@ -238,6 +238,7 @@ class PlacePhase(str, Enum):
     RELEASING = "releasing"
     SETTLING = "settling"
     RETREATING = "retreating"
+    HOMING = "homing"            # robosuite: back to the episode-start pose, then the verdict
     DONE = "done"
     FAILED = "failed"
 
@@ -455,6 +456,7 @@ class PlaceToolExecutor:
         self._held_object_hint = None
         self._status_message = ""
         self._failure_reason = ""
+        self._homing = self._final = None
         self._resolved_target_world = None
         self._approach_axis_world = None
         self._point_2d = None
@@ -609,6 +611,8 @@ class PlaceToolExecutor:
                 return self._step_releasing(obs, state)
             if self._phase == PlacePhase.SETTLING:
                 return self._step_settling(obs, state)
+            if self._phase == PlacePhase.HOMING:
+                return self._step_homing(obs, state)
             if self._phase in (PlacePhase.DONE, PlacePhase.FAILED):
                 return self._noop_response(obs)
         except PerceptionFailure as e:
@@ -1017,6 +1021,7 @@ class PlaceToolExecutor:
                 if dist > LIBERO_STALL_FAIL_M and self._phase != PlacePhase.RETREATING:
                     self._cl_target_pos = None
                     self._fail("motion_blocked", f"arm stalled {dist * 100:.1f} cm short of the {self._phase.value} target")
+                    self._home_libero(obs)
                     return self._noop_response(obs)
                 logger.warning(f"  place {self._phase.value}: segment not converged after {self._cl_chunks} chunks (dist {dist*100:.1f} cm), advancing")
             self._place_log[f"segment_{self._phase.value}_final_dist_m"] = dist
@@ -1036,6 +1041,7 @@ class PlaceToolExecutor:
                 self._status_message = "Place complete"
                 self._cl_target_pos = None
                 self._save_place_log()
+                self._home_libero(obs)
         return {"actions": actions}
 
     @staticmethod
@@ -1583,6 +1589,24 @@ class PlaceToolExecutor:
     # ------------------------------------------------------------------
     # Failure handling
     # ------------------------------------------------------------------
+
+    def _home_libero(self, obs: dict) -> None:
+        """Robosuite branch with a homing client (LiberoHoming.wanted): the place just ended (DONE or
+        FAILED after motion); the arm and base go back to the episode-start pose first, so the master's
+        next image is the one the next tool perceives from.  The verdict is kept and restored after."""
+        if not (self._libero and LiberoHoming.wanted(obs)):
+            return
+        self._homing, self._final = LiberoHoming(), (self._phase, self._status_message)
+        self._home_grip = self._g_open if self._phase == PlacePhase.DONE else self._g_close   # a failed place still holds the object
+        self._phase = PlacePhase.HOMING
+        self._status_message = "Back to the episode-start pose..."
+
+    def _step_homing(self, obs: dict, state) -> dict:
+        chunk = self._homing.chunk(obs, self._home_grip, self._horizon)
+        if chunk is not None:
+            return {"actions": chunk}
+        self._phase, self._status_message = self._final
+        return self._noop_response(obs)
 
     def _fail(self, reason: str, message: str) -> None:
         """Set FAILED phase with a known reason string."""

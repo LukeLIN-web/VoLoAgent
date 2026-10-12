@@ -301,6 +301,12 @@ grasp() that picks that object up.
 Example: {"tool": "grasp", "args": {"target": "blue block", "stack": true}}"""
 
 
+# Robosuite branch: the master gets only the NOW image (the system prompt's input list is rewritten).
+_BEFORE_NOW_LINES = "  - a BEFORE image (start of the episode)\n  - a NOW image (current scene)"
+_NOW_ONLY_LINE = "  - a NOW image (the current scene; the tools see this same image)"
+assert _BEFORE_NOW_LINES in TOOL_CHAIN_SYSTEM_PROMPT
+
+
 def _call_signature(decision: "ToolChainDecision") -> tuple:
     """(tool, phrase, point) of a decision, the identity used to spot a verbatim resend."""
     phrase = decision.args.get("target" if decision.tool == "grasp" else "destination") or ""
@@ -543,7 +549,9 @@ class ToolChainConfig:
     """Robosuite branch (--env libero) only; RoboLab's protocol is frozen without it.
     A call with the same tool, phrase and point as the one that just FAILED may be
     re-issued this many times in a row (the first retry is legitimate: the arm moved);
-    after that the strategy refuses it and tells the master to change phrase or point."""
+    after that the strategy refuses it, without counting it against the caps, and tells
+    the master to change phrase or point.  This many refusals in a row force a replan;
+    the refusal after that aborts the episode."""
 
 
 # ----------------------------------------------------------------------
@@ -614,9 +622,12 @@ class ToolChainStrategy(SubgoalStrategy):
         self._tc_config = config
         self._topdown_fallback = topdown_fallback
         self._grasp_candidates = grasp_candidates
-        # Robosuite (RoboCasa) branch only: refuse a verbatim resend of a FAILED call and say so
-        # in the prompt. RoboLab's master input stays as frozen for the paper's tables.
-        self._refuses_repeats = env_mode == "libero"
+        # Robosuite (RoboCasa) branch only; RoboLab's master input stays as frozen for the paper's
+        # tables.  The master sees no BEFORE image (the tools end at the episode-start pose, so the
+        # NOW image is the one the next tool perceives from); a verbatim resend of a FAILED call is
+        # refused and said so in the prompt, costs no budget, forces a replan after
+        # max_identical_calls refusals and aborts the episode on the refusal after that.
+        self._robosuite = env_mode == "libero"
 
         # Optional forced stack override for A/B testing: when
         # STACK_FORCE={true,false} the VLM's per-tool ``stack`` arg is
@@ -664,6 +675,9 @@ class ToolChainStrategy(SubgoalStrategy):
         state.tool_chain_last_reason = None
         state.tool_chain_pending_tool = None
         state.tool_chain_pending_args = None
+        state.tool_chain_last_sig = None
+        state.tool_chain_repeats = 0
+        state.tool_chain_refusals, state.tool_chain_refusal_replanned = 0, False
         return obs, state
 
     # ------------------------------------------------------------------
@@ -804,6 +818,7 @@ class ToolChainStrategy(SubgoalStrategy):
             state.tool_chain_last_reason = None
             state.tool_chain_last_sig = None
             state.tool_chain_repeats = 0
+            state.tool_chain_refusals, state.tool_chain_refusal_replanned = 0, False
             return obs, state
 
         # The same call again, right after it FAILED: allowed a couple of times (the arm
@@ -813,7 +828,8 @@ class ToolChainStrategy(SubgoalStrategy):
             state.tool_chain_repeats += 1
         else:
             state.tool_chain_repeats = 0
-        if self._refuses_repeats and state.tool_chain_repeats >= self._tc_config.max_identical_calls:
+        if self._robosuite and state.tool_chain_repeats >= self._tc_config.max_identical_calls:
+            state.tool_chain_refusals += 1
             logger.warning(
                 f"tool_chain: {decision.tool}({decision.args}) refused — the identical call "
                 f"already failed {state.tool_chain_repeats}x in a row"
@@ -823,6 +839,7 @@ class ToolChainStrategy(SubgoalStrategy):
                 "tool": decision.tool,
                 "args": decision.args,
                 "repeats": state.tool_chain_repeats,
+                "refusals": state.tool_chain_refusals,
             })
             base_reason = (state.tool_chain_last_reason or "").split(" | REFUSED:")[0]
             state.tool_chain_last_reason = (
@@ -832,10 +849,20 @@ class ToolChainStrategy(SubgoalStrategy):
                 f"is not where you point in the NOW image. Look at the NOW image again and give a "
                 f"different point or phrase, or advance / replan."
             )
-            state.tool_chain_subgoal_calls += 1
-            state.tool_chain_tool_calls += 1
+            # A refused call is not a call: it costs no budget.  A master that keeps resending
+            # gets a fresh plan after max_identical_calls refusals, and the episode ends when it
+            # resends once more.
+            if state.tool_chain_refusals >= self._tc_config.max_identical_calls:
+                if state.tool_chain_refusal_replanned:
+                    logger.warning("tool_chain: the same call refused again after the replan; aborting")
+                    state.tool_chain_aborted = True
+                    state.log({"type": "tool_chain_abort", "reason": "the same call refused again after the replan"})
+                else:
+                    self._do_replan(obs, state, reason=f"the same call refused {state.tool_chain_refusals} times")
+                    state.tool_chain_refusal_replanned = True
             return obs, state
         state.tool_chain_last_sig = sig
+        state.tool_chain_refusals, state.tool_chain_refusal_replanned = 0, False
 
         if decision.tool == "grasp":
             # Optional per-grasp stack intent (only honoured under stack-mode).
@@ -888,7 +915,7 @@ class ToolChainStrategy(SubgoalStrategy):
             task=state.original_instruction or "",
             subgoals=list(state.subgoals),
             current_idx=state.current_subgoal_idx,
-            before_image=state.initial_image,
+            before_image=None if self._robosuite else state.initial_image,
             now_image=now_image,
             last_tool=state.tool_chain_last_tool,
             last_args=state.tool_chain_last_args,
@@ -897,6 +924,8 @@ class ToolChainStrategy(SubgoalStrategy):
         )
         t0 = time.time()
         system_prompt = TOOL_CHAIN_SYSTEM_PROMPT
+        if self._robosuite:
+            system_prompt = system_prompt.replace(_BEFORE_NOW_LINES, _NOW_ONLY_LINE)
         if self._use_front_camera:
             system_prompt = system_prompt + _TOOL_CHAIN_FRONT_CAM_NOTE
         # Only expose the `stack` arg to the planner when the master switch
@@ -905,7 +934,7 @@ class ToolChainStrategy(SubgoalStrategy):
         if self._stack_mode_enabled:
             system_prompt = system_prompt + _TOOL_CHAIN_STACK_NOTE
         if self._point_tools:
-            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._refuses_repeats)
+            system_prompt = system_prompt + _tool_chain_point_note(self._point_tools, self._robosuite)
         try:
             raw = self._vlm_call(system_prompt, user_content)
         except Exception as e:
