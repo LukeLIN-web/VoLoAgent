@@ -29,7 +29,7 @@ from .subgoal import SubgoalConfig, SubgoalStrategy
 
 import numpy as np
 
-from vlm_orchestrator.perception.gt_segmentation import gt_ids_available, gt_object_at
+from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_ids_available, gt_object_at
 from vlm_orchestrator.vlm import POINT_CONVENTION, encode_image_b64, parse_json, parse_norm_point
 
 logger = logging.getLogger(__name__)
@@ -745,10 +745,10 @@ class ToolChainStrategy(SubgoalStrategy):
         point = decision.args.get("point")
         if (point is not None and self._env_mode == "robolab"
                 and gt_ids_available(obs, front=self._use_front_camera)):
-            # The scene object under the point on the image the master saw, for
-            # master_sft.py to match against the tool's tool_target.
+            # The scene object the point names on the image the master saw (the
+            # tools' rule), for master_sft.py to match against the tool's tool_target.
             step_entry["point_object"] = gt_object_at(
-                obs, point, front=self._use_front_camera, radius_px=0,
+                obs, point, front=self._use_front_camera, radius_px=POINT_SNAP_PX,
             )
         state.log(step_entry)
 

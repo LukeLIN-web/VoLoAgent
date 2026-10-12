@@ -40,8 +40,8 @@ The LIBERO client builds them with :class:`RobosuiteSegProvider`; RoboLab's
 VoLo client forwards its instance-segmentation object-id images. The grasp
 and place tools (``gt_sim``) read them through
 :func:`gt_object_mask` / :func:`gt_object_at`. On RoboLab the tool_chain
-loop also records, never showing it to the master, the object under each
-call's point (``tool_chain_step``'s ``point_object``) and the object the
+loop also records, never showing it to the master, the object each call's
+point names (``tool_chain_step``'s ``point_object``) and the object the
 tool then acts on (``tool_target``, via :func:`gt_object_under` for the
 grasp mask). The proxy strips every ``gt_seg/`` key before forwarding to
 the VLA policy server.

@@ -361,6 +361,7 @@ class TestStepTransitions:
         ids[200:280, 300:380] = 4
         gt = {"gt_seg/body_ids": ids, "gt_seg/obj_body_id": {"cube": 4}}
         for point, obs, expected in [((0.53, 0.5), {**_obs(), **gt}, "cube"),
+                                     ((0.6, 0.5), {**_obs(), **gt}, "cube"),   # 4 px beside it
                                      ((0.1, 0.1), {**_obs(), **gt}, None),
                                      ((0.53, 0.5), _obs(), "unrecorded")]:
             state = _state()
