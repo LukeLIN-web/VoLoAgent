@@ -197,6 +197,9 @@ LIBERO_EXEC_STEPS = int(os.environ.get("GRASP_LIBERO_EXEC_STEPS", "5"))   # step
 LIBERO_STALL_FAIL_M = 0.05        # a segment still this far from its target after LIBERO_MAX_CHUNKS fails the place (arm blocked)
 LIBERO_MAX_CHUNKS = 12            # give up converging a segment after this many chunks
 LIBERO_RETREAT_M = float(os.environ.get("PLACE_LIBERO_RETREAT_M", str(PLACE_RETREAT_HEIGHT)))   # lift after release
+# mask_top: a destination mask whose top is more than this above the surface under the point is not a container
+# (a coffee machine, a cabinet) and the release is measured from the pointed surface instead; 0 = off.
+LIBERO_MASK_TOP_MAX_RISE_M = float(os.environ.get("PLACE_LIBERO_MASK_TOP_MAX_RISE_M", "0"))
 
 
 def _topdown_rotation_with_yaw(R_current: np.ndarray) -> np.ndarray:
@@ -818,6 +821,20 @@ class PlaceToolExecutor:
             if mask is not None:
                 surface = mask_top_target(mask, depth, intrinsics, cam_to_world)
                 self._place_log["mask_top_surface_world"] = surface.tolist()
+                if self._libero and LIBERO_MASK_TOP_MAX_RISE_M > 0:
+                    # The mask's top is a container's rim; a mask whose top is far above the surface under the
+                    # point is a tall object (a coffee machine for "under the dispenser", the whole cabinet
+                    # for "in the cabinet"): release over the pointed surface instead.
+                    d = np.squeeze(depth)
+                    v, u = int(pt.y_norm * d.shape[0]), int(pt.x_norm * d.shape[1])
+                    z = float(d[v, u])
+                    px = np.array([(u - intrinsics.cx) / intrinsics.fx * z, (v - intrinsics.cy) / intrinsics.fy * z, z])
+                    pixel_world = cam_to_world[:3, :3] @ px + cam_to_world[:3, 3]
+                    self._place_log["point_surface_world"] = pixel_world.tolist()
+                    if surface[2] - pixel_world[2] > LIBERO_MASK_TOP_MAX_RISE_M:
+                        logger.info(f"  mask top {surface[2] - pixel_world[2]:.2f} m above the pointed surface: "
+                                    f"not a container, releasing over the point")
+                        surface = None
         front = self._use_front_camera
         if not self._libero and gt_ids_available(obs, front=front):
             # What the release is measured from: the destination mask's object, else the object under the pixel.

@@ -417,6 +417,8 @@ LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
 # 1: the chunk between arriving at the grasp point and closing is a zero delta (LIBERO's historical path
 # replays the final segment's last row, a step along the approach, for that chunk).
 LIBERO_HOLD_BEFORE_CLOSE = os.environ.get("GRASP_LIBERO_HOLD_BEFORE_CLOSE", "0") == "1"
+LIBERO_FINAL_DONE_M = 0.01       # with the hold: the final approach ends this close to the grasp point ...
+LIBERO_FINAL_MIN_STEP_M = 0.01   # ... and commands at least this per step on the way
 # sam3_point: when the frame has no detection of the phrase, SAM3 again on the 1/zoom crop around the
 # master's point blown up to the frame (small objects); 0 = off.
 LIBERO_SAM3_ZOOM = int(os.environ.get("GRASP_LIBERO_SAM3_ZOOM", "0"))
@@ -1652,7 +1654,12 @@ class GraspToolExecutor:
         delta_m = target - cur
         dist = float(np.linalg.norm(delta_m))
         angle = libero_rotation_error(obs, self._libero_seg_target_rot) if LIBERO_OVERHEAD_M > 0 else 0.0
-        tol = LIBERO_WAYPOINT_DONE_M if self._libero_waypoints else LIBERO_PHASE_DONE_M
+        if self._libero_waypoints:
+            tol = LIBERO_WAYPOINT_DONE_M
+        elif LIBERO_HOLD_BEFORE_CLOSE and self._phase == GraspPhase.FINAL_APPROACH:
+            tol = LIBERO_FINAL_DONE_M
+        else:
+            tol = LIBERO_PHASE_DONE_M
         done = dist <= tol and angle <= LIBERO_ORI_DONE_RAD
         progress = dist + LIBERO_ORI_PROGRESS_M_PER_RAD * angle
         # A segment that stops getting closer (contact, joint limit, out of reach) fails the grasp so the
@@ -1707,6 +1714,11 @@ class GraspToolExecutor:
             delta_m / max(self._libero_seg_remaining_steps_estimate, LIBERO_EXEC_STEPS),
             -LIBERO_MAX_POS_DELTA, LIBERO_MAX_POS_DELTA,
         )
+        if LIBERO_HOLD_BEFORE_CLOSE and self._phase == GraspPhase.FINAL_APPROACH and dist > 0:
+            # The last centimetres to the grasp point: the OSC moves about a quarter of a small command,
+            # so a floor on the step gets the pads down onto the object instead of hovering (the replayed
+            # row used to push them there).
+            per_step_m = delta_m / dist * max(float(np.linalg.norm(per_step_m)), min(LIBERO_FINAL_MIN_STEP_M, dist))
         per_step_norm = per_step_m / OSC_POSE_POS_SCALE
 
         # Closed-loop orientation when a target_rot is set; otherwise
