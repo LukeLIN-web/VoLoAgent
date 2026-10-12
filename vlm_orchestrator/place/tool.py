@@ -1692,19 +1692,18 @@ class PlaceToolExecutor:
 
     def _destination_mask(self, obs, image, pt, dest) -> np.ndarray | None:
         """The destination's mask under the place pixel, for the mask_top
-        rule: the ground-truth instance under it (gt_sim), else SAM3's
-        detection of the destination phrase that covers it, else SAM2's mask
-        grown from it. None for an open spot ("empty space ..." or no scene
-        object under a ground-truth pixel): the pixel's own depth is the
-        surface."""
+        rule: the object the master's point named (gt_sim), else SAM3's
+        detection of the destination phrase that covers the pixel, else SAM2's
+        mask grown from it. None for an open spot ("empty space ..." or a
+        ground-truth pixel standing for no scene object): the pixel's own
+        depth is the surface."""
         phrase = (dest.phrase or dest.target_object or "").strip()
         if phrase.lower().startswith("empty space"):
             return None
         point = (pt.x_norm, pt.y_norm)
         if self._seg_mode == PlaceSegMode.GT_SIM:
-            front = self._use_front_camera
-            name = gt_object_at(obs, point, front=front, radius_px=POINT_SNAP_PX)
-            return None if name in (None, "table") else gt_object_mask(obs, name, front=front)
+            name = pt.scene_object
+            return None if name in (None, "table") else gt_object_mask(obs, name, front=self._use_front_camera)
         if phrase:
             try:
                 return self._client.detect_and_segment(image, phrase, point=point, radius_px=POINT_SNAP_PX)[0]

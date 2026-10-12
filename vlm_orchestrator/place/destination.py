@@ -122,6 +122,7 @@ class PointToPlace2D:
     source: PointSource
     rationale: str | None = None
     debug_jpg: bytes | None = None
+    scene_object: str | None = None     # gt_sim: the scene object the pixel stands for
 
 
 @dataclass
@@ -394,7 +395,9 @@ def _gt_sim_point(
     object name; otherwise it is the scene object under the master's
     ``point``. A point on no scene object (open table, "empty space next to
     ...") is the destination itself. An object destination is its gt_state
-    position projected to the image.
+    position projected to the image, and ``scene_object`` names it: the
+    mask_top rule takes that object's mask, not whatever lies under the
+    projected pixel (a spoon across a bowl's centre).
     """
     gt_state = (obs or {}).get("gt_state")
     if gt_state is None:
@@ -459,6 +462,7 @@ def _gt_sim_point(
         confidence=1.0,
         source="gt_sim",
         rationale=f"gt_state.objects[{name!r}].pos={pos_world.tolist()}",
+        scene_object=name,
     )
 
 

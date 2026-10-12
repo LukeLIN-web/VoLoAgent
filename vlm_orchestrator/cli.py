@@ -416,7 +416,7 @@ def main():
         default="pixel",
         help="Where the place tool measures the release from: the depth under "
              "the destination pixel (default), or the top of the destination's "
-             "mask under it (ground-truth instance with gt_sim, else SAM3's "
+             "mask (the object the master's point names with gt_sim, else SAM3's "
              "detection covering the pixel, else SAM2 grown from it).",
     )
 
