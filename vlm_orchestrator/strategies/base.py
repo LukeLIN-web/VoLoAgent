@@ -125,6 +125,10 @@ class SessionState:
     tool_chain_last_args: dict | None = field(default=None, repr=False)
     tool_chain_last_status: str | None = None
     tool_chain_last_reason: str | None = None
+    # The last executed call's (tool, phrase, point) and how many times in a row the
+    # master re-issued it after it FAILED; the strategy refuses the repeat past a cap.
+    tool_chain_last_sig: tuple | None = field(default=None, repr=False)
+    tool_chain_repeats: int = 0
     # Currently-running (or just-activated) tool — for log breadcrumbs.
     tool_chain_pending_tool: str | None = None
     tool_chain_pending_args: dict | None = field(default=None, repr=False)

@@ -301,6 +301,14 @@ grasp() that picks that object up.
 Example: {"tool": "grasp", "args": {"target": "blue block", "stack": true}}"""
 
 
+def _call_signature(decision: "ToolChainDecision") -> tuple:
+    """(tool, phrase, point) of a decision, the identity used to spot a verbatim resend."""
+    phrase = decision.args.get("target" if decision.tool == "grasp" else "destination") or ""
+    point = decision.args.get("point")
+    point = tuple(round(float(v), 2) for v in point) if point is not None else None
+    return (decision.tool, " ".join(str(phrase).lower().split()), point)
+
+
 def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
     """System-prompt addition requiring ``args.point`` on ``point_tools`` calls."""
     tools = sorted(point_tools)
@@ -312,6 +320,11 @@ def _tool_chain_point_note(point_tools: frozenset[str]) -> str:
     ]
     if "grasp" in point_tools:
         lines.append("  - grasp: a point on the object to pick up.")
+        lines.append(
+            "    If a grasp FAILED because nothing was detected at your point, the object is "
+            "not at that point in the NOW image: find it again in the NOW image and give a new "
+            "point and phrase. The same target and point is refused after it has failed twice."
+        )
     if "place" in point_tools:
         lines.append(
             "  - place: where the held object should go — on the destination "
@@ -523,6 +536,11 @@ class ToolChainConfig:
 
     max_tools_per_episode: int = 30
     """Hard cap on tool calls before forcing abort (bound runtime cost)."""
+
+    max_identical_calls: int = 2
+    """A call with the same tool, phrase and point as the one that just FAILED may be
+    re-issued this many times in a row (the first retry is legitimate: the arm moved);
+    after that the strategy refuses it and tells the master to change phrase or point."""
 
 
 # ----------------------------------------------------------------------
@@ -778,7 +796,40 @@ class ToolChainStrategy(SubgoalStrategy):
             state.tool_chain_last_args = None
             state.tool_chain_last_status = None
             state.tool_chain_last_reason = None
+            state.tool_chain_last_sig = None
+            state.tool_chain_repeats = 0
             return obs, state
+
+        # The same call again, right after it FAILED: allowed a couple of times (the arm
+        # has moved since), then refused — the master must change phrase or point.
+        sig = _call_signature(decision)
+        if sig == state.tool_chain_last_sig and state.tool_chain_last_status == "FAILED":
+            state.tool_chain_repeats += 1
+        else:
+            state.tool_chain_repeats = 0
+        if state.tool_chain_repeats >= self._tc_config.max_identical_calls:
+            logger.warning(
+                f"tool_chain: {decision.tool}({decision.args}) refused — the identical call "
+                f"already failed {state.tool_chain_repeats}x in a row"
+            )
+            state.log({
+                "type": "tool_chain_repeat_refused",
+                "tool": decision.tool,
+                "args": decision.args,
+                "repeats": state.tool_chain_repeats,
+            })
+            base_reason = (state.tool_chain_last_reason or "").split(" | REFUSED:")[0]
+            state.tool_chain_last_reason = (
+                f"{base_reason} | REFUSED: this exact {decision.tool} call (same "
+                f"{'target' if decision.tool == 'grasp' else 'destination'} and point) has now "
+                f"been issued {state.tool_chain_repeats + 1} times in a row and it fails. The object "
+                f"is not where you point in the NOW image. Look at the NOW image again and give a "
+                f"different point or phrase, or advance / replan."
+            )
+            state.tool_chain_subgoal_calls += 1
+            state.tool_chain_tool_calls += 1
+            return obs, state
+        state.tool_chain_last_sig = sig
 
         if decision.tool == "grasp":
             # Optional per-grasp stack intent (only honoured under stack-mode).

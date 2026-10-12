@@ -169,6 +169,7 @@ class SAM3Detector:
         self.device = device
         self.score_threshold = score_threshold
         self.mask_threshold = mask_threshold
+        self.last_top_score = 0.0   # best raw score of the last detect_and_segment call, kept or not
         self._model = None
 
     def _ensure_loaded(self):
@@ -300,6 +301,7 @@ class SAM3Detector:
             f"threshold={threshold}"
         )
 
+        self.last_top_score = float(topk_scores[0]) if topk_k else 0.0
         # Filter by threshold
         keep = scores > threshold
         keep_idx = keep.nonzero(as_tuple=True)[0]

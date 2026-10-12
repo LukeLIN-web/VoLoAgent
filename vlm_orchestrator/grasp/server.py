@@ -847,6 +847,7 @@ def build_app(
 
             t0 = time.time()
             results = _sam3_detector.detect_and_segment(image, text_prompt)
+            tried = [(text_prompt, _sam3_detector.last_top_score)]
             used_variant = False
 
             # If no detections, retry with prompt variants.
@@ -863,6 +864,7 @@ def build_app(
                     results = _sam3_detector.detect_and_segment(
                         image, variant,
                     )
+                    tried.append((variant, _sam3_detector.last_top_score))
                     if results:
                         logger.info(
                             f"  SAM3 variant '{variant}' found "
@@ -875,8 +877,9 @@ def build_app(
 
             if not results:
                 raise RuntimeError(
-                    f"SAM3 found no detections for '{text_prompt}' "
-                    f"(also tried: {_prompt_variants(text_prompt)})"
+                    f"SAM3 found no detections for '{text_prompt}' (threshold "
+                    f"{_sam3_detector.score_threshold}; best scores: "
+                    + ", ".join(f"'{p}' {s:.2f}" for p, s in tried) + ")"
                 )
 
             # If we fell back to a generic noun and the original prompt

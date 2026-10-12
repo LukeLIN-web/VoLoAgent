@@ -355,6 +355,9 @@ LIBERO_MIRROR_X = os.environ.get("GRASP_LIBERO_MIRROR_X", "1") == "1"
 LIBERO_PERCEPTION_LIFT_DZ = float(os.environ.get("GRASP_LIBERO_LIFT_DZ", "0.25"))    # m up from current EE
 LIBERO_PERCEPTION_LIFT_DX = float(os.environ.get("GRASP_LIBERO_LIFT_DX", "-0.12"))   # m back toward robot base (world x)
 LIBERO_INTERP_PERCEPTION_LIFT = 6   # steps (≥ Δ/MAX_DELTA per axis)
+# A SAM2 mask grown from the master's point that covers more of the image than any graspable
+# object could is the counter / cabinet under a wrong point, not the target.
+POINT_MASK_MAX_FRAC = 0.05
 
 # Axis-convention correction: GraspGen's grasp frame uses
 #   +X = between fingers (open direction), +Y = perpendicular, +Z = approach.
@@ -748,7 +751,7 @@ class GraspToolExecutor:
                     )
                     self._start_perception(obs, state)
                     return
-                self._plan_perception_lift_libero(ee_pos_now)
+                self._plan_perception_lift_libero(ee_pos_now, obs.get("observation/ee_pos_home"))
                 if self._trajectory:
                     self._phase = GraspPhase.LIFTING
                     self._traj_cursor = 0
@@ -1385,7 +1388,7 @@ class GraspToolExecutor:
                     )
                     self._start_perception(obs, state)
                     return
-                self._plan_perception_lift_libero(ee_pos_now)
+                self._plan_perception_lift_libero(ee_pos_now, obs.get("observation/ee_pos_home"))
                 if self._trajectory:
                     self._phase = GraspPhase.LIFTING
                     self._traj_cursor = 0
@@ -1521,6 +1524,12 @@ class GraspToolExecutor:
             self._libero_best_dist, self._libero_stall_chunks = dist, 0
         else:
             self._libero_stall_chunks += 1
+        if (self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M
+                and self._phase == GraspPhase.LIFTING):
+            logger.warning(f"  LIBERO lifting: EE stalled {dist * 100:.1f} cm from the lift target; perceiving from here")
+            self._libero_lift_targets = []
+            self._advance_phase_after_trajectory(obs, state)
+            return self._noop_response(obs)
         if self._libero_stall_chunks >= LIBERO_STALL_CHUNKS and dist > LIBERO_PHASE_DONE_M:
             logger.warning(
                 f"  LIBERO {self._phase.value}: EE stalled {dist * 100:.1f} cm from the target "
@@ -2099,6 +2108,12 @@ class GraspToolExecutor:
     def _advance_phase_after_trajectory(self, obs, state):
         """Called when the current trajectory segment is fully consumed."""
         if self._phase == GraspPhase.LIFTING:
+            if getattr(self, "_libero_lift_targets", None):
+                cur = self._extract_ee_pos(obs)
+                self._libero_seg_target_pos = self._libero_lift_targets.pop(0)
+                self._libero_seg_remaining_steps_estimate = self._libero_lift_steps(cur, self._libero_seg_target_pos)
+                logger.info(f"  Lift segment done → next lift target {np.round(self._libero_seg_target_pos, 3)}")
+                return
             # Lift complete → start perception with fresh obs
             logger.info("  Lift complete → starting perception")
             self._last_obs = obs  # use the latest obs after lift
@@ -2892,6 +2907,12 @@ class GraspToolExecutor:
                 f"VLM likely pointed at the wrong object — retry "
                 f"with a more specific phrase."
             )
+        if mask.sum() > POINT_MASK_MAX_FRAC * mask.size:
+            raise RuntimeError(
+                f"SAM2 from the point ({x_norm:.3f}, {y_norm:.3f}) grew into "
+                f"{int(mask.sum())} px ({mask.sum() / mask.size:.0%} of the image): the point is on a "
+                f"surface, not on {target_object!r} — it is not there in the current image"
+            )
 
         # Tight bbox from the mask for downstream debug overlays.
         ys, xs = np.where(mask)
@@ -3395,8 +3416,14 @@ class GraspToolExecutor:
             return None
         return np.asarray(ee_pos, dtype=np.float64).flatten()[:3]
 
+    @staticmethod
+    def _libero_lift_steps(start: np.ndarray, target: np.ndarray) -> int:
+        """Step budget for one lift segment: the fixed budget, or enough 5 cm steps to get there."""
+        far = int(np.ceil(np.abs(target - start).max() / LIBERO_MAX_POS_DELTA)) + 2
+        return max(LIBERO_INTERP_PERCEPTION_LIFT, far)
+
     def _plan_perception_lift_libero(
-        self, current_ee_pos: np.ndarray,
+        self, current_ee_pos: np.ndarray, home_pos=None,
     ) -> None:
         """Plan an EE-delta lift that clears the arm from the agentview FOV.
 
@@ -3406,18 +3433,30 @@ class GraspToolExecutor:
         target).  The pre-computed open-loop trajectory is also populated
         as a backup / step-budget reference.
         """
-        target_pos = current_ee_pos + np.array([
-            LIBERO_PERCEPTION_LIFT_DX,
-            0.0,
-            LIBERO_PERCEPTION_LIFT_DZ,
-        ])
+        if home_pos is None:
+            targets = [current_ee_pos + np.array([
+                LIBERO_PERCEPTION_LIFT_DX,
+                0.0,
+                LIBERO_PERCEPTION_LIFT_DZ,
+            ])]
+        else:
+            # Back to where the arm started the episode (the eval client keeps it relative
+            # to the base): straight up first so the gripper leaves a drawer or the counter
+            # edge before travelling sideways.
+            home_pos = np.asarray(home_pos, dtype=np.float64).flatten()[:3]
+            targets = []
+            if home_pos[2] > current_ee_pos[2] + 0.02:
+                targets.append(np.array([current_ee_pos[0], current_ee_pos[1], home_pos[2]]))
+            targets.append(home_pos.copy())
+        target_pos = targets[0]
+        self._libero_lift_targets = targets[1:]
         # Closed-loop target for LIFTING phase: hold orientation,
         # only translate.  target_rot=None tells the closed-loop step
         # to use the zero-delta open-loop fallback for orientation.
         self._libero_seg_target_pos = target_pos.copy()
         self._libero_seg_target_rot = None
         self._libero_seg_ori_per_step_norm = np.zeros(3)
-        self._libero_seg_remaining_steps_estimate = LIBERO_INTERP_PERCEPTION_LIFT
+        self._libero_seg_remaining_steps_estimate = self._libero_lift_steps(current_ee_pos, target_pos)
 
         # Open-loop fallback (used only when closed-loop is disabled).
         deltas = self._interpolate_ee_deltas(

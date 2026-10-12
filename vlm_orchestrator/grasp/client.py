@@ -436,6 +436,12 @@ class GraspClient:
             headers={"Content-Type": "application/octet-stream"},
             timeout=self._timeout,
         )
+        if resp.status_code == 422:   # no detection / none under the point: say why, not just "422"
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except ValueError:
+                detail = resp.text
+            raise requests.HTTPError(f"422 {detail}", response=resp)
         resp.raise_for_status()
 
         data = self._unpack_npz(resp.content)
