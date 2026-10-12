@@ -302,6 +302,7 @@ LIBERO_GRIP_DEPTH_M = float(os.environ.get("GRASP_LIBERO_GRIP_DEPTH_M", "0"))
 # The eval client executes this many steps of every chunk before asking again, so a chunk must not cover more
 # than the remaining delta: the per-step delta is the remainder over at least this many steps.
 LIBERO_EXEC_STEPS = int(os.environ.get("GRASP_LIBERO_EXEC_STEPS", "5"))
+LIBERO_EMPTY_GRASP_POS = float(os.environ.get("GRASP_LIBERO_EMPTY_GRASP_POS", "0"))   # verdict without GT: closed past this = empty; 0 = no verdict
 LIBERO_STALL_CHUNKS = 12          # closed-loop chunks without getting closer before the grasp fails
 LIBERO_STALL_PROGRESS_M = 0.005   # what counts as getting closer
 # Mobile-base staging (RoboCasa365's PandaOmron; the client sends observation/base_pos + base_yaw and executes 9-D rows
@@ -1783,6 +1784,11 @@ class GraspToolExecutor:
         """(success, reason) for the finished grasp, or None without GT for the target."""
         z = self._gt_height(obs)
         if z is None or self._target_z0 is None:
+            if self._env_mode == GraspEnvMode.LIBERO and LIBERO_EMPTY_GRASP_POS > 0:
+                # No ground truth: a parallel gripper that closed all the way holds nothing
+                # (gripper_position 0 open / 1 closed, read after the retreat).
+                g = self._extract_gripper(obs)
+                return g < LIBERO_EMPTY_GRASP_POS, f"fingers {'stopped at' if g < LIBERO_EMPTY_GRASP_POS else 'closed to'} gripper_position {g:.2f}"
             return None
         # The ungated contact sensor: the eval client's ``objects_in_contact``
         # drops contacts below a gripper-closure gate that a wide held object
