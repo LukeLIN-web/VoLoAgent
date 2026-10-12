@@ -451,7 +451,7 @@ def libero_overhead_waypoints(cur: np.ndarray, pre: np.ndarray, rot: np.ndarray 
     """(position, orientation or None) segments: vertically from *cur* to *pre* + *clearance* (no higher than
     *cur*, which the homing has already lifted: every extra centimetre of height costs reach on a far target),
     across, then down to *pre*."""
-    z = min(float(cur[2]), float(pre[2]) + clearance)
+    z = max(float(pre[2]), min(float(cur[2]), float(pre[2]) + clearance))
     return [(np.array([cur[0], cur[1], z]), None), (np.array([pre[0], pre[1], z]), rot),
             (np.asarray(pre, dtype=np.float64).copy(), rot)]
 
@@ -1750,6 +1750,8 @@ class GraspToolExecutor:
             if self._phase == GraspPhase.FINAL_APPROACH and LIBERO_CLOSE_DURING_FINAL
             else self._gripper_open
         )
+        if done and LIBERO_HOLD_BEFORE_CLOSE and self._phase == GraspPhase.FINAL_APPROACH:
+            per_step_norm, ori_norm = np.zeros(3), np.zeros(3)   # arrived: this chunk must not push on
 
         action = np.concatenate([per_step_norm, ori_norm, [gripper]])
         actions = np.tile(action, (self._action_horizon, 1))

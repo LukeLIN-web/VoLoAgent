@@ -825,11 +825,10 @@ class PlaceToolExecutor:
                     # The mask's top is a container's rim; a mask whose top is far above the surface under the
                     # point is a tall object (a coffee machine for "under the dispenser", the whole cabinet
                     # for "in the cabinet"): release over the pointed surface instead.
-                    d = np.squeeze(depth)
-                    v, u = int(pt.y_norm * d.shape[0]), int(pt.x_norm * d.shape[1])
-                    z = float(d[v, u])
-                    px = np.array([(u - intrinsics.cx) / intrinsics.fx * z, (v - intrinsics.cy) / intrinsics.fy * z, z])
-                    pixel_world = cam_to_world[:3, :3] @ px + cam_to_world[:3, 3]
+                    pixel_world = raycast_2d_to_3d(
+                        pt, depth, intrinsics, cam_to_world, relation=dest.relation, held_object_height_m=None,
+                        clearance_m=0.0, pre_resolved_3d=None, approach_axis_world=dest.approach_axis_world,
+                    ).target_world
                     self._place_log["point_surface_world"] = pixel_world.tolist()
                     if surface[2] - pixel_world[2] > LIBERO_MASK_TOP_MAX_RISE_M:
                         logger.info(f"  mask top {surface[2] - pixel_world[2]:.2f} m above the pointed surface: "
