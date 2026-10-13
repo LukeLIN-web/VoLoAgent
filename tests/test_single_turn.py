@@ -29,7 +29,7 @@ def _strategy(raws: list[str]) -> SingleTurnToolChainStrategy:
     s._use_front_camera, s._stack_mode_enabled, s._env_mode = True, True, "robolab"
     s._point_call, s._master_points = False, True
     s._grasp_seg_mode, s._place_seg_mode = "gt_sim", "gt_sim"
-    s._plan, s.calls = None, []
+    s.calls = []
 
     def vlm_call(system_prompt, user_content, max_tokens=None):
         s.calls.append((system_prompt, user_content, max_tokens))
@@ -100,28 +100,19 @@ def test_point_call_is_refused():
         SingleTurnToolChainStrategy(None, None, point_call=True)
 
 
-def _moved_obs() -> dict:
-    """The block moved from the left half to the bottom-right corner; the bowl stays."""
-    ids = np.zeros((10, 20), dtype=np.uint8)
-    ids[:, 10:] = 2
-    ids[8:10, 18:20] = 1
-    return {"gt_seg/body_ids_front": ids, "gt_seg/obj_body_id": {"block": 1, "bowl": 2}}
 
 
-@pytest.mark.parametrize("seg, reaimed", [("gt_sim", True), ("vlm_sam2", False)])
-def test_gt_sim_points_follow_the_object_named_on_the_opening_image(seg, reaimed):
-    s, state = _strategy([PLAN]), SessionState()
-    s._grasp_seg_mode = seg
+def test_points_go_to_the_tools_as_written_and_a_new_episode_plans_again():
+    s, state = _strategy([PLAN, PLAN]), SessionState()
     state.original_instruction, state.subgoals = "task", ["a"]
     image = np.zeros((4, 4, 3), dtype=np.uint8)
-    s._plan = s._write_plan(_obs(), state, image)          # planned on the opening scene
-    grasp = s._vlm_step(_moved_obs(), state, image)        # runs after the block moved
-    if reaimed:
-        assert grasp.args["point"] == ((18 + 0.5) / 20, (8 + 0.5) / 10)
-        assert [e["object"] for e in state.log_entries if e["type"] == "single_turn_point_reaimed"] == ["block"]
-    else:
-        assert grasp.args["point"] == (0.25, 0.5)
-    place = s._vlm_step(_moved_obs(), state, image)        # the bowl is still under its point
-    assert place.args["point"] == (0.75, 0.5)
-    plan = next(e for e in state.log_entries if e["type"] == "single_turn_plan")
-    assert plan["calls"][0]["args"]["point"] == (0.25, 0.5)   # the logged plan is as written
+    moved = {"gt_seg/body_ids_front": np.full((10, 20), 2, dtype=np.uint8),   # the block left; all bowl now
+             "gt_seg/obj_body_id": {"block": 1, "bowl": 2}}
+    assert s._vlm_step(_obs(), state, image).args["point"] == (0.25, 0.5)
+    assert s._vlm_step(moved, state, image).args["point"] == (0.75, 0.5)
+    state.single_turn_plan = None   # what _on_new_episode sets
+    assert s._vlm_step(_obs(), state, image).tool == "grasp" and len(s.calls) == 2
+
+def test_libero_is_refused():
+    with pytest.raises(ValueError):
+        SingleTurnToolChainStrategy(None, None, env_mode="libero")

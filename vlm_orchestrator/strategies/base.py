@@ -134,6 +134,8 @@ class SessionState:
     # Currently-running (or just-activated) tool — for log breadcrumbs.
     tool_chain_pending_tool: str | None = None
     tool_chain_pending_args: dict | None = field(default=None, repr=False)
+    # tool_chain_single_turn: the calls of the episode's plan not yet run (None until it is written).
+    single_turn_plan: list | None = field(default=None, repr=False)
 
     # --- Trajectory collector for fine-tuning data generation ---
     trajectory_collector: object | None = field(default=None, repr=False)
