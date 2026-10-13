@@ -90,13 +90,17 @@ def main():
         choices=[
             "rewrite", "passthrough", "adaptive",
             "subgoal", "scene_edit", "subgoal_scene_edit",
-            "next_goal", "tool_chain", "grasp_probe",
+            "next_goal", "tool_chain", "tool_chain_single_turn", "grasp_probe",
         ],
         default="subgoal",
         help="Operation mode: "
              "subgoal (decompose + periodic check, recommended), "
              "tool_chain (no VLA at all; VLM picks grasp/place tools and "
              "checks status only after each tool finishes), "
+             "tool_chain_single_turn (tool_chain without feedback: the VLM "
+             "writes every grasp/place call once, before anything runs, and "
+             "never sees a result; needs --master-points when a tool reads "
+             "the master's point), "
              "grasp_probe (no VLM, no VLA; grasps every scene object once "
              "per episode to measure the grasp tool, needs --grasp-seg-mode "
              "gt_sim), "
@@ -873,7 +877,7 @@ def main():
 
 
 # Modes that run the tool_chain loop: tool actions only, never the VLA.
-_TOOL_CHAIN_MODES = {"tool_chain", "grasp_probe"}
+_TOOL_CHAIN_MODES = {"tool_chain", "tool_chain_single_turn", "grasp_probe"}
 # Modes whose grasp/place tools route trajectories through the motion planner.
 _GRASP_TOOL_MODES = {*_TOOL_CHAIN_MODES, "subgoal", "subgoal_scene_edit", "scene_edit"}
 _GRASP_RECOVERY_MODES = {
@@ -1095,6 +1099,7 @@ def _build_strategy(args):
 
     if args.mode in _TOOL_CHAIN_MODES:
         from vlm_orchestrator.strategies.grasp_probe import GraspProbeStrategy
+        from vlm_orchestrator.strategies.single_turn import SingleTurnToolChainStrategy
         from vlm_orchestrator.strategies.tool_chain import (
             ToolChainConfig,
             ToolChainStrategy,
@@ -1113,9 +1118,10 @@ def _build_strategy(args):
             ),
         )
         initial_strategy = _build_initial_strategy(args, ctx)
-        strategy_cls = (
-            GraspProbeStrategy if args.mode == "grasp_probe" else ToolChainStrategy
-        )
+        strategy_cls = {
+            "grasp_probe": GraspProbeStrategy,
+            "tool_chain_single_turn": SingleTurnToolChainStrategy,
+        }.get(args.mode, ToolChainStrategy)
         return strategy_cls(
             ctx, tc_config, initial_strategy=initial_strategy,
             hitl_state=hitl_state,
