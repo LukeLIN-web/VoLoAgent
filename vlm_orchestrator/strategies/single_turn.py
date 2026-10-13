@@ -7,9 +7,12 @@ The master writes every grasp / place call once, on the scene before anything
 has run, and never sees a result: no NOW image after a tool, no tool status,
 no replan. The calls then run in order; a FAILED call is followed by the next
 one as written. The subgoal decomposition at episode start is the same call as
-in ``tool_chain``. Tools and their grounding sources are unchanged: a call's
-point is read by its tool on the frame the tool perceives, as in ``tool_chain``,
-so it goes stale for an object an earlier call moved.
+in ``tool_chain``. Tools and their grounding sources are unchanged, and a
+``gt_sim`` tool still takes the object the master's point names on the image
+the master saw: that image is now the opening one, so before such a call runs
+its point is moved onto that object where it is now (logged as
+``single_turn_point_reaimed``). The other tools read the point on the frame they
+perceive, as in ``tool_chain``: it goes stale for an object an earlier call moved.
 
 ``rewrites.jsonl`` gets one ``single_turn_plan`` entry with the calls and, on
 RoboLab, the scene object each point names on the image the master saw
@@ -24,7 +27,9 @@ import json
 import logging
 import time
 
-from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_ids_available, gt_object_at
+import numpy as np
+
+from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_ids_available, gt_object_at, gt_object_mask
 from vlm_orchestrator.vlm import encode_image_b64, parse_json
 
 from .tool_chain import (
@@ -113,7 +118,7 @@ class SingleTurnToolChainStrategy(ToolChainStrategy):
             )
         # The per-subgoal cap forces a replan, which asks the master on a new image.
         super().__init__(ctx, dataclasses.replace(config, max_tools_per_subgoal=10**9), **kwargs)
-        self._plan: list[ToolChainDecision] | None = None
+        self._plan: list[tuple[ToolChainDecision, str | None]] | None = None
 
     def _on_new_episode(self, obs, state, prompt):
         obs, state = super()._on_new_episode(obs, state, prompt)
@@ -129,7 +134,26 @@ class SingleTurnToolChainStrategy(ToolChainStrategy):
             state.tool_chain_task_done = True
             state.log({"type": "single_turn_plan_done"})
             return None
-        return self._plan.pop(0)
+        decision, named = self._plan.pop(0)
+        seg = self._grasp_seg_mode if decision.tool == "grasp" else self._place_seg_mode
+        if seg == "gt_sim" and named is not None:
+            self._reaim(obs, state, decision, named)
+        return decision
+
+    def _reaim(self, obs, state, decision: ToolChainDecision, named: str) -> None:
+        """Move a gt_sim call's point onto ``named`` (the object it named on the opening image) where it is now."""
+        point = decision.args["point"]
+        if gt_object_at(obs, point, front=self._use_front_camera, radius_px=POINT_SNAP_PX) == named:
+            return
+        mask = gt_object_mask(obs, named, front=self._use_front_camera)
+        if not mask.any():
+            return   # out of view now: the tool gets the point as written
+        ys, xs = np.nonzero(mask)
+        i = int(np.argmin((ys - ys.mean()) ** 2 + (xs - xs.mean()) ** 2))
+        h, w = mask.shape
+        decision.args["point"] = ((xs[i] + 0.5) / w, (ys[i] + 0.5) / h)
+        state.log({"type": "single_turn_point_reaimed", "tool": decision.tool, "object": named,
+                   "from": list(point), "to": list(decision.args["point"])})
 
     def _system_prompt(self) -> str:
         prompt = SINGLE_TURN_SYSTEM_PROMPT
@@ -143,7 +167,8 @@ class SingleTurnToolChainStrategy(ToolChainStrategy):
             prompt += note.replace(", in the NOW image.", ", in the image.")
         return prompt
 
-    def _write_plan(self, obs, state, image) -> list[ToolChainDecision] | None:
+    def _write_plan(self, obs, state, image) -> list[tuple[ToolChainDecision, str | None]] | None:
+        """The plan's calls, each with the scene object its point names on ``image`` (None off RoboLab)."""
         lines = [f"Task: {state.original_instruction or ''}", "", "Subgoals:"]
         lines += [f"  [{i}] {sg}" for i, sg in enumerate(state.subgoals)] or ["  (no subgoals)"]
         lines += ["", "Return JSON only. No markdown. No commentary."]
@@ -166,18 +191,19 @@ class SingleTurnToolChainStrategy(ToolChainStrategy):
             state.log({"type": "single_turn_plan_parse_error", "error": str(e), "raw": raw[:500],
                        "vlm_latency_s": elapsed})
             return None
-        entry = {
-            "type": "single_turn_plan",
-            "calls": [{"tool": d.tool, "args": d.args} for d in plan],
-            "raw": raw[:2000],
-            "vlm_latency_s": elapsed,
-        }
+        named = [None] * len(plan)
         if self._env_mode == "robolab" and gt_ids_available(obs, front=self._use_front_camera):
-            entry["point_objects"] = [
+            named = [
                 gt_object_at(obs, d.args["point"], front=self._use_front_camera, radius_px=POINT_SNAP_PX)
                 if d.args.get("point") is not None else None
                 for d in plan
             ]
-        state.log(entry)
+        state.log({
+            "type": "single_turn_plan",
+            "calls": [{"tool": d.tool, "args": dict(d.args)} for d in plan],
+            "point_objects": named,
+            "raw": raw[:2000],
+            "vlm_latency_s": elapsed,
+        })
         logger.info(f"tool_chain_single_turn: plan of {len(plan)} calls ({elapsed}s)")
-        return plan
+        return list(zip(plan, named))
