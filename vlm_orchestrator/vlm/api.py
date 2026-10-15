@@ -179,10 +179,20 @@ def encode_image_b64(image: np.ndarray) -> str:
 
 
 def parse_json(text: str) -> dict:
-    """Extract and parse JSON from a VLM response.
+    """Extract and parse a JSON object from a VLM response.
 
     Handles markdown code fences, surrounding prose, and nested braces.
+    A reply whose top-level JSON is not an object (a bare list, string or
+    number) is a parse failure like unreadable text: ValueError, which every
+    caller already turns into its fallback.
     """
+    data = _parse_json_value(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object, got {type(data).__name__}: {text[:200]}")
+    return data
+
+
+def _parse_json_value(text: str):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
