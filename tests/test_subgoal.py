@@ -140,6 +140,11 @@ class TestParseJson:
         with pytest.raises(ValueError):
             _parse_json("no json here")
 
+    def test_non_object_raises(self):
+        for text in ('[{"subgoal": "x"}]', '```json\n["x"]\n```', '"x"', "42"):
+            with pytest.raises(ValueError):
+                _parse_json(text)
+
 
 class TestDecomposition:
     def test_single_subgoal(self):

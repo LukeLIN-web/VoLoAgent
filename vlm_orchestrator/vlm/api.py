@@ -244,7 +244,7 @@ def master_point(image: np.ndarray, phrase: str) -> tuple[float, float]:
             {"type": "text", "text": MASTER_POINT_PROMPT.format(phrase=phrase)},
         ]}],
     ).choices[0].message.content or ""
-    data = parse_json(reply)
+    data = _parse_json_value(reply)   # this one reply may be a list of points
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict) or "point_2d" not in data:
