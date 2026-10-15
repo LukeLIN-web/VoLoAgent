@@ -167,8 +167,14 @@ instruction. Produce an ordered list of subgoals the robot should \
 execute one at a time.
 
 Planning principles:
-- **Atomic actions.** Each subgoal is one pick-and-place / push / \
-  reorient / open / close action.
+- **One pick-and-place per subgoal.** Each subgoal moves one object all \
+  the way to its destination, in one instruction that names both the \
+  object and the destination; start it with "Place" or "Move". Never \
+  write a subgoal that only picks up, grasps or lifts an object: picking \
+  it up is part of the subgoal that places it. Write ["Place the red \
+  block into the grey bin"], not ["Pick up the red block", "Place the \
+  red block into the grey bin"]. A push / reorient / open / close \
+  action is one subgoal.
 - **Implicit prerequisites.** Add steps the instruction omits when \
   physics requires them (clear an obstacle, reorient an object too large \
   for a side grasp, etc.).
