@@ -167,23 +167,13 @@ instruction. Produce an ordered list of subgoals the robot should \
 execute one at a time.
 
 Planning principles:
-- **Atomic actions.** Each subgoal is one pick-and-place / push / \
-  reorient / open / close action.
-- **Implicit prerequisites.** Add steps the instruction omits when \
-  physics requires them (clear an obstacle, reorient an object too large \
-  for a side grasp, etc.).
-- **Avoid unnecessary re-handling.** Where physics permit, place each \
-  object directly in its final pose on the first lift, instead of staging \
-  it at a temporary location.
-- **Naming.** Refer to objects by colour + type ("the yellow banana", \
-  "the grey bin"). For visually-identical duplicates use a generic phrase \
-  ("a Rubik's cube"). Keep each instruction short (≤15 words) and start \
-  with an action verb.
-- **Ordering.** Mark `ordered: true` when a later step depends on an \
-  earlier one; mark `false` when steps are independent (e.g. sorting many \
-  items into one container).
-- **Trivial tasks.** A single pick-and-place with no obstacles should \
-  be one subgoal with `ordered: false`.\
+- **Original instruction, verbatim.** The robot's policy was trained on \
+  the task instructions exactly as written. Emit the task instruction \
+  verbatim as one subgoal with `ordered: false`: copy it character for \
+  character (same words, word order, capitalisation and punctuation). \
+  Never rephrase, shorten or lengthen it, split it into steps, add \
+  prerequisite steps, or rename objects, even when the task involves \
+  several steps.\
 """
 
 # VLABench variant: tells the VLM to preserve the original instruction's
