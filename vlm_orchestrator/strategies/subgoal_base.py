@@ -39,6 +39,7 @@ from vlm_orchestrator.failure_handlers.gt_detector import (
 from vlm_orchestrator.vlm import encode_image_b64, parse_json
 
 from .base import OrchestrationStrategy, SessionState, StrategyContext
+from .retry import Retry, home_chunks
 
 if TYPE_CHECKING:
     from vlm_orchestrator.failure_handlers.base import FailureHandler
@@ -437,9 +438,20 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         stack_mode_enabled: bool = False,
         master_points: bool = False,
         place_target: str = "pixel",
+        max_recycles: int = MAX_RECYCLES,
+        retry_trigger: str = "none",
+        retry_action: str = "home",
     ):
         super().__init__(ctx)
         self.initial_strategy = initial_strategy
+        # Per-episode replan budget (VoLo: MAX_RECYCLES) and the retry of the
+        # current subgoal at a due monitor check (strategies/retry.py).
+        self._max_recycles = max_recycles
+        self._retry = (
+            Retry(retry_trigger, retry_action)
+            if retry_trigger != "none" else None
+        )
+        self._retry_reissue = False
         self._master_points = bool(master_points)
         self._place_target = place_target
         self._client = None
@@ -837,6 +849,10 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         if self._gt_detector is not None:
             self._gt_detector.reset()
         self._gt_all_done = False
+        state.retry_home_chunks = []
+        self._retry_reissue = False
+        if self._retry is not None:
+            self._retry.reset()
 
         # Drop any grasp-tool state carried over from the previous
         # episode.  Without this, episodes 3+ can immediately resume
@@ -1050,6 +1066,12 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         if still_active:
             return obs, state
 
+        # --- Retry of the current subgoal (strategies/retry.py) ---
+        if self._retry is not None:
+            obs, state, busy = self._tick_retry(obs, state)
+            if busy:
+                return obs, state
+
         # ==============================================================
         # VLM failure handler — unified detection + action selection.
         # Replaces both GT detection and the old VLM subgoal check.
@@ -1057,6 +1079,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         if self._failure_handler is not None:
             handler_result = self._failure_handler.step(obs, state)
             if handler_result is not None:
+                if self._retry is not None:
+                    self._retry.last_action = handler_result.action
                 obs, state = self._execute_handler_result(
                     obs, state, handler_result,
                 )
@@ -1141,7 +1165,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 self._step_at_last_recycle_attempt = state.episode_step
                 # Last subgoal timed out — try to recycle (identify
                 # remaining work) before giving up.
-                if self._recycle_count < MAX_RECYCLES:
+                if self._recycle_count < self._max_recycles:
                     image = self.ctx.get_vlm_image(obs)
                     if image is not None and self._recycle(obs, state, image):
                         obs = self.ctx.set_prompt(
@@ -1169,6 +1193,79 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             obs = self.ctx.set_prompt(obs, state.rewritten_instruction)
 
         return obs, state
+
+    # ------------------------------------------------------------------
+    # Retry of the current subgoal
+    # ------------------------------------------------------------------
+
+    def _tick_retry(
+        self, obs: dict, state: SessionState,
+    ) -> tuple[dict, SessionState, bool]:
+        """At a due monitor check, retry the current subgoal instead of
+        asking the master when the trigger fires (strategies/retry.py).
+
+        Returns ``(obs, state, busy)``; *busy* while the arm goes home (the
+        proxy serves ``state.retry_home_chunks``) and at the check a retry
+        fired at.  Once home, the same subgoal is re-issued with the full
+        detection reset (``_apply_new_instruction``), which also restarts
+        the monitor's 80-step timer.
+        """
+        if state.retry_home_chunks:
+            return obs, state, True
+        if self._retry_reissue:
+            self._retry_reissue = False
+            self._apply_new_instruction(obs, state, state.rewritten_instruction)
+            state.log({
+                "type": "retry_reissued",
+                "subgoal_idx": state.current_subgoal_idx,
+                "subgoal": state.rewritten_instruction,
+            })
+            return obs, state, False
+        handler = self._failure_handler
+        if handler is None or not state.subgoals or not handler.due(state):
+            return obs, state, False
+        retry = self._retry
+        reason = retry.on_check(state, obs.get("gt_state"))
+        if reason is None:
+            return obs, state, False
+        k = retry.k
+        retry.fired(state.episode_step)
+        entry = {
+            "type": "retry",
+            "trigger": retry.trigger,
+            "action": retry.action,
+            "reason": reason,
+            "check": k,
+            "count": retry.count,
+            "subgoal_idx": state.current_subgoal_idx,
+            "subgoal": state.rewritten_instruction,
+        }
+        if retry.action == "home":
+            try:
+                state.retry_home_chunks = home_chunks(
+                    obs["observation/joint_position"],
+                    self._get_motion_planner(),
+                )
+                entry["home_chunks"] = len(state.retry_home_chunks)
+                self._retry_reissue = True
+            except Exception as e:   # no lift plan: logged, re-issued in place
+                logger.warning(f"  retry: going home failed ({e})")
+                entry["home_failed"] = str(e)
+                self._apply_new_instruction(
+                    obs, state, state.rewritten_instruction,
+                )
+        else:
+            self._apply_new_instruction(
+                obs, state, state.rewritten_instruction,
+            )
+        logger.info(
+            f"  retry ({retry.trigger}/{retry.action}): {reason} at check "
+            f"{k} on subgoal {state.current_subgoal_idx + 1}"
+        )
+        state.log(entry)
+        if state.rewritten_instruction:
+            obs = self.ctx.set_prompt(obs, state.rewritten_instruction)
+        return obs, state, True
 
     # ------------------------------------------------------------------
     # Handler result execution
@@ -1209,7 +1306,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 self._advance_subgoal(obs, state)
             else:
                 # Last subgoal done — try to recycle
-                if self._recycle_count < MAX_RECYCLES:
+                if self._recycle_count < self._max_recycles:
                     image = self.ctx.get_vlm_image(obs)
                     if image is not None and self._recycle(
                         obs, state, image,
@@ -1234,7 +1331,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             logger.info(
                 f"  ↻ VLM handler: replan (reason: {result.reason})"
             )
-            if self._recycle_count >= MAX_RECYCLES:
+            if self._recycle_count >= self._max_recycles:
                 logger.warning(
                     "  ↻ Replan skipped — max recycle attempts reached"
                 )
@@ -3312,7 +3409,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         """Replan remaining subgoals via VLM, or skip to next."""
         sg_idx = state.current_subgoal_idx
 
-        if self._recycle_count < MAX_RECYCLES:
+        if self._recycle_count < self._max_recycles:
             logger.info("  ↻ REPLAN: re-decomposing task")
             image = self.ctx.get_vlm_image(obs)
             if image is not None and self._recycle(obs, state, image):
@@ -3471,7 +3568,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         """
         self._recycle_count += 1
         logger.info(
-            f"  Recycling attempt {self._recycle_count}/{MAX_RECYCLES}"
+            f"  Recycling attempt {self._recycle_count}/{self._max_recycles}"
         )
 
         text = (

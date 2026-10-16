@@ -163,6 +163,9 @@ class SubgoalStrategy(SubgoalBaseStrategy):
         stack_mode_enabled: bool = False,
         master_points: bool = False,
         place_target: str = "pixel",
+        max_recycles: int = MAX_RECYCLES,
+        retry_trigger: str = "none",
+        retry_action: str = "home",
     ):
         super().__init__(
             ctx,
@@ -182,6 +185,9 @@ class SubgoalStrategy(SubgoalBaseStrategy):
             stack_mode_enabled=stack_mode_enabled,
             master_points=master_points,
             place_target=place_target,
+            max_recycles=max_recycles,
+            retry_trigger=retry_trigger,
+            retry_action=retry_action,
         )
         self.config = config
 
@@ -340,7 +346,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
                 "vlm_latency_s": round(elapsed, 2),
             })
         elif done:
-            if self._recycle_count < MAX_RECYCLES:
+            if self._recycle_count < self._max_recycles:
                 if self._recycle(obs, state, image):
                     obs = self.ctx.set_prompt(
                         obs, state.rewritten_instruction
@@ -437,7 +443,7 @@ class SubgoalStrategy(SubgoalBaseStrategy):
             if state.current_subgoal_idx < total - 1:
                 self._advance_subgoal(obs, state)
             else:
-                if self._recycle_count < MAX_RECYCLES:
+                if self._recycle_count < self._max_recycles:
                     if self._recycle(obs, state, image):
                         obs = self.ctx.set_prompt(
                             obs, state.rewritten_instruction

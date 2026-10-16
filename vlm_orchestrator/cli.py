@@ -460,6 +460,30 @@ def main():
     )
 
     parser.add_argument(
+        "--max-recycles",
+        type=int,
+        default=3,
+        help="Subgoal mode: per-episode replan budget, shared by replan and "
+             "next on the last subgoal (VoLo: 3).",
+    )
+    parser.add_argument(
+        "--retry-trigger",
+        choices=("none", "gt", "timer"),
+        default="none",
+        help="Subgoal mode with a failure handler: at a due monitor check, "
+             "retry the current subgoal instead of asking the master when "
+             "the ground truth (gt) or the clock (timer) says so "
+             "(strategies/retry.py). Default none: VoLo's loop.",
+    )
+    parser.add_argument(
+        "--retry-action",
+        choices=("inplace", "home"),
+        default="home",
+        help="What a retry does before re-issuing the subgoal as written: "
+             "nothing (inplace) or take the arm home with the gripper open "
+             "(home, the grasp tool's lift to its perception pose).",
+    )
+    parser.add_argument(
         "--max-grasp-attempts",
         type=int,
         default=2,
@@ -1175,6 +1199,9 @@ def _build_strategy(args):
             max_grasp_attempts=getattr(args, "max_grasp_attempts", None),
             motion_planner=getattr(args, "motion_planner", "curobo"),
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
+            max_recycles=args.max_recycles,
+            retry_trigger=args.retry_trigger,
+            retry_action=args.retry_action,
         )
 
     if args.mode == "scene_edit":

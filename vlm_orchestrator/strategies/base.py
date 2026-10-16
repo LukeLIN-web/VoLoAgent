@@ -78,6 +78,9 @@ class SessionState:
     # Populated by grasp_debug helpers during perception (synchronous).
     # The proxy pops one per chunk and forwards to annotated video as PIP.
     grasp_debug_queue: list = field(default_factory=list)
+    # Action chunks taking the arm home before a retry of the current
+    # subgoal (strategies/retry.py); the proxy serves one per request.
+    retry_home_chunks: list = field(default_factory=list)
     # Currently displayed debug image (popped from queue).
     grasp_debug_image: np.ndarray | None = field(default=None, repr=False)
     grasp_debug_label: str = ""

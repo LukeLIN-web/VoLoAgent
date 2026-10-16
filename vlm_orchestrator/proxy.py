@@ -672,7 +672,10 @@ class OrchestratorProxy:
                 # Tool steps run perception and the grasp-server call
                 # (tens of seconds on a busy GPU), so like process() they
                 # run in a thread to keep the client's pings answered.
-                if (
+                if getattr(state, "retry_home_chunks", None):
+                    # ---- retry: the arm goes home, bypass VLA ----
+                    response = {"actions": state.retry_home_chunks.pop(0)}
+                elif (
                     getattr(state, "grasp_tool_active", False)
                     and state.grasp_tool_executor is not None
                 ):

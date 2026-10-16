@@ -421,14 +421,18 @@ class VLMFailureHandler(FailureHandler):
     # Detection
     # ------------------------------------------------------------------
 
+    def due(self, state: Any) -> bool:
+        """A check is due: ``check_interval`` steps since the last one."""
+        return (state.episode_step - self._step_at_last_check
+                >= self._check_interval)
+
     def step(self, obs: dict, state: Any) -> HandlerResult | None:
         """Run periodic VLM detection.
 
         Returns ``None`` if it's not time to check yet.
         """
         # Not time to check yet
-        if (state.episode_step - self._step_at_last_check
-                < self._check_interval):
+        if not self.due(state):
             return None
 
         # No subgoals to check against
