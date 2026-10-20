@@ -465,6 +465,9 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         self._place_seg_mode: str | None = place_seg_mode
         self._env_mode = env_mode
         self._use_front_camera = use_front_camera
+        # --reference-image: a ReferenceHook (strategies/reference_hook.py) set by
+        # the CLI adds π0.5's reference image in _post_process; None = off.
+        self.reference_hook = None
 
         # Trajectory collection for fine-tuning data generation
         self._trajectory_collector = None
@@ -3609,7 +3612,9 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
     def _post_process(
         self, obs: dict, state: SessionState,
     ) -> tuple[dict, SessionState]:
-        """Post-step processing (e.g. scene edits)."""
+        """Post-step processing (e.g. scene edits); here π0.5's reference image when ``reference_hook`` is set."""
+        if self.reference_hook is not None:
+            obs = self.reference_hook(obs, state)
         return obs, state
 
     def _should_check(self, state: SessionState) -> bool:
