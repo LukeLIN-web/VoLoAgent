@@ -15,9 +15,11 @@ destination's:
     grown from the point, as the grasp tool's ``sam3_point``), and the mask is
     back-projected with the front depth and projected into the exterior camera.
 ``gt``
-    The simulator's mask on the exterior camera of the current subtask's first
-    unsatisfied object, and of its destination in ``gt_state["plan"]``
-    (``robolab_run.py agent --gt-plan``).
+    The simulator's mask on the exterior camera of the object and destination
+    of the first unsatisfied step in ``gt_state["plan"]``, the evaluator's
+    current subtask's ``[object, destination, relation, satisfied]``
+    (``robolab_run.py agent --gt-plan``); with no such step, of the current
+    subtask's first unsatisfied object alone.
 
 It is computed on the first π0.5 request of each (episode, prompt) and attached
 to every π0.5 request until the prompt changes; requests a tool serves instead
@@ -54,7 +56,6 @@ FRONT = ("observation/depth_front", "observation/camera_K_front",
          "observation/camera_pos_front", "observation/camera_quat_front")
 EXTERIOR = ("observation/depth_external", "observation/camera_K",
             "observation/camera_pos", "observation/camera_quat")
-PLACE_RELATIONS = ("in", "on")
 
 
 def segment(client: GraspClient, image: np.ndarray, phrase: str,
@@ -173,10 +174,13 @@ class ReferenceHook:
 
     def _gt(self, obs: dict, prompt: str, record: dict):
         gt_state = obs["gt_state"]
-        target = next((row["object"] for row in gt_state["subtask"]["conditions"] if not row["satisfied"]), None)
-        plan = record["plan"] = gt_state["plan"]   # None: the task's success term names no destinations
-        triple = next((t for t in plan or [] if t[0] == target), None) if target is not None else None
-        destination = triple[1] if triple is not None and triple[2] in PLACE_RELATIONS else None
+        plan = record["plan"] = gt_state["plan"]
+        step = next((row for row in plan if not row[3]), None)
+        if step is not None:
+            target, destination = step[0], step[1]
+        else:   # a relation subtask, or every step holds
+            target = next((row["object"] for row in gt_state["subtask"]["conditions"] if not row["satisfied"]), None)
+            destination = None
 
         def hull_of(entry, row):
             mask = gt_object_mask(obs, entry["object"], front=False)
