@@ -559,6 +559,29 @@ def main():
         help="Port for HITL web UI (default: 8002)",
     )
 
+    # --- pi0.5 reference image (agent-harness #67) ---
+    parser.add_argument(
+        "--reference-image",
+        choices=["off", "master", "gt"],
+        default="off",
+        help="--mode subgoal: at each subgoal start draw a reference image "
+             "(target red, destination blue, the rest darkened) on the "
+             "exterior 224 frame and send it to pi0.5 as "
+             "observation/reference_image with every request until the "
+             "prompt changes. master: the master names both on the front "
+             "camera, segmented per --reference-seg and carried to the "
+             "exterior camera by the front depth; gt: the simulator's masks "
+             "(needs robolab_run.py agent --gt-plan). (default: off)",
+    )
+    parser.add_argument(
+        "--reference-seg",
+        choices=["sam3", "sam3_point"],
+        default="sam3",
+        help="--reference-image master: sam3 = the phrase's top SAM3 "
+             "detection; sam3_point = its detection under the master's "
+             "point, else SAM2 from the point (default: sam3)",
+    )
+
     # --- Fine-tuning data collection ---
     parser.add_argument(
         "--collect-trajectories",
@@ -766,6 +789,11 @@ def main():
                 f"--next-goal-template {next_goal_template} (MCQ) requires "
                 "--next-goal-task-type to supply closed-vocab candidates."
             )
+
+    if args.reference_image != "off" and args.mode != "subgoal":
+        parser.error(
+            f"--reference-image needs --mode subgoal (got --mode {args.mode})"
+        )
 
     # ------------------------------------------------------------------
     # Validate --failure-monitor / --recovery-mode compatibility
@@ -1168,7 +1196,7 @@ def _build_strategy(args):
 
         initial_strategy = _build_initial_strategy(args, ctx)
 
-        return SubgoalStrategy(
+        strategy = SubgoalStrategy(
             ctx, subgoal_config, initial_strategy=initial_strategy,
             failure_monitor=args.failure_monitor,
             recovery_mode=args.recovery_mode,
@@ -1184,6 +1212,13 @@ def _build_strategy(args):
             motion_planner=getattr(args, "motion_planner", "curobo"),
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
         )
+        if args.reference_image != "off":
+            from vlm_orchestrator.strategies.reference_hook import ReferenceHook
+
+            strategy.reference_hook = ReferenceHook(
+                ctx, args.reference_image, args.reference_seg,
+            )
+        return strategy
 
     if args.mode == "scene_edit":
         from vlm_orchestrator.strategies.archive.scene_edit import (
