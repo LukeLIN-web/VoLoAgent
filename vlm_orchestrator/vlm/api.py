@@ -25,6 +25,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 from PIL import Image
 
+from vlm_orchestrator.perception.reference_image import GROUNDING_PROMPT, parse_grounding
+
 logger = logging.getLogger(__name__)
 
 
@@ -240,6 +242,28 @@ def master_point(image: np.ndarray, phrase: str) -> tuple[float, float]:
     if not isinstance(data, dict) or "point_2d" not in data:
         raise ValueError(f"master point for {phrase!r}: no point_2d in {reply[:200]!r}")
     return parse_norm_point(data["point_2d"], 1000.0)
+
+
+def ask_reference_targets(image: np.ndarray, subgoal: str) -> dict:
+    """What the reference image highlights for ``subgoal``: the master VLM's
+    answer on ``image`` (its front-camera view) to ``GROUNDING_PROMPT``, read
+    by ``parse_grounding`` — the target and the destination, each a phrase
+    and a normalised point, or None. Endpoint, model and call record as
+    :func:`master_point`."""
+    import openai   # optional here: this module is also imported where openai is not installed
+
+    client = openai.OpenAI(
+        base_url=os.environ["VLM_BASE_URL"],
+        api_key=os.environ.get("VLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "EMPTY",
+    )
+    reply = chat_create(
+        client, model=os.environ["VLM_MODEL"], temperature=0.0, max_tokens=256,
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_b64(image)}"}},
+            {"type": "text", "text": GROUNDING_PROMPT.format(subgoal=subgoal)},
+        ]}],
+    ).choices[0].message.content or ""
+    return parse_grounding(reply)
 
 
 def parse_norm_point(value, scale: float = 1.0) -> tuple[float, float]:
