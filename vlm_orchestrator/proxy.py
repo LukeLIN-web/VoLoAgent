@@ -488,6 +488,7 @@ class OrchestratorProxy:
                 # chunks.  Strategies should prefer state.episode_step
                 # over state.infer_count for cadence gating.
                 client_step = obs.pop("__step", None)
+                selection_step = obs.pop("__selection_step", None)
                 if client_step is not None:
                     state.episode_step = int(client_step)
                 else:
@@ -668,10 +669,12 @@ class OrchestratorProxy:
                     )
                 }
                 if self.config.vla_selection_context:
+                    if selection_step is None:
+                        selection_step = client_step if client_step is not None else state.episode_step
                     context = {
                         key: value for key, value in (
                             ("episode_id", episode_marker),
-                            ("step", client_step),
+                            ("step", selection_step),
                             ("task_slug", client_task_slug),
                         ) if value is not None
                     }
