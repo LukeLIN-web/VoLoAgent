@@ -145,6 +145,7 @@ class ProxyConfig:
         frontend: Frontend | None = None,
         backend: Backend | None = None,
         vla_obs_key_remap: str = "none",
+        vla_selection_context: bool = False,
         client_protocol: str = "openpi",
         # ----- backward-compat shim (used by tests / old call-sites) -----
         vlm=None,
@@ -171,6 +172,7 @@ class ProxyConfig:
             gt_metric_attribution_window_steps
         )
         self.vla_obs_key_remap = vla_obs_key_remap
+        self.vla_selection_context = vla_selection_context
         self.client_protocol = client_protocol
 
         # Frontend / backend default to openpi WebSocket on both sides
@@ -656,7 +658,7 @@ class OrchestratorProxy:
                     "observation/camera_",
                     "gt_seg/",
                 )
-                _STRIP_EXACT = {"gt_state", "ground_truth_done"}
+                _STRIP_EXACT = {"gt_state", "ground_truth_done", "__selection_context"}
                 vla_obs = {
                     k: v for k, v in obs.items()
                     if (
@@ -665,6 +667,22 @@ class OrchestratorProxy:
                         and not any(k.startswith(p) for p in _STRIP_PREFIXES)
                     )
                 }
+                if self.config.vla_selection_context:
+                    context = {
+                        key: value for key, value in (
+                            ("episode_id", episode_marker),
+                            ("step", client_step),
+                            ("task_slug", client_task_slug),
+                        ) if value is not None
+                    }
+                    for key in ("camera_K", "camera_pos", "camera_quat"):
+                        if f"observation/{key}" in obs:
+                            context[key] = obs[f"observation/{key}"]
+                    raw = obs.get("observation/exterior_image_1_left_raw")
+                    if raw is not None:
+                        context["exterior_image_raw"] = raw
+                        context["image_hw"] = list(raw.shape[:2])
+                    vla_obs["__selection_context"] = context
 
                 # ---- grasp_with_tool: bypass VLA ----
                 # When a planned grasp is active, generate actions

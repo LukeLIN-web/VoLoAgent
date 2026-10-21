@@ -633,6 +633,13 @@ def main():
              "--client-protocol dreamzero instead. (default: none)",
     )
     parser.add_argument(
+        "--vla-selection-context",
+        action="store_true",
+        help="Forward current exterior image/calibration and episode/step "
+             "metadata in __selection_context for an action selector. "
+             "The selector must remove it before policy inference (default: off).",
+    )
+    parser.add_argument(
         "--client-protocol",
         choices=["openpi", "dreamzero", "cosmos3"],
         default="openpi",
@@ -869,6 +876,7 @@ def main():
         frontend=frontend,
         backend=backend,
         vla_obs_key_remap=args.vla_obs_key_remap,
+        vla_selection_context=args.vla_selection_context,
         client_protocol=args.client_protocol,
     )
 
