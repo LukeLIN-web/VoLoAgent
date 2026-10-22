@@ -105,3 +105,28 @@ def test_generic_keeps_the_subgoal_when_the_destination_mask_is_the_table(monkey
     assert out["prompt"] == expected and REFERENCE_KEY in out
     (line,) = [json.loads(x) for x in open(tmp_path / "reference.jsonl")]
     assert line["vla_prompt"] == expected
+
+
+@pytest.mark.parametrize("rows, expected", [(260, "put the cube on the wooden table"), (60, GENERIC_PROMPT)])
+def test_master_judges_the_table_by_the_destination_mask_share(monkeypatch, tmp_path, rows, expected):
+    """Through _master: the destination mask's share of the 864x480 front frame decides (rows / 480 of it here)."""
+    hook = rh.ReferenceHook(StrategyContext(vlm=None), "master", seg="sam3_point", prompt="generic")
+    grounding = {"target": {"phrase": "red cube", "point": (0.5, 0.5)},
+                 "destination": {"phrase": "wooden table", "point": (0.5, 0.8)}}
+    monkeypatch.setattr(rh, "ask_reference_targets", lambda image, prompt: grounding)
+    monkeypatch.setattr(rh, "_camera", lambda obs, keys: (np.ones((480, 864), np.float32), dict(K=None, pos=None, quat=None)))
+    monkeypatch.setattr(rh, "backproject", lambda mask, *a: mask)
+    monkeypatch.setattr(rh, "hull_224", lambda mask, cam: SQUARE)
+
+    def segment(client, image, phrase, point, seg):
+        mask = np.zeros((480, 864), bool)
+        mask[: (rows if phrase == "wooden table" else 10)] = True
+        return mask, 0.9, "sam3"
+
+    monkeypatch.setattr(rh, "segment", segment)
+    obs = _obs("put the cube on the wooden table")
+    obs[rh.FRONT_IMAGE] = np.zeros((480, 864, 3), np.uint8)
+    out = hook(obs, _state(tmp_path))
+    assert out["prompt"] == expected and REFERENCE_KEY in out
+    (line,) = [json.loads(x) for x in open(tmp_path / "reference.jsonl")]
+    assert line["destination"]["mask_share"] == pytest.approx(rows / 480) and line["vla_prompt"] == expected

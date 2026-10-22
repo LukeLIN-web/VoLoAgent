@@ -59,9 +59,9 @@ logger = logging.getLogger(__name__)
 
 EXTERIOR_224 = "observation/exterior_image_1_left"
 # A master destination mask this share of the front frame or more is the table, not an object on it: on
-# agent-harness #67's runs a mask of the table covers over a fifth of the frame, any other destination
-# (a spot on the table included) under a sixteenth.
-TABLE_SHARE = 1 / 8
+# agent-harness #67's runs (864x480 front frame) a mask of the whole table covers over half of the frame,
+# any other destination (a spot on the table included) under a seventh.
+TABLE_SHARE = 1 / 4
 FRONT_IMAGE = "observation/front_image_left_raw"
 # (depth, K, pos, quat) per camera as RoboLab's VoLo client sends them (policies/volo/metadata.py):
 # depth in metres to the image plane, K in pixels, env-local position, world-frame OpenGL (w, x, y, z).
