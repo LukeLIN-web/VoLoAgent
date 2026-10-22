@@ -89,3 +89,19 @@ def test_tool_steps_are_left_alone(monkeypatch, tmp_path):
     state.tool_chain_active = True
     obs = _obs("put the apple in the bowl")
     assert hook(obs, state) is obs and calls == []
+
+
+@pytest.mark.parametrize("share, expected", [(0.3, "put the cube on the wooden table"), (0.05, GENERIC_PROMPT)])
+def test_generic_keeps_the_subgoal_when_the_destination_mask_is_the_table(monkeypatch, tmp_path, share, expected):
+    hook, _ = _hook(monkeypatch, "generic", [(SQUARE, OTHER)])
+    drawn = hook._gt
+
+    def master_like(obs, prompt, record):   # the master's hull_of logs the destination mask's share of the front frame
+        record["destination"] = {"phrase": "wooden table", "mask_share": share}
+        return drawn(obs, prompt, record)
+
+    monkeypatch.setattr(hook, "_gt", master_like)
+    out = hook(_obs("put the cube on the wooden table"), _state(tmp_path))
+    assert out["prompt"] == expected and REFERENCE_KEY in out
+    (line,) = [json.loads(x) for x in open(tmp_path / "reference.jsonl")]
+    assert line["vla_prompt"] == expected

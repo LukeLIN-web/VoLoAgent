@@ -29,10 +29,13 @@ of π0.5 are left alone. Each computation appends a line to
 polygon), never the proxy step.
 
 ``--reference-prompt generic`` (agent-harness #77): while the image shows both
-the target and the destination, π0.5 gets
+the target and a destination that is not the table, π0.5 gets
 :data:`~vlm_orchestrator.perception.reference_image.GENERIC_PROMPT`, the
-sentence of the sim training frames that carried it, instead of the prompt;
-the line's ``vla_prompt`` is the sentence π0.5 gets.
+sentence of the sim training frames that carried it, instead of the prompt
+(those frames never had the table as the destination). ``gt`` never draws the
+table; under ``master`` a destination mask covering at least ``TABLE_SHARE``
+of the front frame is the table. The line's ``vla_prompt`` is the sentence
+π0.5 gets.
 """
 
 from __future__ import annotations
@@ -55,6 +58,10 @@ from vlm_orchestrator.vlm.api import ask_reference_targets
 logger = logging.getLogger(__name__)
 
 EXTERIOR_224 = "observation/exterior_image_1_left"
+# A master destination mask this share of the front frame or more is the table, not an object on it: on
+# agent-harness #67's runs a mask of the table covers over a fifth of the frame, any other destination
+# (a spot on the table included) under a sixteenth.
+TABLE_SHARE = 1 / 8
 FRONT_IMAGE = "observation/front_image_left_raw"
 # (depth, K, pos, quat) per camera as RoboLab's VoLo client sends them (policies/volo/metadata.py):
 # depth in metres to the image plane, K in pixels, env-local position, world-frame OpenGL (w, x, y, z).
@@ -157,7 +164,8 @@ class ReferenceHook:
             record["error"] = f"{type(e).__name__}: {e}"
             image = None
         both = image is not None and target is not None and destination is not None
-        vla_prompt = GENERIC_PROMPT if self.prompt == "generic" and both else prompt
+        table = (record.get("destination") or {}).get("mask_share", 0) >= TABLE_SHARE
+        vla_prompt = GENERIC_PROMPT if self.prompt == "generic" and both and not table else prompt
         record["attached"] = image is not None
         record["vla_prompt"] = vla_prompt
         self._write(state, record, image)
@@ -180,7 +188,7 @@ class ReferenceHook:
             if found is None:
                 return None
             mask, score, model = found
-            row.update(score=float(score), model=model, mask_px=int(mask.sum()))
+            row.update(score=float(score), model=model, mask_px=int(mask.sum()), mask_share=float(mask.mean()))
             return hull_224(backproject(mask, depth, front["K"], front["pos"], front["quat"]), exterior)
 
         return tuple(_polygon(record, role, grounding[role], hull_of) for role in ("target", "destination"))
