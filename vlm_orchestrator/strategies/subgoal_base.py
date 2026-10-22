@@ -1190,6 +1190,13 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         sg_idx = state.current_subgoal_idx
         sg = state.subgoals[sg_idx] if state.subgoals else "?"
 
+        # Apply a refinement or its expiry before dispatch. Expiry also
+        # restores the full VLA instruction when a tool takes over or a
+        # replan cannot run; next/replan may replace it below as usual.
+        if result.instruction:
+            state.rewritten_instruction = result.instruction
+            state.flush_actions = True
+
         # VLMFailureHandler.step() already emitted a "vlm_detect" event
         # carrying status / action / reason / vlm_latency_s / vlm_raw —
         # no need to duplicate it here.  (Was previously logged as
@@ -1341,13 +1348,6 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                         "  📍 Place tool failed to start — "
                         "continuing with current subgoal"
                     )
-
-        elif result.action == ACTION_CONTINUE:
-            # Nothing to do — keep working
-            if result.instruction:
-                # Handler provided a refined instruction
-                state.rewritten_instruction = result.instruction
-                state.flush_actions = True
 
         # Reset chunk counters after any action (except continue)
         if result.action != ACTION_CONTINUE:

@@ -644,6 +644,164 @@ class TestHandlerReplan:
         )
 
 
+class TestHandlerRecovery:
+    @staticmethod
+    def _strategy(vlm_call):
+        from vlm_orchestrator.failure_handlers.vlm import VLMFailureHandler
+
+        strategy = _make_strategy(
+            MockSubgoalVLM(), check_interval=4, subgoal_timeout=100,
+        )
+        state = SessionState(
+            original_instruction="put the block in the bowl",
+            subgoals=["put the block in the bowl", "move the arm away"],
+            rewritten_instruction="put the block in the bowl",
+            initial_image=np.zeros((64, 64, 3), dtype=np.uint8),
+            episode_id=1,
+            infer_count=1,
+        )
+        strategy._failure_handler = VLMFailureHandler(
+            vlm_call_fn=vlm_call,
+            image_builder_fn=strategy._build_check_message,
+            get_vlm_image_fn=strategy.ctx.get_vlm_image,
+            get_extra_images_fn=strategy.ctx.get_vlm_extra_images,
+            check_interval=4,
+            recovery_mode="replan_tools",
+        )
+        strategy._failure_handler.on_episode_start({}, state)
+        return strategy, state
+
+    @pytest.mark.parametrize("next_check", [
+        "continue", "invalid_response", "call_failure", "missing_rgb",
+    ])
+    def test_refinement_reaches_policy_and_expires_at_next_check(self, next_check):
+        calls = []
+        refined = "lift the block clear of the bowl rim"
+
+        def vlm_call(system_prompt, user_content):
+            calls.append(state.episode_step)
+            if len(calls) == 1:
+                return json.dumps({
+                    "status": "in_progress", "action": "continue",
+                    "instruction": refined,
+                })
+            if next_check == "call_failure":
+                raise RuntimeError("monitor unavailable")
+            if next_check == "invalid_response":
+                return "not a JSON response"
+            return '{"status": "in_progress", "action": "continue"}'
+
+        strategy, state = self._strategy(vlm_call)
+        subgoals = list(state.subgoals)
+        for step in (1, 3, 4, 5, 7, 8):
+            state.episode_step = step
+            state.infer_count += 1
+            state.flush_actions = False  # mimic consumption by the proxy
+            obs = _make_obs(state.original_instruction)
+            if step == 8 and next_check == "missing_rgb":
+                obs = {"prompt": state.original_instruction}
+            obs, state = strategy._on_step(obs, state)
+
+            expected = refined if 4 <= step < 8 else subgoals[0]
+            assert obs["prompt"] == expected
+            assert state.rewritten_instruction == expected
+            assert state.flush_actions is (step in (4, 8))
+            assert state.subgoals == subgoals
+            assert state.current_subgoal_idx == 0
+            assert state.step_at_subgoal_start == 0
+            assert strategy._recycle_count == 0
+            assert not state.episode_done
+
+        assert calls == ([4] if next_check == "missing_rgb" else [4, 8])
+
+    @pytest.mark.parametrize("action", ["grasp_tool", "replan"])
+    def test_refinement_expires_even_when_recovery_action_cannot_run(self, action):
+        replies = iter([
+            '{"action":"continue","instruction":"lift the block"}',
+            json.dumps({"status": "failure", "action": action,
+                        "grasp_target": "the block", "reason": "stuck"}),
+        ])
+        strategy, state = self._strategy(lambda *args: next(replies))
+        strategy._recycle_count = MAX_RECYCLES
+        strategy._grasp_attempts = strategy._max_grasp_attempts
+        state.episode_step = 4
+        obs, state = strategy._on_step(_make_obs(state.original_instruction), state)
+        assert obs["prompt"] == "lift the block"
+
+        state.flush_actions = False
+        state.episode_step = 8
+        obs, state = strategy._on_step(_make_obs(state.original_instruction), state)
+        assert obs["prompt"] == state.subgoals[0]
+        assert state.flush_actions
+        assert state.current_subgoal_idx == 0
+        assert strategy._grasp_attempts == strategy._max_grasp_attempts
+        assert strategy._recycle_count == MAX_RECYCLES
+        assert state.grasp_tool_executor is None
+
+    @pytest.mark.parametrize("tool", ["grasp", "place"])
+    @pytest.mark.parametrize("outcome", ["done", "failed"])
+    def test_lifecycle_feedback_survives_executor_reset_and_log_drain(
+        self, tool, outcome,
+    ):
+        from types import SimpleNamespace
+
+        from vlm_orchestrator.grasp.tool import GraspPhase
+        from vlm_orchestrator.place import PlacePhase
+
+        calls = []
+
+        def vlm_call(system_prompt, user_content):
+            calls.append((state.episode_step, user_content))
+            return '{"status": "in_progress", "action": "continue"}'
+
+        strategy, state = self._strategy(vlm_call)
+        phases = GraspPhase if tool == "grasp" else PlacePhase
+        executor = SimpleNamespace(
+            phase=getattr(phases, outcome.upper()),
+            status_message="motion clearance blocked",
+            failure_reason="motion_blocked",
+            _grasp_confidence=0.75,
+            _place_log={},
+        )
+
+        def reset():
+            executor.phase = phases.IDLE
+            executor.status_message = ""
+            executor.failure_reason = ""
+
+        executor.reset = reset
+        setattr(state, f"{tool}_tool_executor", executor)
+        setattr(state, f"{tool}_tool_active", True)
+        setattr(state, f"{tool}_tool_target", "the striped block")
+        state.place_tool_held_object = "the striped block"
+
+        state.episode_step = 1
+        strategy._on_step(_make_obs(state.original_instruction), state)
+        assert executor.phase == phases.IDLE
+        assert not getattr(state, f"{tool}_tool_active")
+        assert calls == []
+        assert any(
+            entry["type"] == f"{tool}_tool_{outcome}"
+            for entry in state.log_entries
+        )
+        state.log_entries.clear()  # the proxy drains logs after every process()
+
+        state.episode_step = 4
+        obs, state = strategy._on_step(_make_obs(state.original_instruction), state)
+        assert len(calls) == 1
+        assert calls[0][0] == 4
+        content = "\n".join(
+            item["text"] for item in calls[0][1] if item["type"] == "text"
+        )
+        assert f"{tool}_tool_{outcome}" in content
+        assert "the striped block" in content
+        if outcome == "failed":
+            assert "blocked" in content
+        assert state.current_subgoal_idx == 0
+        assert obs["prompt"] == state.subgoals[0]
+        assert not state.episode_done
+
+
 class TestHybridCheckMode:
     def test_ordered_task_uses_vlm_check(self):
         """Hybrid mode: ordered task uses VLM check, advances on 'done'."""

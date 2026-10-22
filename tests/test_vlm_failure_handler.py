@@ -3,10 +3,14 @@
 
 """Tests for VLMFailureHandler."""
 
+import base64
+import io
+import json
 import time
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from vlm_orchestrator.failure_handlers.base import (
     ACTION_CONTINUE,
@@ -339,3 +343,234 @@ class TestVLMFailureHandler:
 
         for _ in range(10):
             assert handler.step({}, state) is None
+
+
+class TestRecoveryContext:
+    @staticmethod
+    def make_handler(response='{"status":"in_progress","action":"continue"}'):
+        from vlm_orchestrator.strategies.base import SessionState
+        from vlm_orchestrator.strategies.subgoal_base import SubgoalBaseStrategy
+
+        calls = []
+
+        def call(system, content):
+            calls.append(content)
+            return response
+
+        handler = VLMFailureHandler(
+            vlm_call_fn=call,
+            image_builder_fn=SubgoalBaseStrategy._build_check_message,
+            get_vlm_image_fn=lambda obs: obs["rgb"],
+            get_extra_images_fn=lambda obs: [obs["wrist"]],
+            check_interval=5,
+            recovery_mode="replan_tools",
+            primary_label="Front camera",
+            extra_labels=["Wrist camera"],
+        )
+        state = SessionState(original_instruction="Put the red block in the bowl")
+        # Production startup resets the handler BEFORE decomposition.
+        handler.on_episode_start({}, state)
+        state.subgoals = [state.original_instruction]
+        state.rewritten_instruction = state.subgoals[0]
+        obs = {
+            "rgb": np.full((16, 16, 3), 17, dtype=np.uint8),
+            "wrist": np.full((16, 16, 3), 42, dtype=np.uint8),
+        }
+        return handler, state, obs, calls
+
+    def test_previous_rgb_is_copied_and_survives_same_subgoal_tool_callback(self):
+        handler, state, obs, calls = self.make_handler()
+        state.episode_step = 5
+        assert handler.step(obs, state) is None
+        assert not any(p.get("text", "").startswith("PREVIOUS") for p in calls[0])
+
+        # Camera buffers may be reused; history must keep the old pixels.
+        obs["rgb"][:] = 200
+        obs["wrist"][:] = 210
+        handler.on_subgoal_advanced(obs, state, 0)
+        state.episode_step = 10
+        assert handler.step(obs, state) is None
+        previous = []
+        for i, part in enumerate(calls[1]):
+            if part.get("text", "").startswith("PREVIOUS"):
+                assert "step 5" in part["text"]
+                assert state.subgoals[0] in part["text"]
+                url = calls[1][i + 1]["image_url"]["url"]
+                pixels = np.asarray(Image.open(io.BytesIO(base64.b64decode(url.split(",")[1]))))
+                previous.append((part["text"], pixels))
+        assert len(previous) == 2
+        assert "Front camera" in previous[0][0]
+        assert "Wrist camera" in previous[1][0]
+        assert np.allclose(previous[0][1], 17, atol=1)
+        assert np.allclose(previous[1][1], 42, atol=1)
+
+    @pytest.mark.parametrize("extra_view", [False, True])
+    def test_three_camera_monitor_respects_image_limit_and_pairing(self, extra_view):
+        from vlm_orchestrator.strategies.base import SessionState, StrategyContext
+        from vlm_orchestrator.strategies.subgoal_base import SubgoalBaseStrategy
+
+        # Deployment uses Front / External / Wrist. Also exercise an already
+        # full eight-image BEFORE/NOW message: history must then be omitted.
+        ctx = StrategyContext(
+            vlm=None, front_image_key="front", image_key="external",
+            extra_image_keys=["wrist"] + (["aux"] if extra_view else []),
+        )
+        keys = ["front", "external", "wrist"] + (["aux"] if extra_view else [])
+
+        def observation(offset):
+            return {key: np.full((16, 16, 3), offset + i * 10, dtype=np.uint8)
+                    for i, key in enumerate(keys)}
+
+        before, previous, now = [observation(offset) for offset in (10, 60, 110)]
+        state = SessionState(
+            original_instruction="Put the block in the bowl",
+            subgoals=["Put the block in the bowl"],
+            initial_image=ctx.get_vlm_image(before),
+            initial_extra_images=ctx.get_vlm_extra_images(before),
+        )
+        calls = []
+
+        def call(system, content):
+            calls.append(content)
+            return '{"action":"continue"}'
+
+        primary_label, extra_labels = ctx.vlm_camera_labels
+        handler = VLMFailureHandler(
+            vlm_call_fn=call,
+            image_builder_fn=SubgoalBaseStrategy._build_check_message,
+            get_vlm_image_fn=ctx.get_vlm_image,
+            get_extra_images_fn=ctx.get_vlm_extra_images,
+            check_interval=5, primary_label=primary_label, extra_labels=extra_labels,
+        )
+        handler.on_episode_start(before, state)
+        state.episode_step = 5
+        handler.step(previous, state)
+        assert sum(p["type"] == "image_url" for p in calls[0]) == 2 * len(keys)
+        state.episode_step = 10
+        handler.step(now, state)
+
+        baseline = SubgoalBaseStrategy._build_check_message(
+            "", state.initial_image, ctx.get_vlm_image(now),
+            ctx.get_vlm_extra_images(now), state.initial_extra_images,
+            primary_label=primary_label, extra_labels=extra_labels,
+        )
+        # Preserve every existing BEFORE/NOW label and encoded image verbatim.
+        assert calls[1][:len(baseline) - 1] == baseline[:-1]
+        pairs = []
+        for i, part in enumerate(calls[1]):
+            if part["type"] == "image_url":
+                assert calls[1][i - 1]["type"] == "text"
+                pixels = np.asarray(Image.open(io.BytesIO(base64.b64decode(
+                    part["image_url"]["url"].split(",")[1],
+                ))))
+                pairs.append((calls[1][i - 1]["text"], pixels))
+        assert len(pairs) == 8
+        expected = [(f"{when} — {label}", offset + i * 10)
+                    for when, offset in [("BEFORE", 10), ("NOW", 110)]
+                    for i, label in enumerate([primary_label] + extra_labels)]
+        if not extra_view:
+            expected += [("PREVIOUS — Front camera", 60), ("PREVIOUS — Wrist camera", 80)]
+        for (label, pixels), (expected_label, value) in zip(pairs, expected):
+            assert label.startswith(expected_label)
+            assert np.allclose(pixels, value, atol=1)
+
+    @pytest.mark.parametrize("reset", ["episode", "subgoal"])
+    def test_context_does_not_cross_episode_or_subgoal(self, reset):
+        handler, state, obs, calls = self.make_handler()
+        state.log({"type": "grasp_tool_failed", "reason": "old motion failure"})
+        state.episode_step = 5
+        handler.step(obs, state)
+        state.log_entries.clear()
+        if reset == "episode":
+            handler.on_episode_start(obs, state)
+        else:
+            state.subgoals = ["Put the blue block in the bowl"]
+            handler.on_subgoal_advanced(obs, state, 0)
+        state.episode_step = 10
+        handler.step(obs, state)
+        text = "\n".join(p.get("text", "") for p in calls[-1])
+        assert "PREVIOUS" not in text
+        assert "old motion failure" not in text
+
+    def test_only_deployment_rgb_and_whitelisted_tool_feedback_are_used(self):
+        handler, state, obs, calls = self.make_handler()
+
+        class RGBOnlyObservation(dict):
+            def __getitem__(self, key):
+                assert key in ("rgb", "wrist"), f"Forbidden observation read: {key}"
+                return super().__getitem__(key)
+
+            def get(self, *args):
+                raise AssertionError("Recovery must use its supplied RGB callbacks")
+
+            def __iter__(self):
+                raise AssertionError("Recovery must not enumerate raw observations")
+
+        obs = RGBOnlyObservation(obs, gt_state=object(), success=True)
+        state.metric_entries = [{"type": "evaluator_sentinel", "success": True}]
+        state.log_entries = [
+            {"type": "grasp_tool_done", "target_object": "red block",
+             "success": True, "gt_state": "evaluator_sentinel"},
+            {"type": "evaluator_sentinel", "reason": "evaluator_sentinel"},
+        ]
+        # Completion can occur before the next scheduled monitor.
+        state.episode_step = 2
+        assert handler.step(obs, state) is None
+        assert calls == []
+        state.log_entries.clear()
+        state.episode_step = 5
+        assert handler.step(obs, state) is None
+        text = "\n".join(p.get("text", "") for p in calls[-1])
+        assert "grasp_tool_done" in text and "red block" in text
+        assert "evaluator_sentinel" not in text and "gt_state" not in text
+        assert '"success"' not in text
+        assert state.current_subgoal_idx == 0 and not state.episode_done
+
+    @pytest.mark.parametrize("instruction", [None, "", "  ", 7, False, [], {}, "x" * 241])
+    def test_invalid_refinement_does_not_reach_vla(self, instruction):
+        handler, state, obs, _ = self.make_handler(json.dumps({
+            "action": "continue", "instruction": instruction,
+        }))
+        state.episode_step = 5
+        assert handler.step(obs, state) is None
+        assert state.rewritten_instruction == state.subgoals[0]
+
+    @pytest.mark.parametrize("action", ["unknown", "grasp_tool", [], {}])
+    def test_rejected_action_cannot_smuggle_a_refinement(self, action):
+        result = _parse_vlm_detection(json.dumps({
+            "action": action, "instruction": "Move the red block",
+        }), _ACTION_SETS["replan"])
+        assert result.action == ACTION_CONTINUE
+        assert result.instruction is None
+
+    def test_refinement_renews_then_expires_before_tool_handoff(self):
+        handler, state, obs, calls = self.make_handler()
+        replies = iter([
+            '{"action":"continue","instruction":"  Grasp the red block  "}',
+            '{"action":"continue","instruction":"Lift the red block"}',
+            '{"action":"place_tool","place_destination":"in the bowl"}',
+        ])
+        handler._vlm_call = lambda *args: next(replies)
+        for step, expected in [(5, "Grasp the red block"), (10, "Lift the red block")]:
+            state.episode_step = step
+            result = handler.step(obs, state)
+            assert result.action == ACTION_CONTINUE and result.instruction == expected
+            state.rewritten_instruction = result.instruction
+        state.episode_step = 15
+        result = handler.step(obs, state)
+        assert result.action == "place_tool"
+        assert result.instruction == state.subgoals[0]
+        assert result.place_destination == "in the bowl"
+
+    def test_expiry_does_not_overwrite_an_external_instruction_change(self):
+        handler, state, obs, calls = self.make_handler(
+            '{"action":"continue","instruction":"Grasp the red block"}'
+        )
+        state.episode_step = 5
+        result = handler.step(obs, state)
+        state.rewritten_instruction = result.instruction
+        state.rewritten_instruction = "Operator instruction"
+        handler._vlm_call = lambda *args: '{"action":"continue"}'
+        state.episode_step = 10
+        assert handler.step(obs, state) is None
+        assert state.rewritten_instruction == "Operator instruction"

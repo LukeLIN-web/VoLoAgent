@@ -23,11 +23,14 @@ The available actions are configured by ``--recovery-mode``:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Callable
 
-from vlm_orchestrator.vlm import POINT_CONVENTION, parse_json, parse_norm_point
+from vlm_orchestrator.vlm import (
+    POINT_CONVENTION, encode_image_b64, parse_json, parse_norm_point,
+)
 
 from .base import (
     ACTION_CONTINUE,
@@ -101,7 +104,14 @@ def _build_system_prompt(
     if ACTION_CONTINUE in available_actions:
         action_descriptions.append(
             '- "continue" — the robot is making progress or the subgoal '
-            "is not yet complete. Keep working with the current instruction."
+            "is not yet complete. Optionally provide an \"instruction\" "
+            "(a short string, at most 240 characters) to refine the next VLA "
+            "attempt using the NOW observations. Describe one immediate "
+            "recovery step and identify its target by visible features. "
+            "Keep the current subgoal's object and final destination. "
+            "The refinement lasts until the next scheduled check; omit it "
+            "to resume the full current subgoal. Do not repeat a grasp "
+            "instruction if the correct object is already visibly held."
         )
     if ACTION_REPLAN in available_actions:
         action_descriptions.append(
@@ -112,12 +122,15 @@ def _build_system_prompt(
         )
     if ACTION_GRASP in available_actions:
         action_descriptions.append(
-            '- "grasp_tool" — fire only for WRONG-OBJECT recovery: the '
-            "gripper holds (or is closing on) an object whose identity "
-            "differs from the subgoal's target. Do NOT fire while the "
-            "robot is still attempting the correct object — that is "
-            'in-progress execution; emit "continue". When firing, set '
-            '"grasp_target" to the noun phrase of the correct object.'
+            '- "grasp_tool" — re-localize and grasp the target from the '
+            "current scene for a wrong-object grasp or a visibly stalled "
+            "grasp across PREVIOUS and NOW. If the correct object is "
+            "already held, do not re-grasp it. Normal approach motion "
+            'alone is not a stall. Set "grasp_target" to a fresh, visually '
+            "grounded noun phrase identifying the correct object. After "
+            "a failed tool attempt, inspect its feedback and changed scene "
+            "before retrying; a refined VLA instruction can recover when "
+            "the tool could not produce a grasp or motion plan."
             + (
                 ' Also set "grasp_point" to a point on that object in the '
                 f"NOW {primary_label} image: {POINT_CONVENTION}."
@@ -126,12 +139,13 @@ def _build_system_prompt(
         )
     if ACTION_PLACE in available_actions:
         action_descriptions.append(
-            '- "place_tool" — fire only for WRONG-DESTINATION recovery: '
-            "the held object is heading to or already released at a "
-            "destination different from the subgoal's destination. Do "
-            "NOT fire while the robot is en route to the correct "
-            'destination — that is in-progress execution; emit '
-            '"continue". When firing, set "place_destination" to a '
+            '- "place_tool" — recover a wrong destination or placement '
+            "that is visibly stalled across PREVIOUS and NOW, only when "
+            "the correct object is visibly held. If it was dropped or "
+            "released elsewhere, recover the grasp first. If the grasp "
+            "is occluded or uncertain, do not assume it is held. Normal "
+            "transport motion alone is not a stall. When firing, set "
+            '"place_destination" to a '
             "FREEFORM destination phrase. PHRASING RULES:\n"
             "  1. Inside a container → \"in <container>\" "
             '(e.g. "in the white bowl").\n'
@@ -191,15 +205,26 @@ image, then re-describe by visual features."""
     return f"""\
 You are monitoring a robot arm executing a tabletop manipulation task.
 
-You receive two sets of images:
+You receive labeled sets of images:
 - **BEFORE** images: the scene at the START of the episode (for reference).
 - **NOW** images: the current scene.
+- **PREVIOUS** images, when available: the last monitor observation for \
+  this subgoal, with its step and the VLA instruction then in use.
 {front_cam_block}
 
 You also receive the overall task instruction, the current subgoal, and \
 any remaining subgoals after the current one.
 
 HOW TO REASON:
+- Compare PREVIOUS with NOW for target motion, grasp contact/lift, and \
+  placement/release. Arm motion alone is not target progress. Repeated \
+  contact with the target still on the table can be a stalled grasp. \
+  Use wrist and scene views together; report uncertainty if occluded.
+- Tool feedback reports execution, not task success. DONE does not prove \
+  the intended object was grasped or placed. Inspect NOW before choosing \
+  the next recovery; FAILED may still have moved the scene. Avoid an \
+  unchanged retry after the same failure; refine the next VLA step when \
+  a different approach is needed. Never infer completion from feedback.
 - Use the BEFORE images and overall task to understand the goal.
 - Use the NOW images, current subgoal, and remaining subgoals to \
   understand the current state and what still needs to happen.
@@ -278,6 +303,14 @@ def _parse_vlm_detection(
     place_relation = data.get("place_relation", "in")
     place_held_object = data.get("place_held_object")
     place_stack = bool(data.get("place_stack", False))
+    # Refinement uses the existing continue callback, never a new action.
+    # Do not reinterpret a rejected tool action as an instruction rewrite.
+    instruction = data.get("instruction")
+    if (action == ACTION_CONTINUE and isinstance(instruction, str)
+            and 0 < len(instruction.strip()) <= 240):
+        instruction = instruction.strip()
+    else:
+        instruction = None
 
     # Validate status
     if status not in (STATUS_COMPLETE, STATUS_FAILURE, STATUS_IN_PROGRESS):
@@ -288,7 +321,7 @@ def _parse_vlm_detection(
         status = STATUS_IN_PROGRESS
 
     # Validate action against available set
-    if action not in available_actions:
+    if not isinstance(action, str) or action not in available_actions:
         logger.warning(
             f"  VLM detection: action {action!r} not in "
             f"{available_actions}, defaulting to continue"
@@ -319,6 +352,7 @@ def _parse_vlm_detection(
         status=status,
         action=action,
         reason=reason,
+        instruction=instruction,
         grasp_target=grasp_target,
         place_destination=place_destination,
         place_target=place_target,
@@ -406,6 +440,12 @@ class VLMFailureHandler(FailureHandler):
         # ``state.episode_step`` so that VLA chunks of different sizes
         # produce the same wall-clock check frequency.
         self._step_at_last_check: int = 0
+        self._previous_images: list = []
+        self._previous_step: int = 0
+        self._previous_instruction: str = ""
+        self._subgoal_key: tuple | None = None
+        self._last_tool_feedback: dict | None = None
+        self._refined_instruction: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -413,9 +453,14 @@ class VLMFailureHandler(FailureHandler):
 
     def on_episode_start(self, obs: dict, state: Any) -> None:
         self._step_at_last_check = state.episode_step
+        self._reset_recovery_context(state)
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
+        # The strategy also calls this after tool activation on the SAME
+        # subgoal. Preserve its before-tool observation for inspection.
+        if self._subgoal_key != (idx, tuple(state.subgoals)):
+            self._reset_recovery_context(state)
 
     # ------------------------------------------------------------------
     # Detection
@@ -426,6 +471,15 @@ class VLMFailureHandler(FailureHandler):
 
         Returns ``None`` if it's not time to check yet.
         """
+        # Episode startup precedes decomposition. Synchronize here too so
+        # the first tool action is recognized as the same-subgoal callback.
+        if self._subgoal_key != (state.current_subgoal_idx, tuple(state.subgoals)):
+            self._reset_recovery_context(state)
+        # Lifecycle callbacks log DONE/FAILED immediately before step(),
+        # then reset the executor. Capture before the cadence gate because
+        # the proxy drains log_entries after each process() invocation.
+        self._capture_tool_feedback(state)
+
         # Not time to check yet
         if (state.episode_step - self._step_at_last_check
                 < self._check_interval):
@@ -446,7 +500,7 @@ class VLMFailureHandler(FailureHandler):
         current_image = self._get_vlm_image(obs)
         if current_image is None:
             logger.warning("  VLM handler: current_image is None, skipping")
-            return None
+            return self._finish_refinement(state)
 
         # Build context
         sg_idx = state.current_subgoal_idx
@@ -468,6 +522,13 @@ class VLMFailureHandler(FailureHandler):
             f"{remaining_str}\n\n"
             f"Assess the current subgoal status and decide the action."
         )
+        active_instruction = getattr(state, "rewritten_instruction", None) or current_sg
+        text += f'\nCurrent VLA instruction: {json.dumps(active_instruction)}'
+        if self._last_tool_feedback is not None:
+            text += (
+                "\nLatest tool execution feedback (not proof of task success): "
+                + json.dumps(self._last_tool_feedback)
+            )
 
         # Build message with BEFORE + NOW images
         extra_images = self._get_extra_images(obs)
@@ -480,6 +541,33 @@ class VLMFailureHandler(FailureHandler):
             primary_label=self._primary_label,
             extra_labels=self._extra_labels,
         )
+        # The frozen service admits eight images. Preserve BEFORE/NOW and
+        # use only spare slots for prior scene and wrist observations.
+        history_slots = max(0, 8 - sum(
+            part.get("type") == "image_url" for part in user_content
+        ))
+        for label, previous_image in self._previous_images[:history_slots]:
+            user_content.extend([
+                {"type": "text", "text": (
+                    f"PREVIOUS — {label} (step {self._previous_step}; "
+                    f"VLA instruction: {json.dumps(self._previous_instruction)}):"
+                )},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + encode_image_b64(previous_image),
+                }},
+            ])
+        # Keep the primary scene view plus one wrist view for grasp contact;
+        # omit redundant scene views. Use the same RGB copies and encoder.
+        self._previous_images = [(self._primary_label, current_image.copy())]
+        for i, img in enumerate(extra_images or []):
+            label = (self._extra_labels[i]
+                     if self._extra_labels and i < len(self._extra_labels)
+                     else "Wrist camera")
+            if "wrist" in label.lower():
+                self._previous_images.append((label, img.copy()))
+                break
+        self._previous_step = state.episode_step
+        self._previous_instruction = active_instruction
 
         # VLM call
         t0 = time.time()
@@ -488,12 +576,18 @@ class VLMFailureHandler(FailureHandler):
             elapsed = time.time() - t0
         except Exception as e:
             logger.warning(f"  VLM detection call failed: {e}; continuing")
-            return None
+            return self._finish_refinement(state)
 
         logger.info(f"  VLM detect raw ({elapsed:.1f}s): {raw[:500]}")
 
         # Parse result
         result = _parse_vlm_detection(raw, self._available_actions, self._point_tools)
+        if result.action == ACTION_CONTINUE and result.instruction:
+            self._refined_instruction = result.instruction
+        else:
+            restore = self._finish_refinement(state)
+            if restore is not None:
+                result.instruction = restore.instruction
         result.extra["vlm_latency_s"] = round(elapsed, 2)
         result.extra["vlm_raw"] = raw
 
@@ -536,7 +630,8 @@ class VLMFailureHandler(FailureHandler):
 
         # Return None for in_progress + continue (no action needed)
         if (result.status == STATUS_IN_PROGRESS
-                and result.action == ACTION_CONTINUE):
+                and result.action == ACTION_CONTINUE
+                and not result.instruction):
             return None
 
         return result
@@ -544,6 +639,42 @@ class VLMFailureHandler(FailureHandler):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _reset_recovery_context(self, state: Any) -> None:
+        self._subgoal_key = (state.current_subgoal_idx, tuple(state.subgoals))
+        self._previous_images = []
+        self._previous_instruction = ""
+        self._last_tool_feedback = None
+        self._refined_instruction = None
+
+    def _capture_tool_feedback(self, state: Any) -> None:
+        for entry in reversed(getattr(state, "log_entries", [])):
+            if entry.get("type") not in (
+                "grasp_tool_done", "grasp_tool_failed",
+                "place_tool_done", "place_tool_failed",
+            ):
+                continue
+            # Copy only deployment tool feedback, not arbitrary log fields.
+            self._last_tool_feedback = {
+                key: entry[key] for key in (
+                    "type", "target_object", "destination", "held_object_hint",
+                    "reason", "failure_reason", "message",
+                ) if isinstance(entry.get(key), str)
+            }
+            break
+
+    def _finish_refinement(self, state: Any) -> HandlerResult | None:
+        """End the one-monitor refinement without advancing the subgoal."""
+        instruction = self._refined_instruction
+        self._refined_instruction = None
+        if (instruction and state.subgoals
+                and getattr(state, "rewritten_instruction", None) == instruction):
+            return HandlerResult(
+                status=STATUS_IN_PROGRESS, action=ACTION_CONTINUE,
+                instruction=state.subgoals[state.current_subgoal_idx],
+                reason="refinement interval ended; resume current subgoal",
+            )
+        return None
 
     @staticmethod
     def _store_check_result(state: Any, result: HandlerResult) -> None:
