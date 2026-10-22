@@ -581,6 +581,17 @@ def main():
              "detection; sam3_point = its detection under the master's "
              "point, else SAM2 from the point (default: sam3)",
     )
+    parser.add_argument(
+        "--reference-prompt",
+        choices=["subgoal", "generic"],
+        default="subgoal",
+        help="--reference-image on: the sentence pi0.5 gets with the image. "
+             "subgoal = the master's subgoal; generic = while the image "
+             "shows both the target and the destination, the sentence of "
+             "the sim training frames that carried it, 'put the "
+             "red-highlighted object in or on the blue-highlighted object' "
+             "(agent-harness #77) (default: subgoal)",
+    )
 
     # --- Fine-tuning data collection ---
     parser.add_argument(
@@ -794,6 +805,8 @@ def main():
         parser.error(
             f"--reference-image needs --mode subgoal (got --mode {args.mode})"
         )
+    if args.reference_prompt != "subgoal" and args.reference_image == "off":
+        parser.error("--reference-prompt generic needs --reference-image master or gt")
 
     # ------------------------------------------------------------------
     # Validate --failure-monitor / --recovery-mode compatibility
@@ -1216,7 +1229,7 @@ def _build_strategy(args):
             from vlm_orchestrator.strategies.reference_hook import ReferenceHook
 
             strategy.reference_hook = ReferenceHook(
-                ctx, args.reference_image, args.reference_seg,
+                ctx, args.reference_image, args.reference_seg, args.reference_prompt,
             )
         return strategy
 

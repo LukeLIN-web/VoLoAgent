@@ -27,6 +27,12 @@ of π0.5 are left alone. Each computation appends a line to
 ``<episode log dir>/reference.jsonl`` and saves the attached image as
 ``reference/<step_count>.png`` beside it. A failure loses the image (or one
 polygon), never the proxy step.
+
+``--reference-prompt generic`` (agent-harness #77): while the image shows both
+the target and the destination, π0.5 gets
+:data:`~vlm_orchestrator.perception.reference_image.GENERIC_PROMPT`, the
+sentence of the sim training frames that carried it, instead of the prompt;
+the line's ``vla_prompt`` is the sentence π0.5 gets.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ from PIL import Image
 from vlm_orchestrator.grasp.client import GraspClient
 from vlm_orchestrator.perception.gt_segmentation import POINT_SNAP_PX, gt_object_mask
 from vlm_orchestrator.perception.reference_image import (
-    REFERENCE_KEY, backproject, hull_224, hull_224_from_pixels, render,
+    GENERIC_PROMPT, REFERENCE_KEY, backproject, hull_224, hull_224_from_pixels, render,
 )
 from vlm_orchestrator.vlm.api import ask_reference_targets
 
@@ -113,14 +119,15 @@ def _polygon(record: dict, role: str, entry: dict | None, hull_of) -> np.ndarray
 
 
 class ReferenceHook:
-    """Adds ``observation/reference_image`` to π0.5's requests (``mode`` master or gt)."""
+    """Adds ``observation/reference_image`` to π0.5's requests (``mode`` master or gt;
+    ``prompt`` subgoal keeps the prompt, generic swaps it while both polygons are drawn)."""
 
-    def __init__(self, ctx, mode: str, seg: str = "sam3"):
-        self.ctx, self.mode, self.seg = ctx, mode, seg
+    def __init__(self, ctx, mode: str, seg: str = "sam3", prompt: str = "subgoal"):
+        self.ctx, self.mode, self.seg, self.prompt = ctx, mode, seg, prompt
         # The grasp tool's perception service (PERCEPTION_SERVER_URL / GRASP_SERVER_*).
         self._client = GraspClient() if mode == "master" else None
-        # episode id -> (prompt, its image or None); one small entry per episode.
-        self._cache: dict[int, tuple[str, np.ndarray | None]] = {}
+        # episode id -> (prompt, its image or None, the sentence π0.5 gets); one small entry per episode.
+        self._cache: dict[int, tuple[str, np.ndarray | None, str]] = {}
 
     def __call__(self, obs: dict, state) -> dict:
         if _vla_bypassed(state):
@@ -128,17 +135,20 @@ class ReferenceHook:
         prompt = self.ctx.get_prompt(obs)
         cached = self._cache.get(state.episode_id)
         if cached is None or cached[0] != prompt:
-            cached = self._cache[state.episode_id] = (prompt, self._compute(obs, state, prompt))
-        if cached[1] is None:
+            cached = self._cache[state.episode_id] = (prompt, *self._compute(obs, state, prompt))
+        _, image, vla_prompt = cached
+        if image is None:
             return obs
-        obs = dict(obs)
-        obs[REFERENCE_KEY] = cached[1]
+        obs = self.ctx.set_prompt(obs, vla_prompt)
+        obs[REFERENCE_KEY] = image
         return obs
 
-    def _compute(self, obs: dict, state, prompt: str) -> np.ndarray | None:
+    def _compute(self, obs: dict, state, prompt: str) -> tuple[np.ndarray | None, str]:
+        """The image and the sentence π0.5 gets with it."""
         record = {"episode": state.episode_id, "step_count": state.infer_count, "prompt": prompt, "mode": self.mode}
         if self.mode == "master":
             record["seg"] = self.seg
+        target = destination = None
         try:
             target, destination = (self._master if self.mode == "master" else self._gt)(obs, prompt, record)
             image = render(np.asarray(obs[EXTERIOR_224]), target, destination)
@@ -146,9 +156,12 @@ class ReferenceHook:
             logger.exception(f"reference image: episode {state.episode_id} step {state.infer_count}")
             record["error"] = f"{type(e).__name__}: {e}"
             image = None
+        both = image is not None and target is not None and destination is not None
+        vla_prompt = GENERIC_PROMPT if self.prompt == "generic" and both else prompt
         record["attached"] = image is not None
+        record["vla_prompt"] = vla_prompt
         self._write(state, record, image)
-        return image
+        return image, vla_prompt
 
     def _master(self, obs: dict, prompt: str, record: dict):
         image = np.asarray(obs[FRONT_IMAGE], dtype=np.uint8)
