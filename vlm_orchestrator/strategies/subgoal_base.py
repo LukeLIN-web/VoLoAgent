@@ -3266,6 +3266,14 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 f"({self._grasp_attempts}/{self._max_grasp_attempts}), "
                 f"skipping grasp tool"
             )
+            state.log({
+                "type": "grasp_tool_failed",
+                "target_object": target_override or _extract_target_object(sg),
+                "reason": (
+                    "Grasp not executed: per-subgoal attempt limit reached "
+                    f"({self._grasp_attempts}/{self._max_grasp_attempts})."
+                ),
+            })
             return False
 
         sg_idx = state.current_subgoal_idx

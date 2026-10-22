@@ -130,7 +130,10 @@ def _build_system_prompt(
             "grounded noun phrase identifying the correct object. After "
             "a failed tool attempt, inspect its feedback and changed scene "
             "before retrying; a refined VLA instruction can recover when "
-            "the tool could not produce a grasp or motion plan."
+            "the tool could not produce a grasp or motion plan. Attempts "
+            "are capped: feedback saying 'not executed' because the attempt "
+            "limit was reached means no new grasp ran. Use continue with "
+            "a refined instruction instead of requesting another grasp."
             + (
                 ' Also set "grasp_point" to a point on that object in the '
                 f"NOW {primary_label} image: {POINT_CONVENTION}."
@@ -461,6 +464,11 @@ class VLMFailureHandler(FailureHandler):
         # subgoal. Preserve its before-tool observation for inspection.
         if self._subgoal_key != (idx, tuple(state.subgoals)):
             self._reset_recovery_context(state)
+        else:
+            # A refused request logs feedback during action dispatch, after
+            # step(). Save it here before the proxy drains that same call's
+            # logs, so the next monitor cannot mistake an older DONE for it.
+            self._capture_tool_feedback(state)
 
     # ------------------------------------------------------------------
     # Detection

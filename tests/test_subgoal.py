@@ -646,11 +646,12 @@ class TestHandlerReplan:
 
 class TestHandlerRecovery:
     @staticmethod
-    def _strategy(vlm_call):
+    def _strategy(vlm_call, check_interval=4, subgoal_timeout=100):
         from vlm_orchestrator.failure_handlers.vlm import VLMFailureHandler
 
         strategy = _make_strategy(
-            MockSubgoalVLM(), check_interval=4, subgoal_timeout=100,
+            MockSubgoalVLM(), check_interval=check_interval,
+            subgoal_timeout=subgoal_timeout,
         )
         state = SessionState(
             original_instruction="put the block in the bowl",
@@ -665,7 +666,7 @@ class TestHandlerRecovery:
             image_builder_fn=strategy._build_check_message,
             get_vlm_image_fn=strategy.ctx.get_vlm_image,
             get_extra_images_fn=strategy.ctx.get_vlm_extra_images,
-            check_interval=4,
+            check_interval=check_interval,
             recovery_mode="replan_tools",
         )
         strategy._failure_handler.on_episode_start({}, state)
@@ -800,6 +801,51 @@ class TestHandlerRecovery:
         assert state.current_subgoal_idx == 0
         assert obs["prompt"] == state.subgoals[0]
         assert not state.episode_done
+
+    def test_refused_grasp_feedback_replaces_done_before_next_monitor(self):
+        calls = []
+        refined = "Grasp the block by its exposed edge and place it in the bowl"
+
+        def vlm_call(system, content):
+            calls.append((state.episode_step, content))
+            if len(calls) == 1:
+                return json.dumps({
+                    "status": "failure", "action": "grasp_tool",
+                    "grasp_target": "the block", "reason": "target still on table",
+                })
+            return json.dumps({"action": "continue", "instruction": refined})
+
+        strategy, state = self._strategy(vlm_call, check_interval=80, subgoal_timeout=900)
+        strategy._grasp_attempts = strategy._max_grasp_attempts
+        state.log({"type": "grasp_tool_done", "target_object": "the block"})
+        state.episode_step = 1
+        strategy._on_step(_make_obs(state.original_instruction), state)
+        state.log_entries.clear()
+
+        state.episode_step = 80
+        strategy._on_step(_make_obs(state.original_instruction), state)
+        refusal = next((e for e in state.log_entries if e["type"] == "grasp_tool_failed"), None)
+        assert refusal is not None
+        assert refusal["target_object"] == "the block"
+        assert "not executed" in refusal["reason"]
+        assert "attempt limit" in refusal["reason"]
+        assert strategy._grasp_attempts == strategy._max_grasp_attempts
+        assert state.grasp_tool_executor is None and not state.grasp_tool_active
+        state.log_entries.clear()  # proxy drains the refusal in the SAME process call
+
+        state.episode_step = 159
+        strategy._on_step(_make_obs(state.original_instruction), state)
+        assert len(calls) == 1
+        state.episode_step = 160
+        obs, state = strategy._on_step(_make_obs(state.original_instruction), state)
+        assert [step for step, _ in calls] == [80, 160]
+        text = "\n".join(p.get("text", "") for p in calls[-1][1])
+        assert "grasp_tool_failed" in text and "not executed" in text
+        assert "grasp_tool_done" not in text
+        assert obs["prompt"] == refined and state.flush_actions
+        assert strategy._grasp_attempts == strategy._max_grasp_attempts
+        assert state.current_subgoal_idx == 0
+        assert strategy._recycle_count == 0 and not state.episode_done
 
 
 class TestHybridCheckMode:
