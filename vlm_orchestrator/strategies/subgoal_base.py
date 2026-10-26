@@ -161,10 +161,7 @@ def _make_dummy_classification(result: "HandlerResult"):
 HITL_IMAGE_INTERVAL = 1
 
 DECOMPOSE_SHARED_PROMPT = """\
-You are a vision-language assistant helping a robot arm plan tabletop \
-manipulation tasks. You will see the robot's camera view and a task \
-instruction. Produce an ordered list of subgoals the robot should \
-execute one at a time.
+You are a vision-language assistant helping a robot arm plan tabletop manipulation tasks. You will see the robot's camera view and a task instruction. Produce an ordered list of subgoals the robot should execute one at a time.
 
 Planning principles:
 - **Atomic actions.** Each subgoal is one pick-and-place / push / \
@@ -175,15 +172,31 @@ Planning principles:
 - **Avoid unnecessary re-handling.** Where physics permit, place each \
   object directly in its final pose on the first lift, instead of staging \
   it at a temporary location.
-- **Naming.** Refer to objects by colour + type ("the yellow banana", \
-  "the grey bin"). For visually-identical duplicates use a generic phrase \
-  ("a Rubik's cube"). Keep each instruction short (≤15 words) and start \
-  with an action verb.
+- **Naming.** Use the original instruction's object names by default. \
+  Only expand to a more specific descriptor (e.g. "the red cola") when \
+  the scene contains multiple visually-similar candidates that the \
+  original name cannot distinguish.
 - **Ordering.** Mark `ordered: true` when a later step depends on an \
   earlier one; mark `false` when steps are independent (e.g. sorting many \
   items into one container).
-- **Trivial tasks.** A single pick-and-place with no obstacles should \
-  be one subgoal with `ordered: false`.\
+- **Copy the instruction when it is already a robot command.** Emit the \
+  original instruction verbatim as the only subgoal (`ordered: false`) \
+  only if it already reads as a command the robot can execute literally: \
+  it names each object to move and where to put it (or names the one \
+  thing to open, close or turn on), and nothing in it has to be worked \
+  out: no reference to how things were earlier, no "correct", \
+  "appropriate", "missing" or superlative choice, no arrangement to \
+  rearrange (swap, reverse, rotate, sort, restack). Polite or wordy \
+  phrasing and commands naming several objects (e.g. "put both the cup \
+  and the spoon in the tray") still count as literal. Otherwise \
+  decompose as usual.
+- **Verbatim means the whole string, unchanged.** When you copy the \
+  instruction, the subgoal must be identical to the original instruction \
+  string: copy it character for character from its first to its last \
+  character, including capitalisation, punctuation, filler words and \
+  anything that trails the command (words, numbers or tags such as \
+  "v2 seed 7"), even if it looks like noise. Do not shorten, clean up or \
+  rephrase it.\
 """
 
 # VLABench variant: tells the VLM to preserve the original instruction's
