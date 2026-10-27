@@ -19,15 +19,16 @@ CAMERA_POS = np.array([0.3, -0.2, 1.0])
 # 1 m above the table looking straight down (identity OpenGL orientation looks along world -z): pixel (u, v)
 # at depth d is the world point CAMERA_POS + (d (u - 50) / 100, -d (v - 50) / 100, -d).
 K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]])
+QUAT = np.array([1.0, 0.0, 0.0, 0.0])
 BOX = (slice(41, 60), slice(31, 70))    # rows, cols of a flat-topped box 0.1 m tall, centred on pixel (50, 50)
 MASK = (slice(36, 65), slice(26, 75))   # SAM2's mask: the box and the table round it
 SMALL = (slice(48, 53), slice(48, 53))  # 25 px on the box top
-BOX_CENTRE = [0.3, -0.2, (0.1 + oh.TABLE_Z) / 2]   # under the camera, between the box top and the calibrated table
+BOX_CENTRE = [0.3, -0.2, 0.05]          # under the camera, between the box top and the table top at z = 0
 BOX_TOP = [0.3, -0.2, 0.1]               # the depth back-projection of TARGET's pixel
 TARGET = {"phrase": "red cube", "point": (0.505, 0.505)}          # pixel (50, 50), on the box top
 DESTINATION = {"phrase": "grey bowl", "point": (0.105, 0.105)}    # pixel (10, 10), on the table
-FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "grounding", "mask_px",
-          "sam2_iou", "boxtable", "pixel", "origin", "source", "wall_s"}
+FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "cause", "grounding", "mask_px",
+          "sam2_iou", "table_z", "boxtable", "pixel", "origin", "source", "wall_s"}
 
 
 def _region(rows_cols) -> np.ndarray:
@@ -36,10 +37,17 @@ def _region(rows_cols) -> np.ndarray:
     return region
 
 
-def _depth() -> np.ndarray:
-    depth = np.full((H, W), 1.0, np.float32)
-    depth[BOX] = 0.9
+def _depth(table=1.0, box=0.9) -> np.ndarray:
+    depth = np.full((H, W), table, np.float32)
+    depth[BOX] = box
     return depth
+
+
+def _fk_z(q):
+    """forward_kinematics_robolab with the end effector at height ``q[0]``."""
+    T = np.eye(4)
+    T[2, 3] = q[0]
+    return T
 
 
 class FakeSam2:
@@ -69,16 +77,17 @@ def _hook(monkeypatch, grounding=None):
     return oh.OriginHook(StrategyContext(vlm=None)), asked
 
 
-def _obs(prompt="pick up the red cube", gripper=0.0, depth=None):
+def _obs(prompt="pick up the red cube", gripper=0.0, depth=None, joints=None):
     depth_key, k_key, pos_key, quat_key = oh.FRONT
     return {
         "prompt": prompt,
         oh.GRIPPER: np.array([gripper]),
+        oh.JOINTS: np.zeros(7, np.float32) if joints is None else np.asarray(joints),
         oh.FRONT_IMAGE: np.zeros((2 * H, 2 * W, 3), np.uint8),
         depth_key: (_depth() if depth is None else depth)[..., None],
         k_key: K,
         pos_key: CAMERA_POS,
-        quat_key: np.array([1.0, 0.0, 0.0, 0.0]),
+        quat_key: QUAT,
     }
 
 
@@ -101,11 +110,34 @@ def test_boxtable_is_the_box_centre_with_its_bottom_at_the_table(monkeypatch, tm
     assert out["prompt"] == "pick up the red cube" and oh.ORIGIN_KEY not in obs   # the strategy's obs is untouched
     (line,) = _lines(tmp_path)
     assert set(line) == FIELDS
-    assert line["source"] == "boxtable" and line["role"] == "target"
+    assert line["source"] == "boxtable" and line["role"] == "target" and line["cause"] == "episode"
+    assert line["table_z"] == pytest.approx(0.0, abs=1e-3)
     assert line["mask_px"] == 29 * 49 and line["sam2_iou"] == 0.9
     assert line["boxtable"] == pytest.approx(BOX_CENTRE, abs=1e-4) and line["origin"] == line["boxtable"]
     assert line["pixel"] == pytest.approx(BOX_TOP, abs=1e-4)
     assert line["grounding"]["target"] == {"phrase": "red cube", "point": [0.505, 0.505]}
+
+
+def test_the_box_bottom_is_at_the_table_the_front_depth_shows(monkeypatch, tmp_path):
+    hook, _ = _hook(monkeypatch)
+    out = hook(_obs(depth=_depth(table=0.95, box=0.85)), _state(tmp_path))   # table top z = 0.05, box top 0.15
+    np.testing.assert_allclose(out[oh.ORIGIN_KEY], [0.3, -0.2, 0.1], atol=1e-6)
+    (line,) = _lines(tmp_path)
+    assert line["source"] == "boxtable" and line["table_z"] == pytest.approx(0.05, abs=1e-3)
+
+
+@pytest.mark.parametrize("depth, source, pixel", [
+    (np.zeros((H, W), np.float32), "none", None),                      # no depth anywhere
+    (np.full((H, W), 0.5, np.float32), "pixel", [0.3, -0.2, 0.5]),     # nothing at a table top's height
+])
+def test_no_table_in_the_front_depth_falls_back_to_the_pixel(monkeypatch, tmp_path, depth, source, pixel):
+    assert np.isnan(oh.table_z(depth, K, CAMERA_POS, QUAT))
+    hook, _ = _hook(monkeypatch)
+    out = hook(_obs(depth=depth), _state(tmp_path))
+    np.testing.assert_allclose(out[oh.ORIGIN_KEY], np.full(3, np.nan) if pixel is None else pixel, atol=1e-6)
+    (line,) = _lines(tmp_path)
+    assert line["table_z"] is None and line["boxtable"] is None and line["source"] == source and "error" not in line
+    assert line["pixel"] == (None if pixel is None else pytest.approx(pixel, abs=1e-4))
 
 
 def test_too_few_mask_points_fall_back_to_the_pixel(monkeypatch, tmp_path):
@@ -185,4 +217,34 @@ def test_a_call_lasts_until_the_prompt_the_subgoal_or_a_tool_changes(monkeypatch
     state.episode_id = 4
     assert hook(_obs("put the red cube in the grey bowl"), state)[oh.CALL_KEY] == f"{pid}-4-0"
     assert len(asked) == 5
-    assert [line["call"] for line in _lines(tmp_path)] == [f"{pid}-3-{i}" for i in range(4)] + [f"{pid}-4-0"]
+    lines = _lines(tmp_path)
+    assert [line["call"] for line in lines] == [f"{pid}-3-{i}" for i in range(4)] + [f"{pid}-4-0"]
+    assert [line["cause"] for line in lines] == ["episode", "prompt", "subgoal", "tool", "episode"]
+
+
+LIFT = [(0.0, 0.2), (0.5, 0.2), (0.5, 0.27), (0.5, 0.28), (0.5, 0.5)]   # (gripper, end-effector z) per request
+
+
+@pytest.mark.parametrize("destination, steps, calls", [
+    (DESTINATION, LIFT, [0, 0, 0, 1, 1]),   # closed at 0.2, placing from 0.28 on; a place call goes on
+    (None, LIFT, [0, 0, 0, 0, 0]),          # a plain pick stays one call
+    (DESTINATION, [(0.0, 0.1), (0.5, 0.2), (0.0, 0.25), (0.5, 0.3), (0.5, 0.36), (0.5, 0.38)],
+     [0, 0, 0, 0, 0, 1]),                   # let go at 0.25: the lift counts from where it closes again
+])
+def test_a_pick_call_with_a_destination_turns_into_a_place_call_once_lifted(monkeypatch, tmp_path, destination,
+                                                                           steps, calls):
+    hook, asked = _hook(monkeypatch, {"target": TARGET, "destination": destination})
+    monkeypatch.setattr(oh, "forward_kinematics_robolab", _fk_z)
+    state = _state(tmp_path)
+    outs = []
+    for i, (gripper, z) in enumerate(steps):
+        state.infer_count = i
+        outs.append(hook(_obs(gripper=gripper, joints=[z] + [0.0] * 6), state))
+    n = calls[-1] + 1
+    assert [out[oh.CALL_KEY] for out in outs] == [f"{os.getpid()}-3-{i}" for i in calls]
+    assert [out[oh.SKILL_KEY] for out in outs] == [("pick", "place")[i] for i in calls]
+    assert len(asked) == n and hook._client.points == [TARGET["point"], DESTINATION["point"]][:n]
+    lines = _lines(tmp_path)
+    assert [(line["cause"], line["skill"], line["role"]) for line in lines] == \
+        [("episode", "pick", "target"), ("lift", "place", "destination")][:n]
+    assert [line["step_count"] for line in lines] == [calls.index(i) for i in range(n)]
