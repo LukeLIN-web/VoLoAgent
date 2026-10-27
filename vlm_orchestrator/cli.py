@@ -592,6 +592,18 @@ def main():
              "red-highlighted object in or on the blue-highlighted object' "
              "(agent-harness #77) (default: subgoal)",
     )
+    parser.add_argument(
+        "--tool-origin",
+        action="store_true",
+        default=False,
+        help="--mode subgoal: at the start of each call of the object-frame "
+             "pi0.5 tool (agent-harness #118) estimate the object's centre "
+             "from the master's point on the front camera (SAM2 mask + front "
+             "depth; the target to pick, the destination to place, by the "
+             "gripper reading) and send it with every request of the call as "
+             "observation/tool_origin, with observation/tool_skill and "
+             "observation/tool_call",
+    )
 
     # --- Fine-tuning data collection ---
     parser.add_argument(
@@ -807,6 +819,12 @@ def main():
         )
     if args.reference_prompt != "subgoal" and args.reference_image == "off":
         parser.error("--reference-prompt generic needs --reference-image master or gt")
+    if args.tool_origin and args.mode != "subgoal":
+        parser.error(
+            f"--tool-origin needs --mode subgoal (got --mode {args.mode})"
+        )
+    if args.tool_origin and args.reference_image != "off":
+        parser.error("--tool-origin and --reference-image share pi0.5's request hook: use one")
 
     # ------------------------------------------------------------------
     # Validate --failure-monitor / --recovery-mode compatibility
@@ -1231,6 +1249,10 @@ def _build_strategy(args):
             strategy.reference_hook = ReferenceHook(
                 ctx, args.reference_image, args.reference_seg, args.reference_prompt,
             )
+        if args.tool_origin:
+            from vlm_orchestrator.strategies.origin_hook import OriginHook
+
+            strategy.reference_hook = OriginHook(ctx)
         return strategy
 
     if args.mode == "scene_edit":
