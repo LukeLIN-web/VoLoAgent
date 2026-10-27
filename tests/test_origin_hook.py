@@ -27,8 +27,8 @@ BOX_CENTRE = [0.3, -0.2, 0.05]          # under the camera, between the box top 
 BOX_TOP = [0.3, -0.2, 0.1]               # the depth back-projection of TARGET's pixel
 TARGET = {"phrase": "red cube", "point": (0.505, 0.505)}          # pixel (50, 50), on the box top
 DESTINATION = {"phrase": "grey bowl", "point": (0.105, 0.105)}    # pixel (10, 10), on the table
-FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "cause", "grounding", "mask_px",
-          "sam2_iou", "table_z", "boxtable", "pixel", "origin", "source", "wall_s"}
+FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "cause", "gripper", "grounding",
+          "mask_px", "sam2_iou", "table_z", "boxtable", "pixel", "origin", "source", "wall_s"}
 
 
 def _region(rows_cols) -> np.ndarray:
@@ -225,21 +225,28 @@ def test_a_call_lasts_until_the_prompt_the_subgoal_or_a_tool_changes(monkeypatch
 LIFT = [(0.0, 0.2), (0.5, 0.2), (0.5, 0.27), (0.5, 0.28), (0.5, 0.5)]   # (gripper, end-effector z) per request
 
 
-@pytest.mark.parametrize("destination, steps, calls", [
-    (DESTINATION, LIFT, [0, 0, 0, 1, 1]),   # closed at 0.2, placing from 0.28 on; a place call goes on
-    (None, LIFT, [0, 0, 0, 0, 0]),          # a plain pick stays one call
-    (DESTINATION, [(0.0, 0.1), (0.5, 0.2), (0.0, 0.25), (0.5, 0.3), (0.5, 0.36), (0.5, 0.38)],
-     [0, 0, 0, 0, 0, 1]),                   # let go at 0.25: the lift counts from where it closes again
+PUT = "put the red cube in the grey bowl"
+
+
+@pytest.mark.parametrize("prompt, destination, steps, calls", [
+    (PUT, DESTINATION, LIFT, [0, 0, 0, 1, 1]),   # closed at 0.2, placing from 0.28 on; a place call goes on
+    (PUT, None, LIFT, [0, 0, 0, 0, 0]),          # no destination: one call
+    (PUT, DESTINATION, [(0.0, 0.1), (0.5, 0.2), (0.0, 0.25), (0.5, 0.3), (0.5, 0.36), (0.5, 0.38)],
+     [0, 0, 0, 0, 0, 1]),                        # let go at 0.25: the lift counts from where it closes again
+    ("Pick up the red cube and place it in the grey bowl.", DESTINATION, LIFT, [0, 0, 0, 1, 1]),
+    ("Pick up the red cube.", DESTINATION, LIFT, [0, 0, 0, 0, 0]),   # pick-only: whatever the grounding names
+    ("Grasp the red cube in the grey bowl", DESTINATION, LIFT, [0, 0, 0, 0, 0]),
+    ("Pick up the red and white cube from the grey bowl.", DESTINATION, LIFT, [0, 0, 0, 0, 0]),
 ])
-def test_a_pick_call_with_a_destination_turns_into_a_place_call_once_lifted(monkeypatch, tmp_path, destination,
-                                                                           steps, calls):
+def test_a_pick_call_with_a_destination_turns_into_a_place_call_once_lifted(monkeypatch, tmp_path, prompt,
+                                                                           destination, steps, calls):
     hook, asked = _hook(monkeypatch, {"target": TARGET, "destination": destination})
     monkeypatch.setattr(oh, "forward_kinematics_robolab", _fk_z)
     state = _state(tmp_path)
     outs = []
     for i, (gripper, z) in enumerate(steps):
         state.infer_count = i
-        outs.append(hook(_obs(gripper=gripper, joints=[z] + [0.0] * 6), state))
+        outs.append(hook(_obs(prompt, gripper=gripper, joints=[z] + [0.0] * 6), state))
     n = calls[-1] + 1
     assert [out[oh.CALL_KEY] for out in outs] == [f"{os.getpid()}-3-{i}" for i in calls]
     assert [out[oh.SKILL_KEY] for out in outs] == [("pick", "place")[i] for i in calls]

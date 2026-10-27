@@ -7,10 +7,10 @@ A call is a run of π0.5 requests of one episode under one prompt and one
 ``current_subgoal_idx`` that no tool interrupts: a new one starts on the
 episode's first π0.5 request, on the first π0.5 request after a tool served one,
 when the subgoal index or the prompt changes, and once a pick call whose
-grounding names a destination has raised the end effector ``PICK_DONE_LIFT_M``
-above where the gripper closed, where a demonstration's pick call gives way to
-its place call. The call's line names the first of these as its ``cause``. At
-its start:
+grounding names a destination, its prompt not a pick-only subgoal (``PICK_ONLY``),
+has raised the end effector ``PICK_DONE_LIFT_M`` above where the gripper closed,
+where a demonstration's pick call gives way to its place call. The call's line
+names the first of these as its ``cause``. At its start:
 
 - the skill is ``place`` when the gripper reads closed (``> GRIPPER_CLOSED``), else ``pick``;
 - the master names the target and the destination on the front camera's raw frame
@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -59,6 +60,10 @@ TABLE_BINS = np.arange(-0.05, 0.3, 0.002)
 # agent-harness robolab_run.py POLICY_PICK_DONE_LIFT_M: a demonstration's pick call ends once the object is this
 # high above where it started; the end effector above where the gripper closed stands in for the object.
 PICK_DONE_LIFT_M = 0.08
+# A subgoal that only picks ("Pick up the X", "Grasp the X in the Y") ends holding the object and the master's next
+# subgoal places it, so a destination its grounding names (often the container the X sits in) starts no place call.
+PICK_ONLY = re.compile(r"^\W*(pick|grasp|lift|take|grab)\b"
+                       r"(?!.*\b(place|put|drop|move|toss|throw|insert|set|stack it|into|onto)\b)", re.I | re.S)
 SAM2_MIN_PX = 50   # VoLo rejects smaller point-prompt masks as degenerate
 
 
@@ -142,12 +147,13 @@ class OriginHook:
 
     def _start(self, obs: dict, state, prompt: str, index: int, cause: str) -> _Call:
         """A new call; logs it."""
-        skill = "place" if float(np.ravel(obs[GRIPPER])[0]) > GRIPPER_CLOSED else "pick"
+        gripper = float(np.ravel(obs[GRIPPER])[0])
+        skill = "place" if gripper > GRIPPER_CLOSED else "pick"
         call_id = f"{os.getpid()}-{state.episode_id}-{index}"
         record = {"episode": state.episode_id, "step_count": state.infer_count,
                   "subgoal_idx": state.current_subgoal_idx, "prompt": prompt, "skill": skill, "role": None,
-                  "call": call_id, "cause": cause, "grounding": None, "mask_px": None, "sam2_iou": None,
-                  "table_z": None, "boxtable": None, "pixel": None}
+                  "call": call_id, "cause": cause, "gripper": round(gripper, 3), "grounding": None, "mask_px": None,
+                  "sam2_iou": None, "table_z": None, "boxtable": None, "pixel": None}
         start = time.perf_counter()
         try:
             origin, source = self._origin(obs, prompt, skill, record)
@@ -161,7 +167,7 @@ class OriginHook:
         record["wall_s"] = round(time.perf_counter() - start, 4)
         self._write(state, record)
         keys = {ORIGIN_KEY: origin.astype(np.float32), SKILL_KEY: skill, CALL_KEY: call_id}
-        destination = bool(record["grounding"] and record["grounding"]["destination"])
+        destination = bool(record["grounding"] and record["grounding"]["destination"]) and not PICK_ONLY.match(prompt)
         return _Call(index, prompt, state.current_subgoal_idx, keys, skill, destination)
 
     def _origin(self, obs: dict, prompt: str, skill: str, record: dict) -> tuple[np.ndarray, str]:
