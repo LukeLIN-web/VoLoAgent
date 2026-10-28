@@ -12,8 +12,14 @@ episode starts from). The triggers act only at the checks the 80-step monitor al
   no undone target);
 - ``timer``: ``TIMER_FRAC`` of the episode's time budget has passed since the subgoal started or was last retried.
 
-Both share the cap and the cooldown: at most ``CAP`` retries per subgoal, never at the first check after a subgoal
-starts or is retried. The check count restarts, as in ``regrasp_read.py``, after a decision that is not continue.
+Both share the cooldown: never at the first check after a subgoal starts or is retried. The check count restarts, as
+in ``regrasp_read.py``, after a decision that is not continue.
+
+- ``closure`` (agent-harness #137) acts on every chunk instead: once per closed-gripper segment, when the flange has
+  risen ``LIFT_M`` since the fingers closed, the master is asked whether the held object is the subgoal's target
+  (``grasp_verify.py``); it fires on ``other``. No cooldown.
+
+All triggers share the cap: at most ``CAP`` retries per subgoal.
 """
 from __future__ import annotations
 
@@ -25,7 +31,9 @@ from vlm_orchestrator.grasp.tool import (
 )
 from vlm_orchestrator.gt_metrics.detectors import _target_objects_from_gt
 
-TRIGGERS = ("none", "gt", "timer")
+from .grasp_verify import GRIP_CLOSED, LIFT_M
+
+TRIGGERS = ("none", "gt", "timer", "closure")
 ACTIONS = ("inplace", "home")
 LATE_CHECKS = 3     # regrasp_read.py LATE (VoLoAgent 1a38752 REGRASP_AFTER_CHECKS)
 MIN_CHECKS = 2      # cooldown
@@ -87,6 +95,28 @@ class Retry:
         self.clock = 0
         self.last_check = 0
         self.last_action = None
+        self.end_segment()
+
+    def end_segment(self) -> None:
+        """closure: forget the closed-gripper segment (fingers opened, a tool took over, or a retry fired)."""
+        self.z0 = None
+        self.verified = False
+
+    def on_chunk(self, state, grip: float, z: float) -> bool:
+        """closure, every chunk: track the closed-gripper segment from the gripper position (0 open, 1 closed) and
+        the flange height; True once per segment, when the flange has risen LIFT_M since the fingers closed."""
+        key = (state.current_subgoal_idx, state.rewritten_instruction)
+        if key != self.key:   # a new subgoal: its own cap
+            self.key, self.count = key, 0
+        if grip <= GRIP_CLOSED:
+            self.end_segment()
+            return False
+        if self.z0 is None:
+            self.z0 = z
+        if self.verified or z - self.z0 < LIFT_M:
+            return False
+        self.verified = True
+        return True
 
     def on_check(self, state, gt: dict | None) -> str | None:
         """A monitor check is due: update the bookkeeping, return why to retry now (None: ask the master)."""
@@ -114,3 +144,4 @@ class Retry:
         self.k = 0
         self.held = set()
         self.clock = step
+        self.end_segment()

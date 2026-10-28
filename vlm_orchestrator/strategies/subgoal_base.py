@@ -38,8 +38,9 @@ from vlm_orchestrator.failure_handlers.gt_detector import (
 )
 from vlm_orchestrator.vlm import encode_image_b64, parse_json
 
+from . import grasp_verify
 from .base import OrchestrationStrategy, SessionState, StrategyContext
-from .retry import Retry, home_chunks
+from .retry import CAP, Retry, home_chunks
 
 if TYPE_CHECKING:
     from vlm_orchestrator.failure_handlers.base import FailureHandler
@@ -1059,11 +1060,15 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         # --- Grasp-tool lifecycle ---
         obs, state, still_active = self._tick_grasp_lifecycle(obs, state)
         if still_active:
+            if self._retry is not None:
+                self._retry.end_segment()
             return obs, state
 
         # --- Place-tool lifecycle ---
         obs, state, still_active = self._tick_place_lifecycle(obs, state)
         if still_active:
+            if self._retry is not None:
+                self._retry.end_segment()
             return obs, state
 
         # --- Retry of the current subgoal (strategies/retry.py) ---
@@ -1221,6 +1226,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 "subgoal": state.rewritten_instruction,
             })
             return obs, state, False
+        if self._retry.trigger == "closure":
+            return self._tick_closure(obs, state)
         handler = self._failure_handler
         if handler is None or not state.subgoals or not handler.due(state):
             return obs, state, False
@@ -1228,14 +1235,22 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         reason = retry.on_check(state, obs.get("gt_state"))
         if reason is None:
             return obs, state, False
-        k = retry.k
+        return self._fire_retry(obs, state, reason, retry.k), state, True
+
+    def _fire_retry(
+        self, obs: dict, state: SessionState, reason: str, check: int | None,
+    ) -> dict:
+        """Retry the current subgoal now: go home (the proxy serves
+        ``state.retry_home_chunks``, then ``_tick_retry`` re-issues) or
+        re-issue in place.  Returns the re-prompted *obs*."""
+        retry = self._retry
         retry.fired(state.episode_step)
         entry = {
             "type": "retry",
             "trigger": retry.trigger,
             "action": retry.action,
             "reason": reason,
-            "check": k,
+            "check": check,
             "count": retry.count,
             "subgoal_idx": state.current_subgoal_idx,
             "subgoal": state.rewritten_instruction,
@@ -1258,14 +1273,100 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             self._apply_new_instruction(
                 obs, state, state.rewritten_instruction,
             )
+        where = (
+            f"check {check}" if check is not None
+            else f"step {state.episode_step}"
+        )
         logger.info(
-            f"  retry ({retry.trigger}/{retry.action}): {reason} at check "
-            f"{k} on subgoal {state.current_subgoal_idx + 1}"
+            f"  retry ({retry.trigger}/{retry.action}): {reason} at "
+            f"{where} on subgoal {state.current_subgoal_idx + 1}"
         )
         state.log(entry)
         if state.rewritten_instruction:
             obs = self.ctx.set_prompt(obs, state.rewritten_instruction)
-        return obs, state, True
+        return obs
+
+    # The NOW images of the grasp check: front, external, wrist (full res).
+    _GRASP_VERIFY_IMAGE_KEYS = (
+        "observation/front_image_left_raw",
+        "observation/exterior_image_1_left_raw",
+        "observation/wrist_image_left_raw",
+    )
+
+    def _tick_closure(
+        self, obs: dict, state: SessionState,
+    ) -> tuple[dict, SessionState, bool]:
+        """``--retry-trigger closure``, every chunk with no tool active:
+        once per closed-gripper segment, when the flange has risen
+        ``grasp_verify.LIFT_M`` since the fingers closed, ask the master
+        whether the held object is the current subgoal's target; on
+        ``other`` (and under the per-subgoal cap) retry the subgoal.
+        Returns ``(obs, state, busy)``; *busy* when a retry fired."""
+        grip = obs.get("observation/gripper_position")
+        ee = obs.get("observation/ee_pos")
+        images = [obs.get(k) for k in self._GRASP_VERIFY_IMAGE_KEYS]
+        if (
+            grip is None or ee is None
+            or not all(isinstance(im, np.ndarray) for im in images)
+            or not 0 <= state.current_subgoal_idx < len(state.subgoals)
+        ):
+            return obs, state, False
+        retry = self._retry
+        if not retry.on_chunk(
+            state,
+            float(np.asarray(grip, dtype=np.float64).reshape(-1)[0]),
+            float(np.asarray(ee, dtype=np.float64).reshape(-1)[2]),
+        ):
+            return obs, state, False
+
+        subgoal = state.subgoals[state.current_subgoal_idx]
+        messages = grasp_verify.build_messages(
+            state.original_instruction, subgoal,
+            *(f"data:image/jpeg;base64,{encode_image_b64(im)}"
+              for im in images),
+        )
+        t0 = time.time()
+        try:
+            raw = self._vlm_call(
+                messages[0]["content"], messages[1]["content"],
+            )
+            error = None
+        except Exception as e:   # like the monitor: logged, continue
+            logger.warning(f"  grasp check call failed: {e}; continuing")
+            raw, error = "", str(e)
+        elapsed = time.time() - t0
+        verdict = grasp_verify.parse_verdict(raw)
+        try:
+            reply = parse_json(raw)
+        except ValueError:
+            reply = {}
+        if not isinstance(reply, dict):
+            reply = {}
+        retried = verdict == "other" and retry.count < CAP
+        logger.info(
+            f"  grasp check [{state.current_subgoal_idx + 1}/"
+            f"{len(state.subgoals)}]: {verdict} — {reply.get('object')}"
+            f" ({elapsed:.1f}s){' → retry' if retried else ''}"
+        )
+        entry = {
+            "type": "grasp_verify",
+            "step": state.episode_step,
+            "verdict": verdict,
+            "object": reply.get("object"),
+            "reason": reply.get("reason"),
+            "retried": retried,
+            "retry_count": retry.count + int(retried),
+            "subgoal_idx": state.current_subgoal_idx,
+            "subgoal": subgoal,
+            "vlm_latency_s": round(elapsed, 2),
+            "vlm_raw": raw[:500],
+        }
+        if error is not None:
+            entry["error"] = error
+        state.log(entry)
+        if not retried:
+            return obs, state, False
+        return self._fire_retry(obs, state, verdict, None), state, True
 
     # ------------------------------------------------------------------
     # Handler result execution

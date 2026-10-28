@@ -468,11 +468,14 @@ def main():
     )
     parser.add_argument(
         "--retry-trigger",
-        choices=("none", "gt", "timer"),
+        choices=("none", "gt", "timer", "closure"),
         default="none",
         help="Subgoal mode with a failure handler: at a due monitor check, "
              "retry the current subgoal instead of asking the master when "
-             "the ground truth (gt) or the clock (timer) says so "
+             "the ground truth (gt) or the clock (timer) says so; or, on "
+             "any chunk, when the master judges the object the gripper "
+             "closed on and lifted 3 cm to be another than the subgoal's "
+             "(closure, strategies/grasp_verify.py) "
              "(strategies/retry.py). Default none: VoLo's loop.",
     )
     parser.add_argument(
