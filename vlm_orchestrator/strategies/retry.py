@@ -17,7 +17,8 @@ in ``regrasp_read.py``, after a decision that is not continue.
 
 - ``closure`` (agent-harness #137) acts on every chunk instead: once per closed-gripper segment, when the flange has
   risen ``LIFT_M`` since the fingers closed, the master is asked whether the held object is the subgoal's target
-  (``grasp_verify.py``); it fires on ``other``. No cooldown.
+  (``grasp_verify.py``); it fires on ``other``. No cooldown. It also has an episode cap: at most ``EPISODE_CAP``
+  retries per episode, kept across subgoals, replans and rewrites of the subgoal.
 
 All triggers share the cap: at most ``CAP`` retries per subgoal.
 """
@@ -38,6 +39,7 @@ ACTIONS = ("inplace", "home")
 LATE_CHECKS = 3     # regrasp_read.py LATE (VoLoAgent 1a38752 REGRASP_AFTER_CHECKS)
 MIN_CHECKS = 2      # cooldown
 CAP = 2             # retries per subgoal
+EPISODE_CAP = 3     # closure: retries per episode (VoLo's per-episode MAX_RECYCLES = 3)
 TIMER_FRAC = 0.5    # three in four of GPT-5.5's successful collection episodes on these openings end within half the budget
 CHUNK = 8
 
@@ -92,6 +94,7 @@ class Retry:
         self.k = 0
         self.held: set = set()
         self.count = 0
+        self.episode_count = 0
         self.clock = 0
         self.last_check = 0
         self.last_action = None
@@ -139,8 +142,15 @@ class Retry:
             return "timer" if budget and state.episode_step - self.clock >= TIMER_FRAC * budget else None
         return gt_reason(gt, key[1] or "", held_before, self.k)
 
+    def closure_cap(self) -> str | None:
+        """closure: which cap blocks a retry now ("episode" or "subgoal"), None when neither does."""
+        if self.episode_count >= EPISODE_CAP:
+            return "episode"
+        return "subgoal" if self.count >= CAP else None
+
     def fired(self, step: int) -> None:
         self.count += 1
+        self.episode_count += 1
         self.k = 0
         self.held = set()
         self.clock = step

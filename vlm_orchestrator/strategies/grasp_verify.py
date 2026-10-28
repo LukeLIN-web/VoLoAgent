@@ -8,6 +8,7 @@ whose identity differs from the subgoal's target"); identity is judged on the
 front and external cameras, the wrist camera only shows what is held
 (RPent's strict_hybrid_guide, rule 1b). Only ``other`` triggers the
 release-and-lift and re-issue; ``target``, ``empty`` and ``unsure`` continue.
+Retries are capped at 2 per subgoal and 3 per episode (``retry.CAP``, ``retry.EPISODE_CAP``).
 """
 from __future__ import annotations
 

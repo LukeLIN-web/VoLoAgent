@@ -40,7 +40,7 @@ from vlm_orchestrator.vlm import encode_image_b64, parse_json
 
 from . import grasp_verify
 from .base import OrchestrationStrategy, SessionState, StrategyContext
-from .retry import CAP, Retry, home_chunks
+from .retry import Retry, home_chunks
 
 if TYPE_CHECKING:
     from vlm_orchestrator.failure_handlers.base import FailureHandler
@@ -1300,7 +1300,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         once per closed-gripper segment, when the flange has risen
         ``grasp_verify.LIFT_M`` since the fingers closed, ask the master
         whether the held object is the current subgoal's target; on
-        ``other`` (and under the per-subgoal cap) retry the subgoal.
+        ``other`` (and under the per-subgoal and per-episode caps) retry
+        the subgoal.
         Returns ``(obs, state, busy)``; *busy* when a retry fired."""
         grip = obs.get("observation/gripper_position")
         ee = obs.get("observation/ee_pos")
@@ -1342,7 +1343,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             reply = {}
         if not isinstance(reply, dict):
             reply = {}
-        retried = verdict == "other" and retry.count < CAP
+        cap = retry.closure_cap() if verdict == "other" else None
+        retried = verdict == "other" and cap is None
         logger.info(
             f"  grasp check [{state.current_subgoal_idx + 1}/"
             f"{len(state.subgoals)}]: {verdict} — {reply.get('object')}"
@@ -1356,11 +1358,14 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             "reason": reply.get("reason"),
             "retried": retried,
             "retry_count": retry.count + int(retried),
+            "episode_retry_count": retry.episode_count + int(retried),
             "subgoal_idx": state.current_subgoal_idx,
             "subgoal": subgoal,
             "vlm_latency_s": round(elapsed, 2),
             "vlm_raw": raw[:500],
         }
+        if cap is not None:
+            entry["cap"] = cap
         if error is not None:
             entry["error"] = error
         state.log(entry)
