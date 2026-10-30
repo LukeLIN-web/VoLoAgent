@@ -346,11 +346,21 @@ def _object_points(
 
 
 def _blob(points: np.ndarray) -> np.ndarray | None:
-    """The connected blob nearest the points' median xy; ``None`` below ``MIN_POINTS``."""
+    """The connected blob nearest the points' median xy, of those with at least ``MIN_POINTS``
+    points; ``None`` when there is none.  A bin's walls ring its median, where the nearest
+    points can be a few seen through its opening; LADDER seeds with a point on the surface
+    (the ray through its box's middle), so it does not meet them."""
     if len(points) < MIN_POINTS:
         return None
-    points = nearest_blob(points, np.median(points[:, :2], axis=0))
-    return points if len(points) >= MIN_POINTS else None
+    seed = np.median(points[:, :2], axis=0)
+    while len(points) >= MIN_POINTS:
+        blob = nearest_blob(points, seed)
+        if len(blob) >= MIN_POINTS:
+            return blob
+        cells = np.floor(points[:, :2] / _BLOB_CELL_M)
+        speck = np.unique(np.floor(blob[:, :2] / _BLOB_CELL_M), axis=0)
+        points = points[~(cells[:, None, :] == speck[None]).all(axis=2).any(axis=1)]
+    return None
 
 
 # From LADDER harness perception/fitting.py (MIT License, (c) 2026 INSAIT).

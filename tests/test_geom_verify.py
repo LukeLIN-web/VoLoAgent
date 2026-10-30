@@ -143,6 +143,18 @@ def test_cube_in_bin_below_its_rim_is_in():
     assert (verdict.n_located, verdict.n_in) == (1, 1)
 
 
+def test_a_few_points_seen_through_the_bins_opening_are_not_the_bin():
+    """The bin's mask takes in 3 pixels of the cube inside it, which lie by the middle of the
+    walls' points, nearer it than any wall: the bin is the nearest blob big enough to fit."""
+    depth, ids = _render([*_BIN, _IN_BIN])
+    cube = np.flatnonzero(ids == 5)
+    destination = np.isin(ids, [1, 2, 3, 4])
+    destination.flat[cube[len(cube) // 2 : len(cube) // 2 + 3]] = True
+    verdict = verify_in_destination(depth, _K, _BASE_FROM_CAMERA, [ids == 5], destination, 1, False)
+    assert verdict.status == "in", verdict.reason
+    assert (verdict.n_located, verdict.n_in) == (1, 1)
+
+
 @pytest.mark.parametrize("seen, status", [(2, "in"), (0, "not_in")])
 def test_cube_hidden_in_deep_bin_is_counted_by_absence(seen, status):
     """One cube on the deep bin's floor, out of the camera's sight, the other on the table.  The
