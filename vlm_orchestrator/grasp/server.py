@@ -859,12 +859,17 @@ def build_app(
             detection whose mask is nearest it is returned, if within
             ``radius_px`` (0: the mask must cover it), else 422
           - ``radius_px``     (scalar) float, optional, default 0
+          - ``all_detections`` (scalar) bool, optional — also return every
+            detection (``masks`` / ``scores``)
 
         Returns ``.npz`` with:
           - ``mask``          (H, W) uint8 — best detection mask
           - ``score``         (scalar) float — detection confidence
           - ``box``           (4,) int — [x1, y1, x2, y2] pixel coords
           - ``num_detections`` (scalar) int — total detections found
+          - ``masks``         (K, H, W) uint8 — with ``all_detections``:
+            every detection, by score descending
+          - ``scores``        (K,) float — their scores
         """
         if _sam3_detector is None:
             raise HTTPException(
@@ -958,12 +963,17 @@ def build_app(
                 f"n_detections={len(results)})"
             )
 
-            return _npz_response(
+            arrays = dict(
                 mask=best["mask"].astype(np.uint8),
                 score=np.array(best["score"]),
                 box=np.array(best["box"], dtype=np.int32),
                 num_detections=np.array(len(results)),
             )
+            if "all_detections" in data and bool(data["all_detections"]):
+                ranked = sorted(results, key=lambda r: r["score"], reverse=True)
+                arrays["masks"] = np.stack([r["mask"] for r in ranked]).astype(np.uint8)
+                arrays["scores"] = np.array([r["score"] for r in ranked])
+            return _npz_response(**arrays)
 
         except RuntimeError as e:
             raise HTTPException(status_code=422, detail=str(e))

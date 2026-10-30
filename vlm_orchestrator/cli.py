@@ -335,6 +335,15 @@ def main():
              "place_tool — required for HITL place to fire). "
              "(default: auto-selected based on --failure-monitor)",
     )
+    parser.add_argument(
+        "--geom-verify",
+        choices=["off", "shadow", "veto"],
+        default="off",
+        help="For --failure-monitor vlm: re-check each VLM check with SAM3 "
+             "masks and scene depth and log the verdict ('shadow'), and "
+             "also turn a VLM 'next' into 'continue' when the object is "
+             "not in its destination ('veto') (default: off)",
+    )
 
     parser.add_argument(
         "--gt-failure-types",
@@ -843,6 +852,12 @@ def main():
                 f"(got '{args.recovery_mode}')"
             )
 
+    if args.geom_verify != "off" and (
+            args.mode != "subgoal" or args.failure_monitor != "vlm"):
+        parser.error(
+            "--geom-verify requires --mode subgoal --failure-monitor vlm"
+        )
+
     # ------------------------------------------------------------------
     # Build the orchestration strategy
     # ------------------------------------------------------------------
@@ -1152,6 +1167,7 @@ def _build_strategy(args):
             check_mode=args.subgoal_check_mode,
             check_interval=args.check_interval,
             subgoal_timeout=args.subgoal_timeout,
+            geom_verify=args.geom_verify,
             vlm_model=args.vlm_model,
             vlm_temperature=args.vlm_temperature,
             vlm_base_url=args.vlm_base_url,

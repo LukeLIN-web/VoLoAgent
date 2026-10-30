@@ -124,6 +124,10 @@ class SubgoalConfig:
     # autonomously).  Set explicitly per-run to re-enable.
     subgoal_timeout: int = 9999
 
+    geom_verify: str = "off"
+    """``"off"`` | ``"shadow"`` | ``"veto"``: geometric re-check of the VLM
+    completion checks (see :class:`VLMFailureHandler`)."""
+
     vlm_model: str = "YOUR_VLM_MODEL"
     vlm_temperature: float = 0.0
     vlm_max_tokens: int = 512

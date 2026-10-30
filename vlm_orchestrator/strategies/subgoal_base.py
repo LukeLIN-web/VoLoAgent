@@ -607,6 +607,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             ),
             stack_mode_enabled=self._stack_mode_enabled,
             point_tools=self._point_tools,
+            # SubgoalSceneEditConfig (archive) has no geom_verify.
+            geom_verify=getattr(self.config, "geom_verify", "off"),
         )
         logger.info(
             f"VLM failure handler created: "

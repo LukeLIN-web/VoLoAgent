@@ -464,6 +464,35 @@ class GraspClient:
         box = tuple(int(x) for x in data["box"])
         return mask, score, box
 
+    def detect_and_segment_all(
+        self,
+        image: np.ndarray,
+        text_prompt: str,
+    ) -> list[tuple[np.ndarray, float]]:
+        """Every SAM3 detection of *text_prompt* as ``(mask (H, W) bool, score)``,
+        by score descending; ``[]`` when the phrase has none (422).
+
+        Raises:
+            requests.HTTPError: if SAM3 is not loaded (501) or on server error.
+        """
+        body = self._pack_npz(
+            image=np.asarray(image, dtype=np.uint8),
+            text_prompt=np.array(text_prompt, dtype=object),
+            all_detections=np.asarray(True),
+        )
+        resp = requests.post(
+            f"{self._perception_url}/detect_and_segment",
+            data=body,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=self._timeout,
+        )
+        if resp.status_code == 422:
+            return []
+        resp.raise_for_status()
+
+        data = self._unpack_npz(resp.content)
+        return [(m.astype(bool), float(s)) for m, s in zip(data["masks"], data["scores"])]
+
     def segment(
         self,
         image: np.ndarray,

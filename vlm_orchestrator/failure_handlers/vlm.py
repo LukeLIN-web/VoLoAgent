@@ -23,10 +23,16 @@ The available actions are configured by ``--recovery-mode``:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from typing import Any, Callable
 
+import numpy as np
+import requests
+
+from vlm_orchestrator.grasp.client import GraspClient
 from vlm_orchestrator.vlm import POINT_CONVENTION, parse_json, parse_norm_point
 
 from .base import (
@@ -41,8 +47,23 @@ from .base import (
     STATUS_FAILURE,
     STATUS_IN_PROGRESS,
 )
+from .geom_verify import (
+    GeomVerdict,
+    parse_place_subgoal,
+    required_count,
+    verify_in_destination,
+)
 
 logger = logging.getLogger(__name__)
+
+# Scene camera for the geometric re-check: raw RGB, metric depth (0 = invalid),
+# flat 3×3 intrinsics, flat 4×4 camera→base (OpenCV axes).
+_GEOM_OBS_KEYS = (
+    "observation/exterior_image_1_left_raw",
+    "observation/depth_external",
+    "observation/camera_K",
+    "observation/camera_extrinsic",
+)
 
 
 # ======================================================================
@@ -362,6 +383,14 @@ class VLMFailureHandler(FailureHandler):
     point_tools:
         Tools (``"grasp"`` / ``"place"``) whose actions must carry a point
         in the primary NOW image (their ``gt_sim`` resolves targets from it).
+    geom_verify:
+        ``"off"`` | ``"shadow"`` | ``"veto"``.  Not off: every check also
+        segments the current place subgoal's object and destination with SAM3
+        (``GraspClient`` perception server) and judges from scene depth whether
+        the object is in the destination; the verdict goes into the
+        ``vlm_detect`` event as ``geom`` and its arrays into
+        ``<episode log>/geom/<step>.npz``.  ``"veto"`` also turns a VLM
+        ``next`` into ``continue`` when the verdict is ``not_in``.
     """
 
     def __init__(
@@ -377,6 +406,7 @@ class VLMFailureHandler(FailureHandler):
         use_front_camera: bool = False,
         stack_mode_enabled: bool = False,
         point_tools: frozenset[str] = frozenset(),
+        geom_verify: str = "off",
     ):
         self._vlm_call = vlm_call_fn
         self._build_check_message = image_builder_fn
@@ -385,6 +415,8 @@ class VLMFailureHandler(FailureHandler):
         self._check_interval = check_interval
         self._primary_label = primary_label
         self._extra_labels = extra_labels
+        self._geom_verify = geom_verify
+        self._geom_client = GraspClient() if geom_verify != "off" else None
 
         if recovery_mode not in _ACTION_SETS:
             raise ValueError(
@@ -517,9 +549,27 @@ class VLMFailureHandler(FailureHandler):
             f"{action_icon} — {result.reason} ({elapsed:.1f}s)"
         )
 
+        geom = None
+        if self._geom_verify != "off":
+            verdict, arrays = self._geom_verdict(obs, state.subgoals, sg_idx)
+            vetoed = (self._geom_verify == "veto"
+                      and result.action == ACTION_NEXT
+                      and verdict.status == "not_in")
+            geom = verdict.as_log() | {"vetoed": vetoed}
+            logger.info(
+                f"  geom verify [{sg_idx + 1}/{total}]: "
+                f"status={verdict.status}, in={verdict.n_in}/{verdict.required}, "
+                f"located={verdict.n_located}{', VETO next' if vetoed else ''} "
+                f"— {verdict.reason}"
+            )
+            if arrays is not None:
+                self._save_geom(state, {
+                    **arrays, "verdict": json.dumps(geom), "subgoal": current_sg,
+                })
+
         # Always log the VLM check to state (even for in_progress/continue)
         self._store_check_result(state, result)
-        state.log({
+        event = {
             "type": "vlm_detect",
             "status": result.status,
             "action": result.action,
@@ -532,7 +582,15 @@ class VLMFailureHandler(FailureHandler):
             "vlm_latency_s": round(elapsed, 2),
             "vlm_raw": raw[:500],
             "step_count": state.infer_count,
-        })
+        }
+        if geom is not None:
+            event["geom"] = geom
+        state.log(event)
+
+        if geom is not None and geom["vetoed"]:
+            result.status = STATUS_IN_PROGRESS
+            result.action = ACTION_CONTINUE
+            result.reason = f"[geom veto] {verdict.reason}"
 
         # Return None for in_progress + continue (no action needed)
         if (result.status == STATUS_IN_PROGRESS
@@ -540,6 +598,81 @@ class VLMFailureHandler(FailureHandler):
             return None
 
         return result
+
+    # ------------------------------------------------------------------
+    # Geometric re-check
+    # ------------------------------------------------------------------
+
+    def _geom_verdict(
+        self, obs: dict, subgoals: list[str], sg_idx: int,
+    ) -> tuple[GeomVerdict, dict | None]:
+        """Whether subgoal *sg_idx*'s object is in its destination, from SAM3
+        masks on the scene depth.
+
+        Also returns, when the verdict was judged from masks, the arrays it
+        was judged from (packed for ``geom/<step>.npz``).
+        """
+        image, depth, K, extrinsic = (obs.get(k) for k in _GEOM_OBS_KEYS)
+        if any(a is None for a in (image, depth, K, extrinsic)):
+            return GeomVerdict("unknown", "no scene depth in observation", 0, 0, 0), None
+        goal = parse_place_subgoal(subgoals[sg_idx])
+        if goal is None:
+            return GeomVerdict("unknown", "subgoal is not a place sentence", 0, 0, 0), None
+
+        image = np.asarray(image, dtype=np.uint8)
+        depth = np.asarray(depth, dtype=np.float32)
+        K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        base_from_camera = np.asarray(extrinsic, dtype=np.float64).reshape(4, 4)
+        try:
+            object_masks = [
+                m for m, _ in self._geom_client.detect_and_segment_all(
+                    image, goal.object_phrase,
+                )
+            ]
+            destination_mask = self._destination_mask(image, goal.destination_phrase)
+            verdict = verify_in_destination(
+                depth, K, base_from_camera, object_masks, destination_mask,
+                required=required_count(subgoals, sg_idx), every=goal.every,
+            )
+        except Exception as e:
+            logger.warning(f"  geom verify failed ({e}); verdict unknown")
+            return GeomVerdict("unknown", f"geom verify failed: {e}", 0, 0, 0), None
+
+        stacked = (np.stack(object_masks).astype(bool) if object_masks
+                   else np.zeros((0, *image.shape[:2]), dtype=bool))
+        arrays = {
+            "depth": depth.astype(np.float16),
+            "object_masks": np.packbits(stacked, axis=-1),
+            "object_masks_shape": np.array(stacked.shape),
+            "K": K,
+            "base_from_camera": base_from_camera,
+        }
+        if destination_mask is not None:
+            arrays["destination_mask"] = np.packbits(destination_mask.astype(bool), axis=-1)
+            arrays["destination_mask_shape"] = np.array(destination_mask.shape)
+        return verdict, arrays
+
+    def _destination_mask(self, image: np.ndarray, phrase: str) -> np.ndarray | None:
+        """SAM3's best mask of *phrase*, ``None`` when it has no detection (422)."""
+        try:
+            return self._geom_client.detect_and_segment(image, phrase)[0]
+        except requests.HTTPError as e:
+            if e.response.status_code == 422:
+                return None
+            raise
+
+    @staticmethod
+    def _save_geom(state: Any, arrays: dict) -> None:
+        """Write *arrays* to ``<episode log>/geom/<episode_step:06d>.npz``."""
+        log_dir = getattr(state, "episode_log_dir", None)
+        if not log_dir:
+            return
+        path = os.path.join(log_dir, "geom", f"{state.episode_step:06d}.npz")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            np.savez_compressed(path, **arrays)
+        except Exception as e:
+            logger.warning(f"  geom verify: could not save {path}: {e}")
 
     # ------------------------------------------------------------------
     # Helpers
