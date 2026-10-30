@@ -20,6 +20,8 @@ from vlm_orchestrator.failure_handlers.geom_verify import (
     PlaceGoal,
     parse_place_subgoal,
     required_count,
+    sam3_instances,
+    support_plane,
     verify_in_destination,
 )
 
@@ -288,6 +290,33 @@ def test_depth_channel_axis_and_masks_at_image_resolution():
         [upscaled(ids == 1)], upscaled(ids == 0), 1, False,
     )
     assert verdict == _verify(depth, ids, [0], [1])
+
+
+def test_given_support_replaces_the_frames_estimate():
+    depth, ids = _render([_PLATE, _BESIDE_PLATE])
+    plane = support_plane(depth, _K, _BASE_FROM_CAMERA)
+    assert plane == pytest.approx(0.0, abs=0.005)
+    assert _verify(depth, ids, [0], [1], support=plane) == _verify(depth, ids, [0], [1])
+    raised = _verify(depth, ids, [0], [1], support=0.02)
+    assert raised.height == pytest.approx(_CUBE_HEIGHT - 0.02, abs=0.01), raised.reason
+
+
+def test_sam3_instances_are_sam3s_own():
+    """As SAM3 lists a phrase's instances: detections scored above 0.5, by score, each
+    overlapping no higher-scored one by more than 0.1 mask IoU, so a repeat of an instance and
+    a part of it (a held object split by a finger) are not instances; a separate one is."""
+    whole = np.zeros((10, 10), dtype=bool)
+    whole[2:6, 2:8] = True
+    repeat, half, other, faint = (np.zeros_like(whole) for _ in range(4))
+    repeat[2:6, 2:7] = True
+    half[2:6, 2:5] = True
+    other[7:9, 2:8] = True
+    faint[0:2, 8:10] = True
+    instances = sam3_instances(
+        [(faint, 0.4), (half, 0.7), (other, 0.6), (whole, 0.9), (repeat, 0.85), (other, 0.5)]
+    )
+    assert [mask.tolist() for mask in instances] == [whole.tolist(), other.tolist()]
+    assert sam3_instances([]) == []
 
 
 @pytest.mark.parametrize(

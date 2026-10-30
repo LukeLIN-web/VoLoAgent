@@ -15,7 +15,10 @@ the opening frame included; the object's height is its tallest instance's in the
 as PSP-Agent measures a held object where it was located before the pick.
 
 Perception follows LADDER's PSP-Agent harness (``perception/scene.py``,
-``perception/fitting.py``, ``tools/geometry.py``), with masks in place of its VLM boxes.
+``perception/fitting.py``, ``tools/geometry.py``), with masks in place of its VLM boxes: the
+support plane is the median of the episode's per-frame estimates (``Scene.support_z``), and a
+phrase's instances are SAM3's detections of it as SAM3 itself lists instances
+(:func:`sam3_instances`).
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ MIN_POINTS = 12
 _EXTENT_PERCENTILE = 2.0
 _BLOB_CELL_M = 0.012
 PLACE_CLEARANCE_M = 0.02
+
+# SAM3's own instance post-processing (sam3 ``model_builder.py``, the video detector's
+# ``score_threshold_detection`` and ``det_nms_thresh``; ``perflib/nms.py``, ``nms_masks``).
+INSTANCE_SCORE = 0.5
+INSTANCE_NMS_IOU = 0.1
 
 _PLACE_VERB = r"(?:place|put|move)"
 _SOURCE = r"(?: (?:from|off|out of) .+?)?"
@@ -105,6 +113,21 @@ def required_count(subgoals: list[str], idx: int) -> int:
     return len(destinations)
 
 
+def sam3_instances(detections: list[tuple[np.ndarray, float]]) -> list[np.ndarray]:
+    """The instances among SAM3 *detections* ``(mask, score)``, by score descending, as SAM3
+    keeps them when it lists a phrase's instances (``nms_masks``): scored above
+    ``INSTANCE_SCORE``, and overlapping no higher-scored instance by more than
+    ``INSTANCE_NMS_IOU`` mask IoU.  A detection overlapping one is a part or a repeat of it."""
+    kept: list[np.ndarray] = []
+    for mask, score in sorted(detections, key=lambda detection: detection[1], reverse=True):
+        mask = np.asarray(mask, dtype=bool)
+        if score > INSTANCE_SCORE and all(
+            (mask & other).sum() <= INSTANCE_NMS_IOU * (mask | other).sum() for other in kept
+        ):
+            kept.append(mask)
+    return kept
+
+
 @dataclass(frozen=True)
 class GeomVerdict:
     """Result of :func:`verify_in_destination`.
@@ -143,12 +166,15 @@ def verify_in_destination(
     seen: int = 0,
     object_height: float = 0.0,
     gripper_closed: bool = False,
+    support: float | None = None,
 ) -> GeomVerdict:
     """Whether enough of the object's instances (a mask each) are in the masked destination.
 
     ``depth_m`` is metric depth along the optical axis, (H, W) or (H, W, 1), 0 or non-finite
     where invalid; ``K`` its intrinsics; ``base_from_camera`` the camera → robot base transform
     (OpenCV camera axes, base z up).  Masks may be at another resolution of the same camera.
+    *support* is the support plane's z (m), the median of the episode's :func:`support_plane`
+    estimates as LADDER's ``Scene.support_z`` takes it; this frame's estimate when not given.
 
     A located instance is in when it lies on the destination's footprint and either its foot is
     no higher than the destination's top + ``PLACE_CLEARANCE_M`` or the gripper is open: above
@@ -174,7 +200,8 @@ def verify_in_destination(
     K = np.asarray(K, dtype=np.float64)
     base_from_camera = np.asarray(base_from_camera, dtype=np.float64)
 
-    support = _support_z(depth, K, base_from_camera)
+    if support is None:
+        support = support_plane(depth, K, base_from_camera)
     if support is None:
         reason = "too little valid depth to estimate the support plane"
         return GeomVerdict("unknown", reason, 0, 0, required, seen, 0, 0.0)
@@ -283,8 +310,13 @@ def _lift(
     return camera @ base_from_camera[:3, :3].T + base_from_camera[:3, 3]
 
 
-# From LADDER harness perception/scene.py Scene.support_z (MIT License, (c) 2026 INSAIT).
-def _support_z(depth: np.ndarray, K: np.ndarray, base_from_camera: np.ndarray) -> float | None:
+# From LADDER harness perception/scene.py Scene.support_z (MIT License, (c) 2026 INSAIT): one
+# frame's estimate, which Scene.support_z takes the episode's median of.
+def support_plane(depth: np.ndarray, K: np.ndarray, base_from_camera: np.ndarray) -> float | None:
+    """The support plane's z (m) in one frame: the median z of the fullest 5 mm height bin of
+    the frame's points (every ``_CLOUD_STRIDE``-th pixel); ``None`` below ``MIN_POINTS``."""
+    depth = np.nan_to_num(np.asarray(depth, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    depth = depth.reshape(depth.shape[:2])
     sampled = np.zeros(depth.shape, dtype=bool)
     sampled[::_CLOUD_STRIDE, ::_CLOUD_STRIDE] = True
     z = _lift(depth, K, base_from_camera, sampled)[:, 2]

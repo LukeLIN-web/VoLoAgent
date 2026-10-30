@@ -15,6 +15,7 @@ import json
 import numpy as np
 import pytest
 
+from vlm_orchestrator.failure_handlers import vlm as vlm_handler
 from vlm_orchestrator.failure_handlers.base import ACTION_NEXT
 from vlm_orchestrator.failure_handlers.vlm import GEOM_VETO_PATIENCE_STEPS, VLMFailureHandler
 from vlm_orchestrator.grasp import client as grasp_client
@@ -58,6 +59,22 @@ class _Sam3:
         ids = image[..., 0].astype(int) - 1
         masks = [np.isin(ids, boxes) for boxes in self._phrases[text_prompt]]
         return [(mask, 0.9) for mask in masks if mask.any()]
+
+
+class _NoisySam3(_Sam3):
+    """SAM3 as it answers in the scene, sorted by score: a faint detection of the table (0.2),
+    and per instance (0.9) a repeat of it (0.8) and its upper half (0.7)."""
+
+    def detect_and_segment_all(self, image, text_prompt):
+        detections = [(image[..., 0] == 0, 0.2)]
+        for mask, score in super().detect_and_segment_all(image, text_prompt):
+            rows = np.nonzero(mask.any(axis=1))[0]
+            detections += [
+                (mask, score),
+                (mask & (np.arange(mask.shape[1]) != np.nonzero(mask[rows[0]])[0][0]), 0.8),
+                (mask & (np.arange(mask.shape[0]) < rows.mean())[:, None], 0.7),
+            ]
+        return detections
 
 
 def _obs(boxes: list, gripper: float = 0.0, scale: int = 1) -> dict:
@@ -213,6 +230,34 @@ def test_cube_located_nowhere_by_the_plate_is_unknown_and_not_vetoed():
     assert event["geom"]["vetoed"] is False
 
 
+def test_repeats_parts_and_faint_detections_are_not_instances():
+    obs = _obs([_PLATE, _BESIDE_PLATE])
+    handler, state = _handler("veto", _NoisySam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
+    handler.on_episode_start(obs, state)
+    _, event = _check(handler, state, obs)
+    assert (event["geom"]["seen"], event["geom"]["n_located"]) == (1, 1), event["geom"]["reason"]
+    assert event["geom"]["status"] == "not_in" and event["geom"]["vetoed"] is True
+
+
+def test_the_support_is_the_median_of_the_episodes_estimates(monkeypatch, tmp_path):
+    """With the arm hiding most of the table, a frame's own estimate lands on a raised surface
+    (0.04 m, which would put the cube's points in the support band).  The support is the median
+    of the episode's estimates, the opening frame's included, as LADDER's Scene.support_z takes
+    it, so the cube is still located beside the plate."""
+    estimates = iter([0.0, 0.0, 0.04])
+    monkeypatch.setattr(vlm_handler, "support_plane", lambda *frame: next(estimates))
+    obs = _obs([_PLATE, _BESIDE_PLATE])
+    handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
+    handler.on_episode_start(obs, state)
+    _check(handler, state, obs)
+    _, event = _check(handler, state, obs)
+    assert event["geom"]["status"] == "not_in", event["geom"]["reason"]
+    assert "support at z 0.000 m" in event["geom"]["reason"]
+    with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
+        assert saved["planes"].tolist() == [0.0, 0.0, 0.04]
+        assert float(saved["support"]) == 0.0
+
+
 def test_sam3_failure_is_unknown_and_not_raised():
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES, fail=True)), _state(_ON_THE_PLATE)
@@ -224,9 +269,14 @@ def test_sam3_failure_is_unknown_and_not_raised():
     assert event["geom"]["vetoed"] is False
 
 
-def test_no_depth_is_unknown_without_segmenting(tmp_path):
+@pytest.mark.parametrize("depth", [None, 0.0])
+def test_no_depth_is_unknown_without_segmenting(tmp_path, depth):
+    """No depth in the observation, or none valid (no support plane to judge from)."""
     obs = _obs([_PLATE, _BESIDE_PLATE])
-    del obs["observation/depth_external"]
+    if depth is None:
+        del obs["observation/depth_external"]
+    else:
+        obs["observation/depth_external"][:] = depth
     sam3 = _Sam3(_PLATE_PHRASES)
     handler, state = _handler("veto", sam3), _state(_ON_THE_PLATE, str(tmp_path))
     handler.on_episode_start(obs, state)

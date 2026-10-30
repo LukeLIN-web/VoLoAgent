@@ -50,6 +50,8 @@ from .geom_verify import (
     GeomVerdict,
     parse_place_subgoal,
     required_count,
+    sam3_instances,
+    support_plane,
     verify_in_destination,
 )
 
@@ -479,10 +481,12 @@ class VLMFailureHandler(FailureHandler):
         # ``state.episode_step`` so that VLA chunks of different sizes
         # produce the same wall-clock check frequency.
         self._step_at_last_check: int = 0
-        # Geometric re-check, per episode: the opening frame (``_geom_frame``)
-        # and, per object phrase, the most instances located in any frame and
-        # the tallest of them above the support (m).
+        # Geometric re-check, per episode: the opening frame (``_geom_frame``),
+        # every frame's support plane estimate (z, m; the support is their
+        # median), and, per object phrase, the most instances located in any
+        # frame and the tallest of them above the support (m).
         self._geom_start: tuple[np.ndarray, ...] | None = None
+        self._geom_planes: list[float] = []
         self._geom_seen: dict[str, tuple[int, float]] = {}
         # (subgoal index, subgoal) → sim step of its first veto.
         self._geom_first_veto: dict[tuple[int, str], int] = {}
@@ -495,8 +499,13 @@ class VLMFailureHandler(FailureHandler):
         self._step_at_last_check = state.episode_step
         if self._geom_verify != "off":
             self._geom_start = _geom_frame(obs)
+            self._geom_planes = []
             self._geom_seen = {}
             self._geom_first_veto = {}
+            if self._geom_start is not None:
+                plane = support_plane(*self._geom_start[1:])
+                if plane is not None:
+                    self._geom_planes.append(plane)
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
@@ -668,7 +677,8 @@ class VLMFailureHandler(FailureHandler):
         """Whether subgoal *sg_idx*'s object is in its destination, from SAM3
         masks on the scene depth.
 
-        The object phrase's instance count (``seen``) and height
+        The support is the median of this and earlier frames' support plane
+        estimates.  The object phrase's instance count (``seen``) and height
         (``object_height``) come from the opening frame, segmented the first
         time the phrase comes up; the count grows with every frame judged.  Also
         returns, when the verdict was judged from masks, the arrays it was
@@ -682,6 +692,11 @@ class VLMFailureHandler(FailureHandler):
             return _geom_unknown("subgoal is not a single place sentence"), None
 
         image, depth, K, base_from_camera = frame
+        plane = support_plane(depth, K, base_from_camera)
+        if plane is None:
+            return _geom_unknown("too little valid depth to estimate the support plane"), None
+        self._geom_planes.append(plane)
+        support = float(np.median(self._geom_planes))
         phrase = goal.object_phrase
         gripper_closed = float(np.asarray(
             obs.get(_GRIPPER_KEY, [0.0]),
@@ -691,27 +706,28 @@ class VLMFailureHandler(FailureHandler):
                 start_image, start_depth, start_K, start_pose = self._geom_start
                 opening = verify_in_destination(
                     start_depth, start_K, start_pose,
-                    [m for m, _ in self._geom_client.detect_and_segment_all(
+                    sam3_instances(self._geom_client.detect_and_segment_all(
                         start_image, phrase,
-                    )],
+                    )),
                     destination_mask=None, required=1, every=False,
+                    support=support,
                 )
                 self._geom_seen[phrase] = (opening.n_located, opening.height)
             seen, object_height = self._geom_seen.get(phrase, (0, 0.0))
-            object_masks = [
-                m for m, _ in self._geom_client.detect_and_segment_all(
-                    image, phrase,
-                )
-            ]
-            destinations = self._geom_client.detect_and_segment_all(
-                image, goal.destination_phrase,
+            object_masks = sam3_instances(
+                self._geom_client.detect_and_segment_all(image, phrase),
             )
-            destination_mask = destinations[0][0] if destinations else None
+            destinations = sam3_instances(
+                self._geom_client.detect_and_segment_all(
+                    image, goal.destination_phrase,
+                ),
+            )
+            destination_mask = destinations[0] if destinations else None
             verdict = verify_in_destination(
                 depth, K, base_from_camera, object_masks, destination_mask,
                 required=required_count(subgoals, sg_idx), every=goal.every,
                 seen=seen, object_height=object_height,
-                gripper_closed=gripper_closed,
+                gripper_closed=gripper_closed, support=support,
             )
         except Exception as e:
             logger.warning(f"  geom verify failed ({e}); verdict unknown")
@@ -731,6 +747,8 @@ class VLMFailureHandler(FailureHandler):
             "gripper_closed": np.array(gripper_closed),
             "seen": np.array(seen),
             "object_height": np.array(object_height),
+            "support": np.array(support),
+            "planes": np.array(self._geom_planes),
         }
         if destination_mask is not None:
             arrays["destination_mask"] = np.packbits(destination_mask.astype(bool), axis=-1)
