@@ -860,7 +860,7 @@ def build_app(
             ``radius_px`` (0: the mask must cover it), else 422
           - ``radius_px``     (scalar) float, optional, default 0
           - ``all_detections`` (scalar) bool, optional — also return every
-            detection (``masks`` / ``scores``)
+            detection (``masks`` / ``scores``) and ``used_variant``
 
         Returns ``.npz`` with:
           - ``mask``          (H, W) uint8 — best detection mask
@@ -870,6 +870,8 @@ def build_app(
           - ``masks``         (K, H, W) uint8 — with ``all_detections``:
             every detection, by score descending
           - ``scores``        (K,) float — their scores
+          - ``used_variant``  (scalar) bool — the phrase detected nothing and
+            these are a simpler variant's detections (its last word, ...)
         """
         if _sam3_detector is None:
             raise HTTPException(
@@ -973,6 +975,7 @@ def build_app(
                 ranked = sorted(results, key=lambda r: r["score"], reverse=True)
                 arrays["masks"] = np.stack([r["mask"] for r in ranked]).astype(np.uint8)
                 arrays["scores"] = np.array([r["score"] for r in ranked])
+                arrays["used_variant"] = np.array(used_variant)
             return _npz_response(**arrays)
 
         except RuntimeError as e:

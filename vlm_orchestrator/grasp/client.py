@@ -470,7 +470,9 @@ class GraspClient:
         text_prompt: str,
     ) -> list[tuple[np.ndarray, float]]:
         """Every SAM3 detection of *text_prompt* as ``(mask (H, W) bool, score)``,
-        by score descending; ``[]`` when the phrase has none (422).
+        by score descending; ``[]`` when the phrase has none (422), or the server
+        found only a simpler variant of it: "pumpkin" for "orange pumpkin" may be
+        another object.
 
         Raises:
             requests.HTTPError: if SAM3 is not loaded (501) or on server error.
@@ -491,6 +493,8 @@ class GraspClient:
         resp.raise_for_status()
 
         data = self._unpack_npz(resp.content)
+        if bool(data["used_variant"]):
+            return []
         return [(m.astype(bool), float(s)) for m, s in zip(data["masks"], data["scores"])]
 
     def segment(

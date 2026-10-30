@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 from vlm_orchestrator.failure_handlers.base import ACTION_NEXT
-from vlm_orchestrator.failure_handlers.vlm import VLMFailureHandler
+from vlm_orchestrator.failure_handlers.vlm import GEOM_VETO_PATIENCE_STEPS, VLMFailureHandler
+from vlm_orchestrator.grasp import client as grasp_client
 
 from test_geom_verify import (
     _ABOVE_PLATE,
@@ -35,34 +36,28 @@ from test_vlm_failure_handler import _FakeState
 
 _NEXT = '{"status": "complete", "action": "next", "reason": "the cube is on the plate"}'
 _ON_THE_PLATE = "Place the cube on the plate"
-# Box indices of each phrase in the scenes [_PLATE, cube, ...] and [*_DEEP_BIN, cube, cube].
-_PLATE_PHRASES = {"cube": [1, 2], "plate": [0]}
-_BIN_PHRASES = {"cube": [5, 6], "grey bin": [0, 1, 2, 3, 4]}
+# Each phrase's instances, as the box indices each is made of, in the scenes [_PLATE, cube, ...]
+# and [*_DEEP_BIN, cube, cube].
+_PLATE_PHRASES = {"cube": [[1], [2]], "plate": [[0]]}
+_BIN_PHRASES = {"cube": [[5], [6]], "grey bin": [[0, 1, 2, 3, 4]]}
 
 
 class _Sam3:
     """SAM3 on a rendered scene: the image is 1 + the index of the box each pixel sees (0 for
-    the table), and each phrase segments the boxes ``phrases`` lists for it."""
+    the table), and each phrase segments a mask per instance ``phrases`` lists for it."""
 
-    def __init__(self, phrases: dict[str, list[int]], fail: bool = False):
+    def __init__(self, phrases: dict[str, list[list[int]]], fail: bool = False):
         self._phrases = phrases
         self._fail = fail
-        self.images: list[np.ndarray] = []  # each detect_and_segment_all call's image
-
-    def _masks(self, image: np.ndarray, phrase: str) -> list[np.ndarray]:
-        ids = image[..., 0].astype(int) - 1
-        return [ids == index for index in self._phrases[phrase] if (ids == index).any()]
+        self.calls: list[tuple[np.ndarray, str]] = []  # each call's image and phrase
 
     def detect_and_segment_all(self, image, text_prompt):
-        self.images.append(image)
+        self.calls.append((image, text_prompt))
         if self._fail:
             raise RuntimeError("SAM3 is down")
-        return [(mask, 0.9) for mask in self._masks(image, text_prompt)]
-
-    def detect_and_segment(self, image, text_prompt):
-        mask = np.logical_or.reduce(self._masks(image, text_prompt))
-        rows, columns = np.nonzero(mask)
-        return mask, 0.9, (columns.min(), rows.min(), columns.max(), rows.max())
+        ids = image[..., 0].astype(int) - 1
+        masks = [np.isin(ids, boxes) for boxes in self._phrases[text_prompt]]
+        return [(mask, 0.9) for mask in masks if mask.any()]
 
 
 def _obs(boxes: list, gripper: float = 0.0, scale: int = 1) -> dict:
@@ -143,9 +138,12 @@ def test_cube_on_the_plate_is_not_vetoed():
     assert event["geom"]["vetoed"] is False
 
 
-@pytest.mark.parametrize("gripper, status", [(1.0, "not_in"), (0.0, "in"), (None, "in")])
+@pytest.mark.parametrize(
+    "gripper, status", [(1.0, "not_in"), (0.39, "not_in"), (0.1, "in"), (0.0, "in"), (None, "in")]
+)
 def test_cube_over_the_plate_is_held_only_with_the_gripper_closed(gripper, status):
-    """0.10 m over the plate; no gripper position in the observation reads as open."""
+    """0.10 m over the plate.  Holding an object leaves the gripper part open (0.39: 0.61 of
+    its travel open), which reads closed; no gripper position in the observation reads as open."""
     obs = _obs([_PLATE, _ABOVE_PLATE], gripper=gripper or 0.0)
     if gripper is None:
         del obs["observation/gripper_position"]
@@ -235,7 +233,7 @@ def test_no_depth_is_unknown_without_segmenting(tmp_path):
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "unknown" and event["geom"]["vetoed"] is False
-    assert sam3.images == []
+    assert sam3.calls == []
     assert not (tmp_path / "geom").exists()
 
 
@@ -268,4 +266,45 @@ def test_opening_frame_is_segmented_once_per_phrase():
     for _ in range(2):
         _check(handler, state, now)
     start_image = start["observation/exterior_image_1_left_raw"]
-    assert [np.array_equal(image, start_image) for image in sam3.images] == [True, False, False]
+    assert [phrase for image, phrase in sam3.calls if np.array_equal(image, start_image)] == ["cube"]
+    assert [phrase for _, phrase in sam3.calls] == ["cube", "cube", "plate", "cube", "plate"]
+
+
+def test_vetoes_stop_after_the_patience_from_the_first():
+    """The cube stays beside the plate and the VLM keeps saying next: vetoed until
+    GEOM_VETO_PATIENCE_STEPS after the first veto, then the VLM's next stands."""
+    obs = _obs([_PLATE, _BESIDE_PLATE])
+    handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
+    handler.on_episode_start(obs, state)
+    result, event = _check(handler, state, obs)
+    assert result is None and event["geom"]["vetoed"] is True
+    state.episode_step += GEOM_VETO_PATIENCE_STEPS - 2  # the next check is 1 step short of it
+    result, event = _check(handler, state, obs)
+    assert result is None and event["geom"]["vetoed"] is True
+    result, event = _check(handler, state, obs)
+    assert result.action == ACTION_NEXT
+    assert event["geom"]["status"] == "not_in" and event["geom"]["vetoed"] is False
+    handler.on_episode_start(obs, state)  # a new episode starts the patience afresh
+    result, event = _check(handler, state, obs)
+    assert result is None and event["geom"]["vetoed"] is True
+
+
+class _Response:
+    def __init__(self, arrays: dict):
+        self.status_code = 200
+        self.content = grasp_client.GraspClient._pack_npz(**arrays)
+
+    def raise_for_status(self):
+        pass
+
+
+@pytest.mark.parametrize("used_variant, found", [(False, 1), (True, 0)])
+def test_a_simpler_variants_detections_are_not_the_phrase(monkeypatch, used_variant, found):
+    """The server falls back to the phrase's last word when the phrase detects nothing
+    ("pumpkin" for "orange pumpkin"): those masks may be another object, so none are returned."""
+    mask = np.ones((1, 4, 4), dtype=np.uint8)
+    reply = _Response({"masks": mask, "scores": np.array([0.9]), "used_variant": np.array(used_variant)})
+    monkeypatch.setattr(grasp_client.requests, "post", lambda *args, **kwargs: reply)
+    client = grasp_client.GraspClient(url="http://sam3.invalid")
+    detections = client.detect_and_segment_all(np.zeros((4, 4, 3), dtype=np.uint8), "orange pumpkin")
+    assert len(detections) == found

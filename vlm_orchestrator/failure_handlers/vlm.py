@@ -30,7 +30,6 @@ import time
 from typing import Any, Callable
 
 import numpy as np
-import requests
 
 from vlm_orchestrator.grasp.client import GraspClient
 from vlm_orchestrator.vlm import POINT_CONVENTION, parse_json, parse_norm_point
@@ -66,8 +65,15 @@ _GEOM_OBS_KEYS = (
 )
 # Depth beyond this is no return (the renderer may send float32 max), zeroed as invalid.
 _MAX_DEPTH_M = 100.0
-# [g], 0 open … 1 closed; closed above 0.5, as LADDER's gripper_open_threshold.
+# [g], 1 − LADDER's openness (0 open … 1 closed).  Closed above 0.15: LADDER's scene_events
+# counts the gripper open from OPEN_FRACTION 0.85 of its travel, and holding an object leaves
+# it about 0.4–0.8 open.
 _GRIPPER_KEY = "observation/gripper_position"
+_GRIPPER_CLOSED_ABOVE = 0.15
+# A subgoal can be vetoed for this many sim steps from its first veto; then the VLM's next
+# stands.  LADDER RoboLab's attempt_stall_steps, its patience with one goal (a RoboLab
+# pick-and-place takes ~250 steps).
+GEOM_VETO_PATIENCE_STEPS = 300
 
 
 def _geom_frame(
@@ -419,7 +425,8 @@ class VLMFailureHandler(FailureHandler):
         the object is in the destination; the verdict goes into the
         ``vlm_detect`` event as ``geom`` and its arrays into
         ``<episode log>/geom/<step>.npz``.  ``"veto"`` also turns a VLM
-        ``next`` into ``continue`` when the verdict is ``not_in``.  Instances
+        ``next`` into ``continue`` when the verdict is ``not_in``, for
+        ``GEOM_VETO_PATIENCE_STEPS`` from the subgoal's first veto.  Instances
         not located now count as placed only when the destination is a
         container taller than the object and the gripper is open; the
         instance count is the most located in any frame of the episode, the
@@ -477,6 +484,8 @@ class VLMFailureHandler(FailureHandler):
         # the tallest of them above the support (m).
         self._geom_start: tuple[np.ndarray, ...] | None = None
         self._geom_seen: dict[str, tuple[int, float]] = {}
+        # (subgoal index, subgoal) → sim step of its first veto.
+        self._geom_first_veto: dict[tuple[int, str], int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -487,6 +496,7 @@ class VLMFailureHandler(FailureHandler):
         if self._geom_verify != "off":
             self._geom_start = _geom_frame(obs)
             self._geom_seen = {}
+            self._geom_first_veto = {}
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
@@ -594,9 +604,15 @@ class VLMFailureHandler(FailureHandler):
         geom = None
         if self._geom_verify != "off":
             verdict, arrays = self._geom_verdict(obs, state.subgoals, sg_idx)
+            first_veto = self._geom_first_veto.get((sg_idx, current_sg))
             vetoed = (self._geom_verify == "veto"
                       and result.action == ACTION_NEXT
-                      and verdict.status == "not_in")
+                      and verdict.status == "not_in"
+                      and (first_veto is None
+                           or state.episode_step - first_veto
+                           < GEOM_VETO_PATIENCE_STEPS))
+            if vetoed:
+                self._geom_first_veto.setdefault((sg_idx, current_sg), state.episode_step)
             geom = verdict.as_log() | {"vetoed": vetoed}
             logger.info(
                 f"  geom verify [{sg_idx + 1}/{total}]: "
@@ -669,7 +685,7 @@ class VLMFailureHandler(FailureHandler):
         phrase = goal.object_phrase
         gripper_closed = float(np.asarray(
             obs.get(_GRIPPER_KEY, [0.0]),
-        ).reshape(-1)[0]) > 0.5
+        ).reshape(-1)[0]) > _GRIPPER_CLOSED_ABOVE
         try:
             if phrase not in self._geom_seen and self._geom_start is not None:
                 start_image, start_depth, start_K, start_pose = self._geom_start
@@ -687,7 +703,10 @@ class VLMFailureHandler(FailureHandler):
                     image, phrase,
                 )
             ]
-            destination_mask = self._destination_mask(image, goal.destination_phrase)
+            destinations = self._geom_client.detect_and_segment_all(
+                image, goal.destination_phrase,
+            )
+            destination_mask = destinations[0][0] if destinations else None
             verdict = verify_in_destination(
                 depth, K, base_from_camera, object_masks, destination_mask,
                 required=required_count(subgoals, sg_idx), every=goal.every,
@@ -717,15 +736,6 @@ class VLMFailureHandler(FailureHandler):
             arrays["destination_mask"] = np.packbits(destination_mask.astype(bool), axis=-1)
             arrays["destination_mask_shape"] = np.array(destination_mask.shape)
         return verdict, arrays
-
-    def _destination_mask(self, image: np.ndarray, phrase: str) -> np.ndarray | None:
-        """SAM3's best mask of *phrase*, ``None`` when it has no detection (422)."""
-        try:
-            return self._geom_client.detect_and_segment(image, phrase)[0]
-        except requests.HTTPError as e:
-            if e.response.status_code == 422:
-                return None
-            raise
 
     @staticmethod
     def _save_geom(state: Any, arrays: dict) -> None:
