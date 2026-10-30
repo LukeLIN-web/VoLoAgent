@@ -426,7 +426,8 @@ class VLMFailureHandler(FailureHandler):
         (``GraspClient`` perception server) and judges from scene depth whether
         the object is in the destination; the verdict goes into the
         ``vlm_detect`` event as ``geom`` and its arrays into
-        ``<episode log>/geom/<step>.npz``.  ``"veto"`` also turns a VLM
+        ``<episode log>/geom/<step>.npz`` (the opening frame's in
+        ``geom/start.npz``).  ``"veto"`` also turns a VLM
         ``next`` into ``continue`` when the verdict is ``not_in``, for
         ``GEOM_VETO_PATIENCE_STEPS`` from the subgoal's first veto.  Instances
         not located now count as placed only when the destination is a
@@ -503,9 +504,15 @@ class VLMFailureHandler(FailureHandler):
             self._geom_seen = {}
             self._geom_first_veto = {}
             if self._geom_start is not None:
-                plane = support_plane(*self._geom_start[1:])
+                image, depth, K, base_from_camera = self._geom_start
+                plane = support_plane(depth, K, base_from_camera)
                 if plane is not None:
                     self._geom_planes.append(plane)
+                self._save_geom(state, {
+                    "image": image, "depth": depth, "K": K,
+                    "base_from_camera": base_from_camera,
+                    "plane": np.array(np.nan if plane is None else plane),
+                }, name="start")
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
@@ -756,12 +763,14 @@ class VLMFailureHandler(FailureHandler):
         return verdict, arrays
 
     @staticmethod
-    def _save_geom(state: Any, arrays: dict) -> None:
-        """Write *arrays* to ``<episode log>/geom/<episode_step:06d>.npz``."""
+    def _save_geom(state: Any, arrays: dict, name: str | None = None) -> None:
+        """Write *arrays* to ``<episode log>/geom/<name>.npz``, by default
+        named by ``episode_step`` (``%06d``)."""
         log_dir = getattr(state, "episode_log_dir", None)
         if not log_dir:
             return
-        path = os.path.join(log_dir, "geom", f"{state.episode_step:06d}.npz")
+        name = name or f"{state.episode_step:06d}"
+        path = os.path.join(log_dir, "geom", f"{name}.npz")
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             np.savez_compressed(path, **arrays)

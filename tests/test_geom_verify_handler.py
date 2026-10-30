@@ -284,7 +284,7 @@ def test_no_depth_is_unknown_without_segmenting(tmp_path, depth):
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "unknown" and event["geom"]["vetoed"] is False
     assert sam3.calls == []
-    assert not (tmp_path / "geom").exists()
+    assert not list(tmp_path.glob(f"geom/{state.episode_step:06d}.npz"))  # no check's arrays
 
 
 def test_arrays_are_saved_per_check(tmp_path):
@@ -305,6 +305,16 @@ def test_arrays_are_saved_per_check(tmp_path):
         assert tuple(saved["object_masks_shape"]) == (1, *depth.shape)
         assert json.loads(str(saved["verdict"])) == event["geom"]
         assert str(saved["subgoal"]) == _ON_THE_PLATE
+
+
+def test_the_opening_frame_is_saved(tmp_path):
+    obs = _obs([_PLATE, _BESIDE_PLATE])
+    handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
+    handler.on_episode_start(obs, state)
+    with np.load(tmp_path / "geom" / "start.npz") as saved:
+        np.testing.assert_array_equal(saved["image"], obs["observation/exterior_image_1_left_raw"])
+        np.testing.assert_array_equal(saved["depth"], obs["observation/depth_external"])
+        assert float(saved["plane"]) == pytest.approx(0.0, abs=0.005)
 
 
 def test_opening_frame_is_segmented_once_per_phrase():
