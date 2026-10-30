@@ -239,23 +239,40 @@ def test_repeats_parts_and_faint_detections_are_not_instances():
     assert event["geom"]["status"] == "not_in" and event["geom"]["vetoed"] is True
 
 
-def test_the_support_is_the_median_of_the_episodes_estimates(monkeypatch, tmp_path):
+def test_the_support_is_the_median_of_the_checked_frames_estimates(monkeypatch, tmp_path):
     """With the arm hiding most of the table, a frame's own estimate lands on a raised surface
     (0.04 m, which would put the cube's points in the support band).  The support is the median
-    of the episode's estimates, the opening frame's included, as LADDER's Scene.support_z takes
-    it, so the cube is still located beside the plate."""
-    estimates = iter([0.0, 0.0, 0.04])
+    of the checked frames' estimates, as LADDER's Scene.support_z takes it, so the cube is still
+    located beside the plate; the opening frame's estimate (0.03) is not among them."""
+    estimates = iter([0.03, 0.0, 0.0, 0.04])
     monkeypatch.setattr(vlm_handler, "support_plane", lambda *frame: next(estimates))
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
     handler.on_episode_start(obs, state)
-    _check(handler, state, obs)
+    for _ in range(2):
+        _check(handler, state, obs)
     _, event = _check(handler, state, obs)
     assert event["geom"]["status"] == "not_in", event["geom"]["reason"]
     assert "support at z 0.000 m" in event["geom"]["reason"]
     with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
         assert saved["planes"].tolist() == [0.0, 0.0, 0.04]
         assert float(saved["support"]) == 0.0
+
+
+def test_the_opening_frame_is_measured_against_its_own_support(tmp_path):
+    """RoboLab's reset observation renders the table 1.45 cm below every later frame (here: its
+    camera pose is 1.45 cm low).  Measured against its own support, the cube's height is its own,
+    and the frame does not pull the checked frames' support down."""
+    start = _obs([_PLATE, _BESIDE_PLATE])
+    start["observation/camera_extrinsic"][11] -= 0.0145
+    handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
+    handler.on_episode_start(start, state)
+    _check(handler, state, _obs([_PLATE, _BESIDE_PLATE]))
+    with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
+        assert float(saved["object_height"]) == pytest.approx(_CUBE_HEIGHT, abs=0.003)
+        assert len(saved["planes"]) == 1 and float(saved["support"]) == pytest.approx(0.0, abs=0.003)
+    with np.load(tmp_path / "geom" / "start.npz") as saved:
+        assert float(saved["plane"]) == pytest.approx(-0.0145, abs=0.003)
 
 
 def test_sam3_failure_is_unknown_and_not_raised():

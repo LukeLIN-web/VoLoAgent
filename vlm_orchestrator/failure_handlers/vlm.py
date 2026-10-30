@@ -483,9 +483,9 @@ class VLMFailureHandler(FailureHandler):
         # produce the same wall-clock check frequency.
         self._step_at_last_check: int = 0
         # Geometric re-check, per episode: the opening frame (``_geom_frame``),
-        # every frame's support plane estimate (z, m; the support is their
-        # median), and, per object phrase, the most instances located in any
-        # frame and the tallest of them above the support (m).
+        # every checked frame's support plane estimate (z, m; the support is
+        # their median), and, per object phrase, the most instances located in
+        # any frame and the tallest of them above the support (m).
         self._geom_start: tuple[np.ndarray, ...] | None = None
         self._geom_planes: list[float] = []
         self._geom_seen: dict[str, tuple[int, float]] = {}
@@ -506,8 +506,6 @@ class VLMFailureHandler(FailureHandler):
             if self._geom_start is not None:
                 image, depth, K, base_from_camera = self._geom_start
                 plane = support_plane(depth, K, base_from_camera)
-                if plane is not None:
-                    self._geom_planes.append(plane)
                 self._save_geom(state, {
                     "image": image, "depth": depth, "K": K,
                     "base_from_camera": base_from_camera,
@@ -684,10 +682,12 @@ class VLMFailureHandler(FailureHandler):
         """Whether subgoal *sg_idx*'s object is in its destination, from SAM3
         masks on the scene depth.
 
-        The support is the median of this and earlier frames' support plane
-        estimates.  The object phrase's instance count (``seen``) and height
-        (``object_height``) come from the opening frame, segmented the first
-        time the phrase comes up; the count grows with every frame judged.  Also
+        The support is the median of this and earlier checked frames' support
+        plane estimates.  The object phrase's instance count (``seen``) and
+        height (``object_height``) come from the opening frame, segmented the
+        first time the phrase comes up and measured against its own support
+        estimate: RoboLab's reset observation renders the table 1.45 cm below
+        every later frame.  The count grows with every frame judged.  Also
         returns, when the verdict was judged from masks, the arrays it was
         judged from (packed for ``geom/<step>.npz``).
         """
@@ -717,7 +717,6 @@ class VLMFailureHandler(FailureHandler):
                         start_image, phrase,
                     )),
                     destination_mask=None, required=1, every=False,
-                    support=support,
                 )
                 self._geom_seen[phrase] = (opening.n_located, opening.height)
             seen, object_height = self._geom_seen.get(phrase, (0, 0.0))

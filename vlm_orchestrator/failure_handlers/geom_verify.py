@@ -16,7 +16,7 @@ as PSP-Agent measures a held object where it was located before the pick.
 
 Perception follows LADDER's PSP-Agent harness (``perception/scene.py``,
 ``perception/fitting.py``, ``tools/geometry.py``), with masks in place of its VLM boxes: the
-support plane is the median of the episode's per-frame estimates (``Scene.support_z``), and a
+support plane is the median of the checked frames' estimates (``Scene.support_z``), and a
 phrase's instances are SAM3's detections of it as SAM3 itself lists instances
 (:func:`sam3_instances`).
 """
