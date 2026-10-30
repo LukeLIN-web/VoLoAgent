@@ -426,8 +426,10 @@ class VLMFailureHandler(FailureHandler):
         (``GraspClient`` perception server) and judges from scene depth whether
         the object is in the destination; the verdict goes into the
         ``vlm_detect`` event as ``geom`` and its arrays into
-        ``<episode log>/geom/<step>.npz`` (the opening frame's in
-        ``geom/start.npz``).  ``"veto"`` also turns a VLM
+        ``<episode log>/geom/<step>.npz``.  The opening frame is the first the
+        handler steps on after the env has moved (RoboLab's reset observation
+        shows its default scene, not the episode's placement), saved to
+        ``geom/start.npz``.  ``"veto"`` also turns a VLM
         ``next`` into ``continue`` when the verdict is ``not_in``, for
         ``GEOM_VETO_PATIENCE_STEPS`` from the subgoal's first veto.  Instances
         not located now count as placed only when the destination is a
@@ -482,10 +484,12 @@ class VLMFailureHandler(FailureHandler):
         # ``state.episode_step`` so that VLA chunks of different sizes
         # produce the same wall-clock check frequency.
         self._step_at_last_check: int = 0
-        # Geometric re-check, per episode: the opening frame (``_geom_frame``),
-        # every checked frame's support plane estimate (z, m; the support is
-        # their median), and, per object phrase, the most instances located in
-        # any frame and the tallest of them above the support (m).
+        # Geometric re-check, per episode: whether the opening frame is still
+        # to be taken, the opening frame (``_geom_frame``), every frame's
+        # support plane estimate (z, m; the support is their median), and, per
+        # object phrase, the most instances located in any frame and the
+        # tallest of them above the support (m).
+        self._geom_start_pending = False
         self._geom_start: tuple[np.ndarray, ...] | None = None
         self._geom_planes: list[float] = []
         self._geom_seen: dict[str, tuple[int, float]] = {}
@@ -499,18 +503,11 @@ class VLMFailureHandler(FailureHandler):
     def on_episode_start(self, obs: dict, state: Any) -> None:
         self._step_at_last_check = state.episode_step
         if self._geom_verify != "off":
-            self._geom_start = _geom_frame(obs)
+            self._geom_start_pending = True
+            self._geom_start = None
             self._geom_planes = []
             self._geom_seen = {}
             self._geom_first_veto = {}
-            if self._geom_start is not None:
-                image, depth, K, base_from_camera = self._geom_start
-                plane = support_plane(depth, K, base_from_camera)
-                self._save_geom(state, {
-                    "image": image, "depth": depth, "K": K,
-                    "base_from_camera": base_from_camera,
-                    "plane": np.array(np.nan if plane is None else plane),
-                }, name="start")
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
@@ -524,6 +521,10 @@ class VLMFailureHandler(FailureHandler):
 
         Returns ``None`` if it's not time to check yet.
         """
+        if self._geom_start_pending:  # the episode's first step after its reset
+            self._geom_start_pending = False
+            self._take_opening_frame(obs, state)
+
         # Not time to check yet
         if (state.episode_step - self._step_at_last_check
                 < self._check_interval):
@@ -676,20 +677,35 @@ class VLMFailureHandler(FailureHandler):
     # Geometric re-check
     # ------------------------------------------------------------------
 
+    def _take_opening_frame(self, obs: dict, state: Any) -> None:
+        """Keep *obs* as the episode's opening frame, its support plane
+        estimate among the episode's, and save it to ``geom/start.npz``."""
+        self._geom_start = _geom_frame(obs)
+        if self._geom_start is None:
+            return
+        image, depth, K, base_from_camera = self._geom_start
+        plane = support_plane(depth, K, base_from_camera)
+        if plane is not None:
+            self._geom_planes.append(plane)
+        self._save_geom(state, {
+            "image": image, "depth": depth, "K": K,
+            "base_from_camera": base_from_camera,
+            "plane": np.array(np.nan if plane is None else plane),
+        }, name="start")
+
     def _geom_verdict(
         self, obs: dict, subgoals: list[str], sg_idx: int,
     ) -> tuple[GeomVerdict, dict | None]:
         """Whether subgoal *sg_idx*'s object is in its destination, from SAM3
         masks on the scene depth.
 
-        The support is the median of this and earlier checked frames' support
-        plane estimates.  The object phrase's instance count (``seen``) and
-        height (``object_height``) come from the opening frame, segmented the
-        first time the phrase comes up and measured against its own support
-        estimate: RoboLab's reset observation renders the table 1.45 cm below
-        every later frame.  The count grows with every frame judged.  Also
-        returns, when the verdict was judged from masks, the arrays it was
-        judged from (packed for ``geom/<step>.npz``).
+        The support is the median of the opening frame's, this and earlier
+        checked frames' support plane estimates.  The object phrase's instance
+        count (``seen``) and height (``object_height``) come from the opening
+        frame, segmented the first time the phrase comes up; the count grows
+        with every frame judged.  Also returns, when the verdict was judged
+        from masks, the arrays it was judged from (packed for
+        ``geom/<step>.npz``).
         """
         frame = _geom_frame(obs)
         if frame is None:
@@ -717,6 +733,7 @@ class VLMFailureHandler(FailureHandler):
                         start_image, phrase,
                     )),
                     destination_mask=None, required=1, every=False,
+                    support=support,
                 )
                 self._geom_seen[phrase] = (opening.n_located, opening.height)
             seen, object_height = self._geom_seen.get(phrase, (0, 0.0))

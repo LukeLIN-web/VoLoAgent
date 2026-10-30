@@ -92,7 +92,7 @@ def _obs(boxes: list, gripper: float = 0.0, scale: int = 1) -> dict:
 
 
 def _handler(geom_verify: str, sam3: _Sam3) -> VLMFailureHandler:
-    """A handler checking every step, whose VLM always says complete / next."""
+    """A handler checking every 2nd step, whose VLM always says complete / next."""
     handler = VLMFailureHandler(
         vlm_call_fn=lambda system_prompt, user_content: _NEXT,
         image_builder_fn=lambda text, init_img, cur_img, extra, **kw: [
@@ -100,7 +100,7 @@ def _handler(geom_verify: str, sam3: _Sam3) -> VLMFailureHandler:
         ],
         get_vlm_image_fn=lambda obs: obs["observation/exterior_image_1_left_raw"],
         get_extra_images_fn=lambda obs: None,
-        check_interval=1,
+        check_interval=2,
         recovery_mode="replan",
         geom_verify=geom_verify,
     )
@@ -115,8 +115,22 @@ def _state(subgoal: str, log_dir: str | None = None) -> _FakeState:
     return state
 
 
+# RoboLab's reset observation shows its default scene, not the episode's placement: here the
+# cube floats over the plate.
+_RESET = _obs([_PLATE, _ABOVE_PLATE])
+
+
+def _start(handler: VLMFailureHandler, state: _FakeState, opening: dict) -> None:
+    """Start an episode on ``_RESET``; its first step, not a check, sees *opening*."""
+    handler.on_episode_start(_RESET, state)
+    state.tick()
+    assert handler.step(opening, state) is None
+
+
 def _check(handler: VLMFailureHandler, state: _FakeState, obs: dict):
-    """One check on *obs*: the handler's result and the ``vlm_detect`` event it logged."""
+    """One check on *obs*, 2 steps on: the handler's result and the ``vlm_detect`` event it
+    logged."""
+    state.tick()
     state.tick()
     result = handler.step(obs, state)
     event = state.log_entries[-1]
@@ -127,7 +141,7 @@ def _check(handler: VLMFailureHandler, state: _FakeState, obs: dict):
 def test_veto_turns_next_into_continue_when_the_cube_is_beside_the_plate():
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result is None  # in_progress / continue: nothing for the strategy to act on
     assert event["action"] == ACTION_NEXT  # the VLM's own call is what the event records
@@ -138,7 +152,7 @@ def test_veto_turns_next_into_continue_when_the_cube_is_beside_the_plate():
 def test_shadow_keeps_next_when_the_cube_is_beside_the_plate():
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("shadow", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "not_in", event["geom"]["reason"]
@@ -148,7 +162,7 @@ def test_shadow_keeps_next_when_the_cube_is_beside_the_plate():
 def test_cube_on_the_plate_is_not_vetoed():
     obs = _obs([_PLATE, _ON_PLATE], scale=2)  # masks at twice the depth's resolution
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "in", event["geom"]["reason"]
@@ -165,7 +179,7 @@ def test_cube_over_the_plate_is_held_only_with_the_gripper_closed(gripper, statu
     if gripper is None:
         del obs["observation/gripper_position"]
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     _, event = _check(handler, state, obs)
     assert event["geom"]["status"] == status, event["geom"]["reason"]
     assert event["geom"]["vetoed"] is (status == "not_in")
@@ -181,7 +195,7 @@ def test_cube_hidden_in_the_bin_is_counted_against_the_opening_frame(opening_fra
     now = _obs([*_DEEP_BIN, _IN_BIN, _BESIDE_PLATE])
     handler = _handler("veto", _Sam3(_BIN_PHRASES))
     state = _state("Place the cube in the grey bin")
-    handler.on_episode_start(start if opening_frame else {}, state)
+    _start(handler, state, start if opening_frame else {})
     _, event = _check(handler, state, now)
     assert event["geom"]["seen"] == seen, event["geom"]["reason"]
     assert event["geom"]["n_located"] == 1
@@ -196,7 +210,7 @@ def test_only_cube_hidden_in_the_bin_is_counted_by_the_opening_frames_height(gri
     hides it: with the gripper open it is in; closed, the gripper may hold it, so unknown."""
     handler = _handler("veto", _Sam3(_BIN_PHRASES))
     state = _state("Place the cube in the grey bin")
-    handler.on_episode_start(_obs([*_DEEP_BIN, _cube(0.35, 0.42, 0.0)]), state)
+    _start(handler, state, _obs([*_DEEP_BIN, _cube(0.35, 0.42, 0.0)]))
     result, event = _check(handler, state, _obs([*_DEEP_BIN, _IN_BIN], gripper=gripper))
     assert event["geom"]["status"] == status, event["geom"]["reason"]
     assert (event["geom"]["seen"], event["geom"]["n_located"]) == (1, 0)
@@ -208,7 +222,7 @@ def test_a_held_cube_does_not_change_the_object_height(tmp_path):
     """Held 0.10 m up, the cube's box reads 0.15 m above the table; the object's height stays
     the opening frame's, so a bin is not made to look shallower than the cube."""
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(_obs([_PLATE, _BESIDE_PLATE]), state)
+    _start(handler, state, _obs([_PLATE, _BESIDE_PLATE]))
     _, held = _check(handler, state, _obs([_PLATE, _cube(0.5, 0.42, 0.10)], gripper=1.0))
     assert held["geom"]["height"] == pytest.approx(_CUBE_HEIGHT + 0.10, abs=0.01)
     _check(handler, state, _obs([_PLATE, _BESIDE_PLATE]))
@@ -221,7 +235,7 @@ def test_cube_located_nowhere_by_the_plate_is_unknown_and_not_vetoed():
     say).  The plate hides nothing, so the cube is not counted placed: unknown, and the VLM's
     next stands."""
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(_obs([_PLATE, _BESIDE_PLATE]), state)
+    _start(handler, state, _obs([_PLATE, _BESIDE_PLATE]))
     result, event = _check(handler, state, _obs([_PLATE]))
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "unknown", event["geom"]["reason"]
@@ -233,24 +247,23 @@ def test_cube_located_nowhere_by_the_plate_is_unknown_and_not_vetoed():
 def test_repeats_parts_and_faint_detections_are_not_instances():
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _NoisySam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     _, event = _check(handler, state, obs)
     assert (event["geom"]["seen"], event["geom"]["n_located"]) == (1, 1), event["geom"]["reason"]
     assert event["geom"]["status"] == "not_in" and event["geom"]["vetoed"] is True
 
 
-def test_the_support_is_the_median_of_the_checked_frames_estimates(monkeypatch, tmp_path):
+def test_the_support_is_the_median_of_the_episodes_estimates(monkeypatch, tmp_path):
     """With the arm hiding most of the table, a frame's own estimate lands on a raised surface
     (0.04 m, which would put the cube's points in the support band).  The support is the median
-    of the checked frames' estimates, as LADDER's Scene.support_z takes it, so the cube is still
-    located beside the plate; the opening frame's estimate (0.03) is not among them."""
-    estimates = iter([0.03, 0.0, 0.0, 0.04])
+    of the opening and checked frames' estimates, as LADDER's Scene.support_z takes it, so the
+    cube is still located beside the plate."""
+    estimates = iter([0.0, 0.0, 0.04])
     monkeypatch.setattr(vlm_handler, "support_plane", lambda *frame: next(estimates))
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(obs, state)
-    for _ in range(2):
-        _check(handler, state, obs)
+    _start(handler, state, obs)
+    _check(handler, state, obs)
     _, event = _check(handler, state, obs)
     assert event["geom"]["status"] == "not_in", event["geom"]["reason"]
     assert "support at z 0.000 m" in event["geom"]["reason"]
@@ -259,26 +272,10 @@ def test_the_support_is_the_median_of_the_checked_frames_estimates(monkeypatch, 
         assert float(saved["support"]) == 0.0
 
 
-def test_the_opening_frame_is_measured_against_its_own_support(tmp_path):
-    """RoboLab's reset observation renders the table 1.45 cm below every later frame (here: its
-    camera pose is 1.45 cm low).  Measured against its own support, the cube's height is its own,
-    and the frame does not pull the checked frames' support down."""
-    start = _obs([_PLATE, _BESIDE_PLATE])
-    start["observation/camera_extrinsic"][11] -= 0.0145
-    handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(start, state)
-    _check(handler, state, _obs([_PLATE, _BESIDE_PLATE]))
-    with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
-        assert float(saved["object_height"]) == pytest.approx(_CUBE_HEIGHT, abs=0.003)
-        assert len(saved["planes"]) == 1 and float(saved["support"]) == pytest.approx(0.0, abs=0.003)
-    with np.load(tmp_path / "geom" / "start.npz") as saved:
-        assert float(saved["plane"]) == pytest.approx(-0.0145, abs=0.003)
-
-
 def test_sam3_failure_is_unknown_and_not_raised():
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES, fail=True)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "unknown"
@@ -296,7 +293,7 @@ def test_no_depth_is_unknown_without_segmenting(tmp_path, depth):
         obs["observation/depth_external"][:] = depth
     sam3 = _Sam3(_PLATE_PHRASES)
     handler, state = _handler("veto", sam3), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "unknown" and event["geom"]["vetoed"] is False
@@ -310,7 +307,7 @@ def test_arrays_are_saved_per_check(tmp_path):
     depth[0, :8] = np.finfo(np.float32).max
     depth[1, :8] = np.nan
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     _, event = _check(handler, state, obs)
     with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
         assert saved["depth"].dtype == np.float32
@@ -324,14 +321,21 @@ def test_arrays_are_saved_per_check(tmp_path):
         assert str(saved["subgoal"]) == _ON_THE_PLATE
 
 
-def test_the_opening_frame_is_saved(tmp_path):
-    obs = _obs([_PLATE, _BESIDE_PLATE])
+def test_the_opening_frame_is_the_first_after_the_reset(tmp_path):
+    """Not ``_RESET`` (there the cube floats 0.10 m over the plate): the opening frame is the
+    first the handler steps on after it, saved to geom/start.npz, and the cube's height is its
+    height there."""
+    opening = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE, str(tmp_path))
-    handler.on_episode_start(obs, state)
+    _start(handler, state, opening)
     with np.load(tmp_path / "geom" / "start.npz") as saved:
-        np.testing.assert_array_equal(saved["image"], obs["observation/exterior_image_1_left_raw"])
-        np.testing.assert_array_equal(saved["depth"], obs["observation/depth_external"])
+        np.testing.assert_array_equal(saved["image"], opening["observation/exterior_image_1_left_raw"])
+        np.testing.assert_array_equal(saved["depth"], opening["observation/depth_external"])
         assert float(saved["plane"]) == pytest.approx(0.0, abs=0.005)
+    _check(handler, state, _obs([_PLATE, _ON_PLATE]))
+    with np.load(tmp_path / "geom" / f"{state.episode_step:06d}.npz") as saved:
+        assert float(saved["object_height"]) == pytest.approx(_CUBE_HEIGHT, abs=0.003)
+        assert len(saved["planes"]) == 2
 
 
 def test_opening_frame_is_segmented_once_per_phrase():
@@ -339,7 +343,7 @@ def test_opening_frame_is_segmented_once_per_phrase():
     now = _obs([_PLATE, _ON_PLATE])
     sam3 = _Sam3(_PLATE_PHRASES)
     handler, state = _handler("veto", sam3), _state(_ON_THE_PLATE)
-    handler.on_episode_start(start, state)
+    _start(handler, state, start)
     for _ in range(2):
         _check(handler, state, now)
     start_image = start["observation/exterior_image_1_left_raw"]
@@ -352,16 +356,16 @@ def test_vetoes_stop_after_the_patience_from_the_first():
     GEOM_VETO_PATIENCE_STEPS after the first veto, then the VLM's next stands."""
     obs = _obs([_PLATE, _BESIDE_PLATE])
     handler, state = _handler("veto", _Sam3(_PLATE_PHRASES)), _state(_ON_THE_PLATE)
-    handler.on_episode_start(obs, state)
+    _start(handler, state, obs)
     result, event = _check(handler, state, obs)
     assert result is None and event["geom"]["vetoed"] is True
-    state.episode_step += GEOM_VETO_PATIENCE_STEPS - 2  # the next check is 1 step short of it
+    state.episode_step += GEOM_VETO_PATIENCE_STEPS - 3  # the next check is 1 step short of it
     result, event = _check(handler, state, obs)
     assert result is None and event["geom"]["vetoed"] is True
     result, event = _check(handler, state, obs)
     assert result.action == ACTION_NEXT
     assert event["geom"]["status"] == "not_in" and event["geom"]["vetoed"] is False
-    handler.on_episode_start(obs, state)  # a new episode starts the patience afresh
+    _start(handler, state, obs)  # a new episode starts the patience afresh
     result, event = _check(handler, state, obs)
     assert result is None and event["geom"]["vetoed"] is True
 
