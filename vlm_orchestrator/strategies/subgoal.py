@@ -163,6 +163,8 @@ class SubgoalStrategy(SubgoalBaseStrategy):
         stack_mode_enabled: bool = False,
         master_points: bool = False,
         place_target: str = "pixel",
+        grasp_noun_phrase: bool = False,
+        pick_with_grasp_tool: bool = False,
     ):
         super().__init__(
             ctx,
@@ -182,6 +184,8 @@ class SubgoalStrategy(SubgoalBaseStrategy):
             stack_mode_enabled=stack_mode_enabled,
             master_points=master_points,
             place_target=place_target,
+            grasp_noun_phrase=grasp_noun_phrase,
+            pick_with_grasp_tool=pick_with_grasp_tool,
         )
         self.config = config
 

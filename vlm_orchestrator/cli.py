@@ -471,6 +471,25 @@ def main():
     )
 
     parser.add_argument(
+        "--grasp-noun-phrase",
+        action="store_true",
+        help="--mode subgoal with --grasp-seg-mode sam3: the grasp tool asks "
+             "SAM3 for the target's noun phrase instead of the phrase as given "
+             "(leading grasp verb and determiner dropped, cut at the first comma "
+             "or relation word: 'the yellow lemon on the table near the grey "
+             "bin' -> 'yellow lemon').",
+    )
+
+    parser.add_argument(
+        "--pick-with-grasp-tool",
+        action="store_true",
+        help="--mode subgoal: every subgoal that names a grasp verb starts with "
+             "the grasp tool picking the subgoal's object (when the gripper is "
+             "open and no grasp is running); the VLA then runs the subgoal as "
+             "usual. These picks do not count against --max-grasp-attempts.",
+    )
+
+    parser.add_argument(
         "--grasp-topdown-threshold",
         type=float,
         default=0.85,
@@ -801,6 +820,13 @@ def main():
             "--mode grasp_probe grasps scene objects by name and needs "
             "--grasp-seg-mode gt_sim."
         )
+    if args.grasp_noun_phrase and (
+            args.mode != "subgoal" or args.grasp_seg_mode != "sam3"):
+        parser.error(
+            "--grasp-noun-phrase needs --mode subgoal and --grasp-seg-mode sam3."
+        )
+    if args.pick_with_grasp_tool and args.mode != "subgoal":
+        parser.error("--pick-with-grasp-tool needs --mode subgoal.")
 
     # Auto-default --recovery-mode based on --failure-monitor
     if args.recovery_mode is None:
@@ -904,6 +930,7 @@ def _preflight_motion_planner(args):
     recovery = getattr(args, "recovery_mode", None)
     uses_grasp = mode in _GRASP_TOOL_MODES and (
         mode in _TOOL_CHAIN_MODES or recovery in _GRASP_RECOVERY_MODES
+        or getattr(args, "pick_with_grasp_tool", False)
     )
     if not uses_grasp:
         return
@@ -1175,6 +1202,8 @@ def _build_strategy(args):
             max_grasp_attempts=getattr(args, "max_grasp_attempts", None),
             motion_planner=getattr(args, "motion_planner", "curobo"),
             stack_mode_enabled=getattr(args, "enable_stack_mode", False),
+            grasp_noun_phrase=args.grasp_noun_phrase,
+            pick_with_grasp_tool=args.pick_with_grasp_tool,
         )
 
     if args.mode == "scene_edit":

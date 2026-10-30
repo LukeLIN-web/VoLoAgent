@@ -437,6 +437,8 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         stack_mode_enabled: bool = False,
         master_points: bool = False,
         place_target: str = "pixel",
+        grasp_noun_phrase: bool = False,
+        pick_with_grasp_tool: bool = False,
     ):
         super().__init__(ctx)
         self.initial_strategy = initial_strategy
@@ -447,6 +449,14 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         self._original_subgoals: list[str] = []
         self._grasp_seg_mode = grasp_seg_mode
         self._grasp_topdown_threshold = grasp_topdown_threshold
+        # The grasp tool's SAM3 call takes the target's noun phrase (CLI
+        # --grasp-noun-phrase).
+        self._grasp_noun_phrase = bool(grasp_noun_phrase)
+        # Each subgoal starts with the grasp tool picking its object (CLI
+        # --pick-with-grasp-tool); ``_pick_step`` is the (episode, step) of
+        # the last pick, so one step starts at most one.
+        self._pick_with_grasp_tool = bool(pick_with_grasp_tool)
+        self._pick_step: tuple[int, int] | None = None
         # Motion-planner kind for grasp/place trajectory segments; built
         # lazily on first use so the linear default carries no import cost.
         self._motion_planner_kind = motion_planner
@@ -955,6 +965,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         # Configure GT detector for the first subgoal
         if state.subgoals:
             self._configure_gt_detector(obs, state, state.subgoals[0])
+            self._pick_subgoal_object(obs, state)
 
         # Apply the decomposed instruction to obs.  _decompose_and_setup
         # sets state.rewritten_instruction but ctx.set_prompt() returns a
@@ -1556,7 +1567,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 # Lazy-create executor if needed
                 if state.grasp_tool_executor is None:
                     from vlm_orchestrator.grasp.tool import GraspToolExecutor
-                    state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled)
+                    state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled, noun_phrase=self._grasp_noun_phrase)
                 # Expose HITL handle so executor can push debug images
                 state._hitl = self._hitl
                 state.grasp_tool_executor.start(
@@ -1813,7 +1824,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                         from vlm_orchestrator.grasp.tool import (
                             GraspToolExecutor,
                         )
-                        state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled)
+                        state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled, noun_phrase=self._grasp_noun_phrase)
                     # Expose HITL handle for debug visualization
                     state._hitl = hitl
                     state.grasp_tool_executor.start(
@@ -3141,6 +3152,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 topdown_threshold=self._grasp_topdown_threshold,
                 motion_planner=self._get_motion_planner(),
                 stack_mode_enabled=self._stack_mode_enabled,
+                noun_phrase=self._grasp_noun_phrase,
             )
 
         if self._hitl is not None:
@@ -3275,7 +3287,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         )
         if state.grasp_tool_executor is None:
             from vlm_orchestrator.grasp.tool import GraspToolExecutor
-            state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled)
+            state.grasp_tool_executor = GraspToolExecutor(seg_mode=self._grasp_seg_mode, env_mode=self._env_mode, use_front_camera=self._use_front_camera, topdown_threshold=self._grasp_topdown_threshold, motion_planner=self._get_motion_planner(), stack_mode_enabled=self._stack_mode_enabled, noun_phrase=self._grasp_noun_phrase)
 
         if self._hitl is not None:
             state._hitl = self._hitl
@@ -3305,6 +3317,62 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
 
         logger.warning("  Grasp tool failed to start")
         return False
+
+    def _pick_subgoal_object(self, obs: dict, state: SessionState) -> None:
+        """``--pick-with-grasp-tool``: the grasp tool picks the current
+        subgoal's object before π0.5 takes the subgoal on.
+
+        Called wherever a subgoal starts.  Picks ``subgoal_pick_target``
+        when the subgoal starts with a grasp verb, the fingers are open (a held object is not dropped for a
+        second pick) and no grasp is running, at most once per step.  The
+        running grasp holds off π0.5 and the checks the way a recovery grasp
+        does (``_tick_grasp_lifecycle``); done or failed, π0.5 then runs the
+        subgoal.  Not counted in ``_grasp_attempts``, so recovery keeps its
+        ``--max-grasp-attempts`` budget.
+        """
+        if not self._pick_with_grasp_tool or state.grasp_tool_active:
+            return
+        from vlm_orchestrator.grasp.tool import (
+            GraspToolExecutor, gripper_is_open, subgoal_pick_target,
+        )
+
+        target = subgoal_pick_target(state.subgoals[state.current_subgoal_idx])
+        step = (state.episode_id, state.episode_step)
+        if target is None or step == self._pick_step or not gripper_is_open(obs):
+            return
+        self._pick_step = step
+        if state.grasp_tool_executor is None:
+            state.grasp_tool_executor = GraspToolExecutor(
+                seg_mode=self._grasp_seg_mode,
+                env_mode=self._env_mode,
+                use_front_camera=self._use_front_camera,
+                topdown_threshold=self._grasp_topdown_threshold,
+                motion_planner=self._get_motion_planner(),
+                stack_mode_enabled=self._stack_mode_enabled,
+                noun_phrase=self._grasp_noun_phrase,
+            )
+        if self._hitl is not None:
+            state._hitl = self._hitl
+        state.grasp_tool_executor.start(
+            target_object=target, obs=obs, state=state,
+        )
+        state.grasp_tool_active = state.grasp_tool_executor.is_active
+        state.grasp_tool_phase = state.grasp_tool_executor.phase.value
+        state.grasp_tool_target = target
+        if state.grasp_tool_active:
+            # Drop the client's cached VLA chunk so the grasp's actions are
+            # served from the next inference on.
+            state.flush_actions = True
+        logger.info(
+            f"  🤏 PICK WITH GRASP TOOL [subgoal {state.current_subgoal_idx + 1}]: "
+            f"'{target}' ({'started' if state.grasp_tool_active else 'did not start'})"
+        )
+        state.log({
+            "type": "pick_with_grasp_tool",
+            "target_object": target,
+            "subgoal_idx": state.current_subgoal_idx,
+            "started": state.grasp_tool_active,
+        })
 
     def _replan_or_skip(
         self, obs, state, result,
@@ -3427,6 +3495,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             self._original_subgoals = list(subgoals)
         self._reset_detection_state(obs, state)
         self._configure_gt_detector(obs, state, subgoals[0])
+        self._pick_subgoal_object(obs, state)
 
     # ------------------------------------------------------------------
     # Subgoal advancement
@@ -3444,6 +3513,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             f"{len(state.subgoals)}]: \"{new_sg}\""
         )
         self._on_subgoal_advanced(obs, state, state.current_subgoal_idx)
+        self._pick_subgoal_object(obs, state)
 
     # ------------------------------------------------------------------
     # Recycling
@@ -3563,6 +3633,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
                 self._on_subgoal_advanced(
                     obs, state, state.current_subgoal_idx,
                 )
+                self._pick_subgoal_object(obs, state)
             print(f"[RECYCLE] ✅ new subgoals: {data.get('subgoals')}")
             return result
         except (ValueError, KeyError) as e:

@@ -58,8 +58,69 @@ from vlm_orchestrator.vlm import master_point
 from vlm_orchestrator.perception.gt_segmentation import (
     POINT_SNAP_PX, gt_ids_available, gt_object_at, gt_object_mask, gt_object_under,
 )
+from vlm_orchestrator.strategies.subgoal_base import _GRASP_VERBS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Target noun phrase
+# ---------------------------------------------------------------------------
+
+# Leading words a detector does not need (determiners, quantifiers), and the
+# words (relations, conjunctions) at which the object's own description ends.
+_NOUN_PHRASE_LEADING = frozenset(
+    "the a an each both all every of one two three four five six seven eight "
+    "nine ten".split()
+)
+_NOUN_PHRASE_ENDS = frozenset(
+    "on near in inside into onto at of by beside next under behind with "
+    "from to or and not that which then".split()
+)
+_GRASP_VERB_WORDS = sorted((v.split() for v in _GRASP_VERBS), key=len, reverse=True)
+
+
+def _after_grasp_verb(words: list[str]) -> list[str] | None:
+    """*words* after a leading grasp verb; None when they do not start with one."""
+    for verb in _GRASP_VERB_WORDS:
+        if words[:len(verb)] == verb:
+            return words[len(verb):]
+    return None
+
+
+def target_noun_phrase(text: str) -> str:
+    """The object's noun phrase in a grasp target or a subgoal.
+
+    Lower-cased, without a leading grasp verb, determiners or quantifiers, and
+    cut at the first comma or relation word: "the yellow lemon on the table
+    near the grey bin" -> "yellow lemon", "Pick each lime and place it in the
+    grey bin" -> "lime", "Place each of the four green limes into the grey
+    bin" -> "green limes".  VoLo's grasp(target) names the object by a phrase
+    a detector can ground ("red block"), not by a relational description.
+    Returns *text* when nothing is left.
+    """
+    words = text.lower().split()
+    words = _after_grasp_verb(words) or words
+    while words and words[0] in _NOUN_PHRASE_LEADING:
+        words = words[1:]
+    phrase = []
+    for word in words:
+        head, comma, _ = word.partition(",")
+        if head in _NOUN_PHRASE_ENDS:
+            break
+        if head:
+            phrase.append(head)
+        if comma:
+            break
+    return " ".join(phrase).strip(" .;:") or text
+
+
+def subgoal_pick_target(subgoal: str) -> str | None:
+    """What ``--pick-with-grasp-tool`` picks for *subgoal*: the noun phrase of
+    a subgoal that starts with a grasp verb, else None."""
+    if _after_grasp_verb(subgoal.lower().split()) is None:
+        return None
+    return target_noun_phrase(subgoal)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +156,11 @@ GRIPPER_CLOSE = 1.0
 # LIBERO gripper: -1 = open, +1 = close (OSC_POSE convention)
 LIBERO_GRIPPER_OPEN = -1.0
 LIBERO_GRIPPER_CLOSE = 1.0
+
+# Highest observation/gripper_position (0 open / 1 closed) that counts as
+# open fingers.  RoboLab's DROID gripper reads 0.00 open; closed on a held
+# object it reads 0.16 or more.
+GRIPPER_OPEN_MAX_POS = 0.05
 
 # NOTE: there is no gripper-pos-based grasp verify step any more.
 #
@@ -653,6 +719,11 @@ def _build_obstacle_cloud(pc_world, keep_mask, motion_planner):
     return pts.astype(np.float32)
 
 
+def gripper_is_open(obs: dict) -> bool:
+    """Whether the fingers are open in *obs* (``GRIPPER_OPEN_MAX_POS``)."""
+    return GraspToolExecutor._extract_gripper(obs) <= GRIPPER_OPEN_MAX_POS
+
+
 class GraspToolExecutor:
     """Drives a planned grasp sequence, producing VLA-compatible action chunks.
 
@@ -683,8 +754,12 @@ class GraspToolExecutor:
         topdown_fallback: bool = False,
         point_call: bool = False,
         grasp_candidates: int = 1,
+        noun_phrase: bool = False,
     ):
         self._grasp_client = GraspClient(url=grasp_server_url, single_detection=GraspEnvMode(env_mode) == GraspEnvMode.LIBERO)
+        # SAM3 is asked for target_noun_phrase(target) instead of the target
+        # as given (CLI --grasp-noun-phrase).
+        self._noun_phrase = bool(noun_phrase)
         # The master's point, when this seg mode reads one and the call gave
         # none: asked of the master on its own at perception (master_point).
         self._point_call = bool(point_call)
@@ -1052,9 +1127,15 @@ class GraspToolExecutor:
             elif self._seg_mode == GraspSegMode.SAM3:
                 # ---- SAM3: unified detect + segment in one call ----
                 logger.info(f"  Using SAM3 for '{target_object}'")
+                phrase = target_object
+                if self._noun_phrase:
+                    phrase = target_noun_phrase(target_object)
+                    logger.info(
+                        f"  SAM3 phrase: '{phrase}' (master: '{target_object}')"
+                    )
                 mask, detection_score, bbox = (
                     self._grasp_client.detect_and_segment(
-                        image, target_object,
+                        image, phrase,
                     )
                 )
                 bbox = tuple(bbox)
