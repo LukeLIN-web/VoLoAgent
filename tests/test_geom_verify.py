@@ -75,6 +75,7 @@ _ON_PLATE = _cube(0.5, 0.2, 0.02)
 _BESIDE_PLATE = _cube(0.5, 0.42, 0.0)
 _ABOVE_PLATE = _cube(0.5, 0.2, 0.12)  # 0.10 m above the plate's top
 _IN_BIN = _cube(0.5, 0.2, 0.01)
+_IN_BIN_CORNER = _cube(0.55, 0.25, 0.01)
 
 
 def _render(boxes: list) -> tuple[np.ndarray, np.ndarray]:
@@ -143,13 +144,17 @@ def test_cube_in_bin_below_its_rim_is_in():
     assert (verdict.n_located, verdict.n_in) == (1, 1)
 
 
-def test_a_few_points_seen_through_the_bins_opening_are_not_the_bin():
-    """The bin's mask takes in 3 pixels of the cube inside it, which lie by the middle of the
-    walls' points, nearer it than any wall: the bin is the nearest blob big enough to fit."""
-    depth, ids = _render([*_BIN, _IN_BIN])
-    cube = np.flatnonzero(ids == 5)
-    destination = np.isin(ids, [1, 2, 3, 4])
-    destination.flat[cube[len(cube) // 2 : len(cube) // 2 + 3]] = True
+@pytest.mark.parametrize("half", [1, 2])
+def test_the_floor_seen_through_the_bins_opening_is_not_the_bin(half):
+    """The bin's mask leaves out the cube in it and takes in a patch of floor at its middle
+    (3 × 3 pixels, too few points to fit, or 5 × 5, enough), nearer the middle of the walls'
+    points than any wall: the bin is the largest blob, its walls."""
+    depth, ids = _render([*_BIN, _IN_BIN_CORNER])
+    rows, columns = np.nonzero(ids == 0)
+    near_middle = (np.abs(np.arange(_H)[:, None] - int(np.median(rows))) <= half) & (
+        np.abs(np.arange(_W)[None] - int(np.median(columns))) <= half
+    )
+    destination = np.isin(ids, [1, 2, 3, 4]) | ((ids == 0) & near_middle)
     verdict = verify_in_destination(depth, _K, _BASE_FROM_CAMERA, [ids == 5], destination, 1, False)
     assert verdict.status == "in", verdict.reason
     assert (verdict.n_located, verdict.n_in) == (1, 1)

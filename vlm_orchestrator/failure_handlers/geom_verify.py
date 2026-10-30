@@ -346,21 +346,22 @@ def _object_points(
 
 
 def _blob(points: np.ndarray) -> np.ndarray | None:
-    """The connected blob nearest the points' median xy, of those with at least ``MIN_POINTS``
-    points; ``None`` when there is none.  A bin's walls ring its median, where the nearest
-    points can be a few seen through its opening; LADDER seeds with a point on the surface
-    (the ray through its box's middle), so it does not meet them."""
-    if len(points) < MIN_POINTS:
-        return None
-    seed = np.median(points[:, :2], axis=0)
-    while len(points) >= MIN_POINTS:
-        blob = nearest_blob(points, seed)
-        if len(blob) >= MIN_POINTS:
-            return blob
-        cells = np.floor(points[:, :2] / _BLOB_CELL_M)
-        speck = np.unique(np.floor(blob[:, :2] / _BLOB_CELL_M), axis=0)
-        points = points[~(cells[:, None, :] == speck[None]).all(axis=2).any(axis=1)]
-    return None
+    """The largest of the points' connected blobs (:func:`nearest_blob`'s); ``None`` below
+    ``MIN_POINTS``.  LADDER seeds its blob with the surface point the ray through the object's
+    box hits, taking in a bin's floor and contents with its walls; a mask leaves out what lies in
+    the bin, so the floor seen between the contents falls apart into islands inside the walls,
+    and the bin's middle lands on one of them."""
+    def cell_keys(p: np.ndarray) -> np.ndarray:
+        cells = np.floor(p[:, :2] / _BLOB_CELL_M).astype(np.int64)
+        return cells[:, 0] * (1 << 32) + cells[:, 1]
+
+    largest = points[:0]
+    while len(points) > len(largest):
+        blob = nearest_blob(points, points[0, :2])
+        if len(blob) > len(largest):
+            largest = blob
+        points = points[~np.isin(cell_keys(points), cell_keys(blob))]
+    return largest if len(largest) >= MIN_POINTS else None
 
 
 # From LADDER harness perception/fitting.py (MIT License, (c) 2026 INSAIT).
