@@ -64,6 +64,35 @@ _GEOM_OBS_KEYS = (
     "observation/camera_K",
     "observation/camera_extrinsic",
 )
+# Depth beyond this is no return (the renderer may send float32 max), zeroed as invalid.
+_MAX_DEPTH_M = 100.0
+# [g], 0 open … 1 closed; closed above 0.5, as LADDER's gripper_open_threshold.
+_GRIPPER_KEY = "observation/gripper_position"
+
+
+def _geom_frame(
+    obs: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Copies of *obs*'s scene image, depth (float32; non-finite and beyond
+    ``_MAX_DEPTH_M`` zeroed), K (3×3) and camera→base (4×4); ``None`` when one
+    is missing."""
+    image, depth, K, extrinsic = (obs.get(k) for k in _GEOM_OBS_KEYS)
+    if any(a is None for a in (image, depth, K, extrinsic)):
+        return None
+    depth = np.array(depth, dtype=np.float32)
+    depth[~np.isfinite(depth)] = 0.0
+    depth[depth > _MAX_DEPTH_M] = 0.0
+    return (
+        np.array(image, dtype=np.uint8),
+        depth,
+        np.array(K, dtype=np.float64).reshape(3, 3),
+        np.array(extrinsic, dtype=np.float64).reshape(4, 4),
+    )
+
+
+def _geom_unknown(reason: str) -> GeomVerdict:
+    """A verdict left to the VLM before any mask was judged."""
+    return GeomVerdict("unknown", reason, 0, 0, 0, 0, 0, 0.0)
 
 
 # ======================================================================
@@ -390,7 +419,12 @@ class VLMFailureHandler(FailureHandler):
         the object is in the destination; the verdict goes into the
         ``vlm_detect`` event as ``geom`` and its arrays into
         ``<episode log>/geom/<step>.npz``.  ``"veto"`` also turns a VLM
-        ``next`` into ``continue`` when the verdict is ``not_in``.
+        ``next`` into ``continue`` when the verdict is ``not_in``.  Instances
+        not located now count as placed only when the destination is a
+        container taller than the object and the gripper is open; the
+        instance count is the most located in any frame of the episode, the
+        opening frame included, and the object's height its tallest instance's
+        in the opening frame.
     """
 
     def __init__(
@@ -438,6 +472,11 @@ class VLMFailureHandler(FailureHandler):
         # ``state.episode_step`` so that VLA chunks of different sizes
         # produce the same wall-clock check frequency.
         self._step_at_last_check: int = 0
+        # Geometric re-check, per episode: the opening frame (``_geom_frame``)
+        # and, per object phrase, the most instances located in any frame and
+        # the tallest of them above the support (m).
+        self._geom_start: tuple[np.ndarray, ...] | None = None
+        self._geom_seen: dict[str, tuple[int, float]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -445,6 +484,9 @@ class VLMFailureHandler(FailureHandler):
 
     def on_episode_start(self, obs: dict, state: Any) -> None:
         self._step_at_last_check = state.episode_step
+        if self._geom_verify != "off":
+            self._geom_start = _geom_frame(obs)
+            self._geom_seen = {}
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
@@ -558,9 +600,10 @@ class VLMFailureHandler(FailureHandler):
             geom = verdict.as_log() | {"vetoed": vetoed}
             logger.info(
                 f"  geom verify [{sg_idx + 1}/{total}]: "
-                f"status={verdict.status}, in={verdict.n_in}/{verdict.required}, "
-                f"located={verdict.n_located}{', VETO next' if vetoed else ''} "
-                f"— {verdict.reason}"
+                f"status={verdict.status}, "
+                f"placed={verdict.placed}/{verdict.required}, in={verdict.n_in}, "
+                f"located={verdict.n_located}, seen={verdict.seen}"
+                f"{', VETO next' if vetoed else ''} — {verdict.reason}"
             )
             if arrays is not None:
                 self._save_geom(state, {
@@ -609,43 +652,66 @@ class VLMFailureHandler(FailureHandler):
         """Whether subgoal *sg_idx*'s object is in its destination, from SAM3
         masks on the scene depth.
 
-        Also returns, when the verdict was judged from masks, the arrays it
-        was judged from (packed for ``geom/<step>.npz``).
+        The object phrase's instance count (``seen``) and height
+        (``object_height``) come from the opening frame, segmented the first
+        time the phrase comes up; the count grows with every frame judged.  Also
+        returns, when the verdict was judged from masks, the arrays it was
+        judged from (packed for ``geom/<step>.npz``).
         """
-        image, depth, K, extrinsic = (obs.get(k) for k in _GEOM_OBS_KEYS)
-        if any(a is None for a in (image, depth, K, extrinsic)):
-            return GeomVerdict("unknown", "no scene depth in observation", 0, 0, 0), None
+        frame = _geom_frame(obs)
+        if frame is None:
+            return _geom_unknown("no scene depth in observation"), None
         goal = parse_place_subgoal(subgoals[sg_idx])
         if goal is None:
-            return GeomVerdict("unknown", "subgoal is not a place sentence", 0, 0, 0), None
+            return _geom_unknown("subgoal is not a single place sentence"), None
 
-        image = np.asarray(image, dtype=np.uint8)
-        depth = np.asarray(depth, dtype=np.float32)
-        K = np.asarray(K, dtype=np.float64).reshape(3, 3)
-        base_from_camera = np.asarray(extrinsic, dtype=np.float64).reshape(4, 4)
+        image, depth, K, base_from_camera = frame
+        phrase = goal.object_phrase
+        gripper_closed = float(np.asarray(
+            obs.get(_GRIPPER_KEY, [0.0]),
+        ).reshape(-1)[0]) > 0.5
         try:
+            if phrase not in self._geom_seen and self._geom_start is not None:
+                start_image, start_depth, start_K, start_pose = self._geom_start
+                opening = verify_in_destination(
+                    start_depth, start_K, start_pose,
+                    [m for m, _ in self._geom_client.detect_and_segment_all(
+                        start_image, phrase,
+                    )],
+                    destination_mask=None, required=1, every=False,
+                )
+                self._geom_seen[phrase] = (opening.n_located, opening.height)
+            seen, object_height = self._geom_seen.get(phrase, (0, 0.0))
             object_masks = [
                 m for m, _ in self._geom_client.detect_and_segment_all(
-                    image, goal.object_phrase,
+                    image, phrase,
                 )
             ]
             destination_mask = self._destination_mask(image, goal.destination_phrase)
             verdict = verify_in_destination(
                 depth, K, base_from_camera, object_masks, destination_mask,
                 required=required_count(subgoals, sg_idx), every=goal.every,
+                seen=seen, object_height=object_height,
+                gripper_closed=gripper_closed,
             )
         except Exception as e:
             logger.warning(f"  geom verify failed ({e}); verdict unknown")
-            return GeomVerdict("unknown", f"geom verify failed: {e}", 0, 0, 0), None
+            return _geom_unknown(f"geom verify failed: {e}"), None
+        self._geom_seen[phrase] = (
+            max(seen, verdict.n_located), object_height,
+        )
 
         stacked = (np.stack(object_masks).astype(bool) if object_masks
                    else np.zeros((0, *image.shape[:2]), dtype=bool))
         arrays = {
-            "depth": depth.astype(np.float16),
+            "depth": depth,
             "object_masks": np.packbits(stacked, axis=-1),
             "object_masks_shape": np.array(stacked.shape),
             "K": K,
             "base_from_camera": base_from_camera,
+            "gripper_closed": np.array(gripper_closed),
+            "seen": np.array(seen),
+            "object_height": np.array(object_height),
         }
         if destination_mask is not None:
             arrays["destination_mask"] = np.packbits(destination_mask.astype(bool), axis=-1)
