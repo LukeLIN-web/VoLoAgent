@@ -11,7 +11,9 @@ decomposition format, check logic, and any per-frame processing.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import pathlib
 import time
 from typing import TYPE_CHECKING
 
@@ -153,6 +155,19 @@ def _make_dummy_classification(result: "HandlerResult"):
         features=SignalFeatures(),
     )
 
+
+# Claude-written master prompts (agent-harness todo "Claude 读训练任务的日志给主控写提示和 guideline"): each of the
+# three system prompts the Full loop sends (decompose, monitor, remaining subgoals) is swapped for the file written for
+# it, keyed by the sha1 of the prompt it replaces; any other system prompt passes through unchanged.
+_CLAUDE_PROMPTS = pathlib.Path(__file__).with_name("claude_written_prompts")
+_PROMPT_SWAP = {
+    sha: (_CLAUDE_PROMPTS / name).read_text(encoding="utf-8")
+    for sha, name in (
+        ("ec7b9481c2a057a39831756955238e8a65521d25", "decompose.txt"),
+        ("66c012d36b8845688494ada3bde9d59a9ba8bf7b", "monitor.txt"),
+        ("35aa18d2ebb7e4311f799e7eab6bf79dffc5a1e1", "donecheck.txt"),
+    )
+}
 
 # HITL: push a new camera frame to the browser every N process() calls.
 # Each process() call corresponds to one action chunk (~8 env steps).
@@ -657,6 +672,9 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         for calls that need more room (e.g. recycle with many subgoals).
         """
         from vlm_orchestrator.vlm import chat_create
+        system_prompt = _PROMPT_SWAP.get(
+            hashlib.sha1(system_prompt.encode("utf-8")).hexdigest(), system_prompt
+        )
         response = chat_create(
             self.client,
             model=self.config.vlm_model,
