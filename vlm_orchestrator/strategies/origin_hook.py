@@ -10,9 +10,12 @@ when the subgoal index or the prompt changes, and once a pick call whose
 grounding names a destination, its prompt not a pick-only subgoal (``PICK_ONLY``),
 has raised the end effector ``PICK_DONE_LIFT_M`` above where the gripper closed,
 where a demonstration's pick call gives way to its place call. The call's line
-names the first of these as its ``cause``. At its start:
+names the first of these as its ``cause``. Holding is the gripper reading closed
+(``> GRIPPER_CLOSED``), or, when the request carries ``HOLDING_KEY`` (agent-harness
+robolab_run.py ``--holding-truth``), that simulator reading; a pick call turns into
+a place call only while holding. At its start:
 
-- the skill is ``place`` when the gripper reads closed (``> GRIPPER_CLOSED``), else ``pick``;
+- the skill is ``place`` when holding, else ``pick``;
 - the master names the target and the destination on the front camera's raw frame
   (:func:`~vlm_orchestrator.vlm.api.ask_reference_targets`); pick uses the target,
   place the destination (the target when there is none);
@@ -23,7 +26,8 @@ names the first of these as its ``cause``. At its start:
 
 Every request of the call carries ``observation/tool_origin`` (float32 (3,),
 env-local world frame), ``observation/tool_skill`` and ``observation/tool_call``
-(one id per call); requests a tool serves are left alone. Each call appends a
+(one id per call), and with ``demo_sentence`` the demonstrations' sentence for the
+skill (:func:`demo_sentence`) in place of the master's; requests a tool serves are left alone. Each call appends a
 line to ``<episode log dir>/origin.jsonl``. A failure loses the call's origin
 (NaN), never the proxy step.
 """
@@ -55,6 +59,8 @@ GRIPPER = "observation/gripper_position"
 JOINTS = "observation/joint_position"
 # The gripper reads 0.0 open and 0.12-1.0 holding an object, so closed on nothing reads as holding.
 GRIPPER_CLOSED = 0.1
+# agent-harness robolab_run.py --holding-truth: whether the closed gripper touches an object lifted off where it started.
+HOLDING_KEY = "__holding"
 # 2 mm bins over the heights a task's table top can have in the robot base frame.
 TABLE_BINS = np.arange(-0.05, 0.3, 0.002)
 # agent-harness robolab_run.py POLICY_PICK_DONE_LIFT_M: a demonstration's pick call ends once the object is this
@@ -65,6 +71,32 @@ PICK_DONE_LIFT_M = 0.08
 PICK_ONLY = re.compile(r"^\W*(pick|grasp|lift|take|grab)\b"
                        r"(?!.*\b(place|put|drop|move|toss|throw|insert|set|stack it|into|onto)\b)", re.I | re.S)
 SAM2_MIN_PX = 50   # VoLo rejects smaller point-prompt masks as degenerate
+# The first relation word of the master's sentence picks the demonstrations' "in" or "on".
+RELATION = re.compile(r"\b(into|inside|in|onto|on|above)\b", re.I)
+ARTICLE = re.compile(r"^(the|a|an)\s+", re.I)
+
+
+def holding(obs: dict) -> bool:
+    """Whether the gripper holds an object: ``HOLDING_KEY`` when the request carries it, else the gripper reading."""
+    if HOLDING_KEY in obs:
+        return bool(obs[HOLDING_KEY])
+    return float(np.ravel(obs[GRIPPER])[0]) > GRIPPER_CLOSED
+
+
+def demo_sentence(skill: str, grounding: dict | None, prompt: str) -> str | None:
+    """The demonstrations' sentence (agent-harness robolab_run.py Scene.call_params) for ``skill`` with the
+    grounding's phrases: ``pick up the X``, ``put the X in / on the Y`` (``on`` when the master's sentence first
+    names on, onto or above); None when the grounding lacks a phrase it needs."""
+    def phrase(role):
+        entry = (grounding or {}).get(role)
+        return ARTICLE.sub("", entry["phrase"].strip()).lower() if entry and entry.get("phrase") else None
+    target, destination = phrase("target"), phrase("destination")
+    if target is None or (skill == "place" and destination is None):
+        return None
+    if skill == "pick":
+        return f"pick up the {target}"
+    rel = RELATION.search(prompt)
+    return f"put the {target} {'on' if rel and rel.group(1).lower() in ('onto', 'on', 'above') else 'in'} the {destination}"
 
 
 def table_z(depth: np.ndarray, K, pos, quat) -> float:
@@ -108,21 +140,23 @@ class _Call:
     closed_z: float | None = None   # the end effector's height where the gripper closed; None while it reads open
 
     def lifted(self, obs: dict) -> bool:
-        """Whether the end effector is more than ``PICK_DONE_LIFT_M`` above where the gripper closed in this call."""
+        """Whether the end effector is more than ``PICK_DONE_LIFT_M`` above where the gripper closed in this call,
+        holding."""
         if float(np.ravel(obs[GRIPPER])[0]) <= GRIPPER_CLOSED:
             self.closed_z = None
             return False
         z = float(forward_kinematics_robolab(np.asarray(obs[JOINTS], dtype=np.float64))[2, 3])
         if self.closed_z is None:
             self.closed_z = z
-        return z - self.closed_z > PICK_DONE_LIFT_M
+        return z - self.closed_z > PICK_DONE_LIFT_M and holding(obs)
 
 
 class OriginHook:
     """Adds the object-frame tool's origin, skill and call id to π0.5's requests."""
 
-    def __init__(self, ctx):
+    def __init__(self, ctx, demo_sentence: bool = False):
         self.ctx = ctx
+        self.demo_sentence = demo_sentence
         # The grasp tool's perception service (PERCEPTION_SERVER_URL / GRASP_SERVER_*).
         self._client = GraspClient()
         # episode id -> its latest call; one small entry per episode.
@@ -148,11 +182,12 @@ class OriginHook:
     def _start(self, obs: dict, state, prompt: str, index: int, cause: str) -> _Call:
         """A new call; logs it."""
         gripper = float(np.ravel(obs[GRIPPER])[0])
-        skill = "place" if gripper > GRIPPER_CLOSED else "pick"
+        skill = "place" if holding(obs) else "pick"
         call_id = f"{os.getpid()}-{state.episode_id}-{index}"
         record = {"episode": state.episode_id, "step_count": state.infer_count,
                   "subgoal_idx": state.current_subgoal_idx, "prompt": prompt, "skill": skill, "role": None,
-                  "call": call_id, "cause": cause, "gripper": round(gripper, 3), "grounding": None, "mask_px": None,
+                  "call": call_id, "cause": cause, "gripper": round(gripper, 3),
+                  "holding": bool(obs[HOLDING_KEY]) if HOLDING_KEY in obs else None, "grounding": None, "mask_px": None,
                   "sam2_iou": None, "table_z": None, "boxtable": None, "pixel": None}
         start = time.perf_counter()
         try:
@@ -164,9 +199,11 @@ class OriginHook:
         record.update(origin=_rounded(origin), source=source)
         if error is not None:
             record["error"] = error
+        keys = {ORIGIN_KEY: origin.astype(np.float32), SKILL_KEY: skill, CALL_KEY: call_id}
+        if self.demo_sentence:   # the master's sentence when the grounding lacks a phrase
+            keys[self.ctx.prompt_key] = record["vla_prompt"] = demo_sentence(skill, record["grounding"], prompt) or prompt
         record["wall_s"] = round(time.perf_counter() - start, 4)
         self._write(state, record)
-        keys = {ORIGIN_KEY: origin.astype(np.float32), SKILL_KEY: skill, CALL_KEY: call_id}
         destination = bool(record["grounding"] and record["grounding"]["destination"]) and not PICK_ONLY.match(prompt)
         return _Call(index, prompt, state.current_subgoal_idx, keys, skill, destination)
 

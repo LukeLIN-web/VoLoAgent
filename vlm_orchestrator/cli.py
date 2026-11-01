@@ -604,6 +604,14 @@ def main():
              "observation/tool_origin, with observation/tool_skill and "
              "observation/tool_call",
     )
+    parser.add_argument(
+        "--tool-demo-sentence",
+        action="store_true",
+        default=False,
+        help="--tool-origin: each call's pi0.5 sentence is the demonstrations' "
+             "one for its skill with the master's grounding phrases ('pick up "
+             "the X', 'put the X in / on the Y') instead of the master's subgoal",
+    )
 
     # --- Fine-tuning data collection ---
     parser.add_argument(
@@ -823,6 +831,8 @@ def main():
         parser.error(
             f"--tool-origin needs --mode subgoal (got --mode {args.mode})"
         )
+    if args.tool_demo_sentence and not args.tool_origin:
+        parser.error("--tool-demo-sentence requires --tool-origin")
     if args.tool_origin and args.reference_image != "off":
         parser.error("--tool-origin and --reference-image share pi0.5's request hook: use one")
 
@@ -1252,7 +1262,7 @@ def _build_strategy(args):
         if args.tool_origin:
             from vlm_orchestrator.strategies.origin_hook import OriginHook
 
-            strategy.reference_hook = OriginHook(ctx)
+            strategy.reference_hook = OriginHook(ctx, args.tool_demo_sentence)
         return strategy
 
     if args.mode == "scene_edit":

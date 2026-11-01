@@ -27,7 +27,8 @@ BOX_CENTRE = [0.3, -0.2, 0.05]          # under the camera, between the box top 
 BOX_TOP = [0.3, -0.2, 0.1]               # the depth back-projection of TARGET's pixel
 TARGET = {"phrase": "red cube", "point": (0.505, 0.505)}          # pixel (50, 50), on the box top
 DESTINATION = {"phrase": "grey bowl", "point": (0.105, 0.105)}    # pixel (10, 10), on the table
-FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "cause", "gripper", "grounding",
+FIELDS = {"episode", "step_count", "subgoal_idx", "prompt", "skill", "role", "call", "cause", "gripper", "holding",
+          "grounding",
           "mask_px", "sam2_iou", "table_z", "boxtable", "pixel", "origin", "source", "wall_s"}
 
 
@@ -62,7 +63,7 @@ class FakeSam2:
         return self.mask.repeat(scale, 0).repeat(scale, 1), 0.9
 
 
-def _hook(monkeypatch, grounding=None):
+def _hook(monkeypatch, grounding=None, demo_sentence=False):
     """A hook whose master answers ``grounding`` (raises it when an exception) and whose SAM2 is FakeSam2."""
     asked = []
 
@@ -74,12 +75,12 @@ def _hook(monkeypatch, grounding=None):
 
     monkeypatch.setattr(oh, "ask_reference_targets", ask)
     monkeypatch.setattr(oh, "GraspClient", FakeSam2)
-    return oh.OriginHook(StrategyContext(vlm=None)), asked
+    return oh.OriginHook(StrategyContext(vlm=None), demo_sentence), asked
 
 
-def _obs(prompt="pick up the red cube", gripper=0.0, depth=None, joints=None):
+def _obs(prompt="pick up the red cube", gripper=0.0, depth=None, joints=None, held=None):
     depth_key, k_key, pos_key, quat_key = oh.FRONT
-    return {
+    return {**({} if held is None else {oh.HOLDING_KEY: held}),
         "prompt": prompt,
         oh.GRIPPER: np.array([gripper]),
         oh.JOINTS: np.zeros(7, np.float32) if joints is None else np.asarray(joints),
@@ -255,3 +256,68 @@ def test_a_pick_call_with_a_destination_turns_into_a_place_call_once_lifted(monk
     assert [(line["cause"], line["skill"], line["role"]) for line in lines] == \
         [("episode", "pick", "target"), ("lift", "place", "destination")][:n]
     assert [line["step_count"] for line in lines] == [calls.index(i) for i in range(n)]
+
+
+@pytest.mark.parametrize("gripper, held, skill", [(1.0, False, "pick"), (0.0, True, "place"), (0.5, True, "place")])
+def test_the_simulator_reading_when_sent_picks_the_skill(monkeypatch, tmp_path, gripper, held, skill):
+    hook, _ = _hook(monkeypatch)
+    out = hook(_obs(gripper=gripper, held=held), _state(tmp_path))
+    assert out[oh.SKILL_KEY] == skill
+    (line,) = _lines(tmp_path)
+    assert line["holding"] is held and line["gripper"] == gripper
+
+
+@pytest.mark.parametrize("held, calls", [
+    ([False] * 5, [0, 0, 0, 0, 0]),                 # closed on nothing: lifted, never a place call
+    ([False, False, False, True, True], [0, 0, 0, 1, 1]),
+    ([False, False, False, False, True], [0, 0, 0, 0, 1]),   # lifted at 0.28, holding from the next request
+])
+def test_a_pick_call_turns_into_a_place_call_only_while_holding(monkeypatch, tmp_path, held, calls):
+    hook, _ = _hook(monkeypatch)
+    monkeypatch.setattr(oh, "forward_kinematics_robolab", _fk_z)
+    state = _state(tmp_path)
+    outs = []
+    for i, ((gripper, z), h) in enumerate(zip(LIFT, held)):
+        state.infer_count = i
+        outs.append(hook(_obs(PUT, gripper=gripper, joints=[z] + [0.0] * 6, held=h), state))
+    assert [out[oh.CALL_KEY] for out in outs] == [f"{os.getpid()}-3-{i}" for i in calls]
+    assert [line["cause"] for line in _lines(tmp_path)] == ["episode", "lift"][:calls[-1] + 1]
+
+
+@pytest.mark.parametrize("skill, grounding, prompt, sentence", [
+    ("pick", {"target": TARGET, "destination": DESTINATION}, PUT, "pick up the red cube"),
+    ("place", {"target": TARGET, "destination": DESTINATION}, PUT, "put the red cube in the grey bowl"),
+    ("place", {"target": {"phrase": "The Red Cube", "point": (0, 0)}, "destination": DESTINATION},
+     "Place the red cube onto the grey bowl near the box", "put the red cube on the grey bowl"),
+    ("place", {"target": TARGET, "destination": DESTINATION}, "Put the cube in the bowl on the left",
+     "put the red cube in the grey bowl"),        # the first relation word
+    ("place", {"target": TARGET, "destination": DESTINATION}, "Move the cube to the bowl",
+     "put the red cube in the grey bowl"),        # none: in
+    ("pick", {"target": TARGET, "destination": None}, "pick up the cube", "pick up the red cube"),
+    ("place", {"target": TARGET, "destination": None}, PUT, None),
+    ("pick", {"target": None, "destination": DESTINATION}, PUT, None),
+    ("pick", None, PUT, None),
+])
+def test_demo_sentence(skill, grounding, prompt, sentence):
+    assert oh.demo_sentence(skill, grounding, prompt) == sentence
+
+
+def test_demo_sentence_replaces_the_masters_for_the_whole_call(monkeypatch, tmp_path):
+    hook, _ = _hook(monkeypatch, demo_sentence=True)
+    monkeypatch.setattr(oh, "forward_kinematics_robolab", _fk_z)
+    state = _state(tmp_path)
+    prompts = []
+    for i, ((gripper, z), h) in enumerate(zip(LIFT, [False, False, False, True, True])):
+        state.infer_count = i
+        prompts.append(hook(_obs(PUT, gripper=gripper, joints=[z] + [0.0] * 6, held=h), state)["prompt"])
+    assert prompts == ["pick up the red cube"] * 3 + ["put the red cube in the grey bowl"] * 2
+    lines = _lines(tmp_path)
+    assert [line["vla_prompt"] for line in lines] == ["pick up the red cube", "put the red cube in the grey bowl"]
+    assert all(line["prompt"] == PUT for line in lines)
+
+
+def test_demo_sentence_keeps_the_masters_when_the_grounding_fails(monkeypatch, tmp_path):
+    hook, _ = _hook(monkeypatch, ValueError("no grounding"), demo_sentence=True)
+    assert hook(_obs(PUT), _state(tmp_path))["prompt"] == PUT
+    (line,) = _lines(tmp_path)
+    assert line["vla_prompt"] == PUT
