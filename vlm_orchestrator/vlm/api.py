@@ -84,12 +84,13 @@ def _record_call(log_dir, t: float, caller: str, kwargs: dict,
     """Append one ``chat_create`` call to ``<log_dir>/vlm_calls.jsonl``."""
     latency_s = time.time() - t
     if response is None:
-        reply = {"response": None, "finish_reason": None, "usage": None}
+        reply = {"response": None, "finish_reason": None, "reasoning_summary": None, "usage": None}
     else:
         choice = response.choices[0]
         reply = {
             "response": choice.message.content,
             "finish_reason": choice.finish_reason,
+            "reasoning_summary": getattr(choice.message, "reasoning_summary", None),
             "usage": response.usage.model_dump() if response.usage is not None else None,
         }
     messages = copy.deepcopy(kwargs["messages"])
@@ -138,7 +139,8 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
     While :func:`set_call_log_dir` has set a directory, every call (including
     one that raises) appends a record to ``<dir>/vlm_calls.jsonl``: the direct
     caller, the exact request (data-URL images replaced by
-    ``vlm_images/<sha1>.<ext>`` files beside it), the reply, usage and latency.
+    ``vlm_images/<sha1>.<ext>`` files beside it), the reply, the reasoning summary when the endpoint returns one
+    (message.reasoning_summary; the GPT relay does), usage and latency.
     """
     kwargs = dict(model=model, messages=messages, **extra)
     if is_reasoning_model(model):
