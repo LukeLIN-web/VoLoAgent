@@ -650,6 +650,8 @@ class OrchestratorProxy:
                 #   - *_raw: full-resolution images (for VLM only)
                 #   - gt_state: robolab ground-truth state machine
                 #   - __holding: agent-harness --holding-truth (origin_hook only)
+                #   - __resume: agent-harness robolab_resume.py (the strategy's
+                #     _resume_episode only)
                 #   - ground_truth_done: LIBERO success flag (logging only)
                 #   - observation/ee_pos, observation/gripper_position:
                 #     failure detector inputs (proxy-only)
@@ -660,7 +662,7 @@ class OrchestratorProxy:
                     "observation/camera_",
                     "gt_seg/",
                 )
-                _STRIP_EXACT = {"gt_state", "ground_truth_done", "__selection_context", "__holding"}
+                _STRIP_EXACT = {"gt_state", "ground_truth_done", "__selection_context", "__holding", "__resume"}
                 vla_obs = {
                     k: v for k, v in obs.items()
                     if (

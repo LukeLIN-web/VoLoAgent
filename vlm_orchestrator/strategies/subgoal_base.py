@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+from PIL import Image
 
 from vlm_orchestrator.failure_handlers.base import (
     HandlerResult,
@@ -927,6 +928,9 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             [e.copy() for e in extra] if extra else None
         )
 
+        if obs.get("__resume") is not None:
+            return self._resume_episode(obs, state, obs["__resume"])
+
         # ---- HITL-driven episode start ----
         # In HITL mode the human writes the subgoal decomposition — no
         # VLM calls, no initial strategy.  Block until the human submits
@@ -980,6 +984,47 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             obs = self.ctx.set_prompt(obs, state.rewritten_instruction)
 
         return obs, state
+
+    def _resume_episode(
+        self, obs: dict, state: SessionState, resume: dict,
+    ) -> tuple[dict, SessionState]:
+        """Continue a recorded episode from one of its monitor calls
+        (the client's ``__resume``; agent-harness robolab_resume.py).
+
+        No decomposition: the recorded subgoal list at the index it had
+        (an index past the list stays on the last subgoal, where the
+        loop stays once every subgoal is done), ``original_subgoals``
+        as the list recycle / replan select from, that call's BEFORE
+        images, and a monitor check on this request.  Retry, recycle
+        and tool counters start from zero, as in any new episode.
+        """
+        images = [
+            np.asarray(Image.open(path).convert("RGB"))
+            for path in resume["before_images"]
+        ]
+        state.initial_image = images[0]
+        state.initial_extra_images = images[1:] or None
+        subgoals = list(resume["subgoals"])
+        if not subgoals:
+            raise ValueError("__resume carries no subgoals")
+        idx = min(int(resume["subgoal_idx"]), len(subgoals) - 1)
+        state.subgoals = subgoals
+        state.subgoals_ordered = False
+        state.current_subgoal_idx = idx
+        state.rewritten_instruction = subgoals[idx]
+        self._original_subgoals = list(resume["original_subgoals"])
+        self._configure_gt_detector(obs, state, subgoals[idx])
+        state.log({
+            "type": "resume",
+            "subgoal_idx": idx,
+            "subgoal": subgoals[idx],
+            "resume": resume,
+        })
+        due = state.episode_step - self.config.check_interval
+        state.step_at_last_check = due
+        if self._failure_handler is not None:
+            self._failure_handler._step_at_last_check = due
+        return self._on_step(obs, state)
 
     def _on_step(
         self, obs: dict, state: SessionState,
