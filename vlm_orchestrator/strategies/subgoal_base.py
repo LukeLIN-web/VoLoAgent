@@ -11,6 +11,7 @@ decomposition format, check logic, and any per-frame processing.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -457,6 +458,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         self._master_points = bool(master_points)
         self._place_target = place_target
         self._client = None
+        self._monitor_client = None
         self._recycle_count = 0
         self._original_subgoals: list[str] = []
         self._grasp_seg_mode = grasp_seg_mode
@@ -611,7 +613,7 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         primary_label, extra_labels = self.ctx.vlm_camera_labels
 
         self._failure_handler = VLMFailureHandler(
-            vlm_call_fn=self._vlm_call,
+            vlm_call_fn=functools.partial(self._vlm_call, monitor=True),
             image_builder_fn=self._build_check_message,
             get_vlm_image_fn=self.ctx.get_vlm_image,
             get_extra_images_fn=self.ctx.get_vlm_extra_images,
@@ -643,40 +645,59 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
         always use the OpenAI-compatible API backend."""
         return False
 
+    def _open_client(self, base_url: str | None):
+        """An OpenAI-compatible client on ``base_url``."""
+        import openai
+        import os
+
+        kwargs: dict = {}
+        if base_url:
+            kwargs["base_url"] = base_url
+        # Resolve API key: explicit config > VLM_API_KEY > OPENAI_API_KEY
+        if self.config.vlm_api_key:
+            kwargs["api_key"] = self.config.vlm_api_key
+        elif os.environ.get("VLM_API_KEY"):
+            kwargs["api_key"] = os.environ["VLM_API_KEY"]
+        # else: fall through to openai lib's own OPENAI_API_KEY lookup
+        return openai.OpenAI(**kwargs)
+
     @property
     def client(self):
         """Lazy-initialised OpenAI-compatible client."""
         if self._client is None:
-            import openai
-            import os
-
-            kwargs: dict = {}
-            if self.config.vlm_base_url:
-                kwargs["base_url"] = self.config.vlm_base_url
-            # Resolve API key: explicit config > VLM_API_KEY > OPENAI_API_KEY
-            if self.config.vlm_api_key:
-                kwargs["api_key"] = self.config.vlm_api_key
-            elif os.environ.get("VLM_API_KEY"):
-                kwargs["api_key"] = os.environ["VLM_API_KEY"]
-            # else: fall through to openai lib's own OPENAI_API_KEY lookup
-            self._client = openai.OpenAI(**kwargs)
+            self._client = self._open_client(self.config.vlm_base_url)
         return self._client
+
+    @property
+    def monitor_client(self):
+        """Client of the service that answers the failure monitor's calls
+        (``config.vlm_monitor_base_url``, same API key as the master)."""
+        if self._monitor_client is None:
+            self._monitor_client = self._open_client(self.config.vlm_monitor_base_url)
+        return self._monitor_client
 
     def _vlm_call(
         self,
         system_prompt: str,
         user_content: list[dict],
         max_tokens: int | None = None,
+        monitor: bool = False,
     ) -> str:
         """Single VLM call via the OpenAI-compatible backend.
 
         *max_tokens* overrides the default ``config.vlm_max_tokens``
         for calls that need more room (e.g. recycle with many subgoals).
+        *monitor* marks the failure monitor's calls: with
+        ``config.vlm_monitor_model`` set they go to that model on
+        ``config.vlm_monitor_base_url``; the request is otherwise the same.
         """
         from vlm_orchestrator.vlm import chat_create
+        client, model = self.client, self.config.vlm_model
+        if monitor and getattr(self.config, "vlm_monitor_model", None):
+            client, model = self.monitor_client, self.config.vlm_monitor_model
         response = chat_create(
-            self.client,
-            model=self.config.vlm_model,
+            client,
+            model=model,
             temperature=self.config.vlm_temperature,
             max_tokens=max_tokens or self.config.vlm_max_tokens,
             messages=[

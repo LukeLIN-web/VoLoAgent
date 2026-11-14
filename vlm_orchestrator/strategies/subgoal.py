@@ -129,6 +129,10 @@ class SubgoalConfig:
     vlm_max_tokens: int = 512
     vlm_base_url: str | None = None
     vlm_api_key: str | None = None
+    # The failure monitor's calls go to this model on this endpoint when set
+    # (same API key); every other call stays on vlm_model / vlm_base_url.
+    vlm_monitor_model: str | None = None
+    vlm_monitor_base_url: str | None = None
 
 
 # ======================================================================

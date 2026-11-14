@@ -128,6 +128,18 @@ def main():
         help="Base URL for VLM API (default: https://YOUR_VLM_ENDPOINT/v1)",
     )
     parser.add_argument(
+        "--vlm-monitor-model",
+        default=None,
+        help="Subgoal mode: model that answers the failure monitor's calls, "
+             "served at --vlm-monitor-base-url with the same API key "
+             "(default: --vlm-model answers every call)",
+    )
+    parser.add_argument(
+        "--vlm-monitor-base-url",
+        default=None,
+        help="Base URL of the --vlm-monitor-model service",
+    )
+    parser.add_argument(
         "--vlm-api-key",
         default=None,
         help="API key for VLM (default: VLM_API_KEY env var, "
@@ -1233,6 +1245,8 @@ def _build_strategy(args):
             vlm_temperature=args.vlm_temperature,
             vlm_base_url=args.vlm_base_url,
             vlm_api_key=args.vlm_api_key,
+            vlm_monitor_model=args.vlm_monitor_model,
+            vlm_monitor_base_url=args.vlm_monitor_base_url,
         )
 
         initial_strategy = _build_initial_strategy(args, ctx)
