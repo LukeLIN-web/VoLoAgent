@@ -657,6 +657,30 @@ def main():
              "estimation. Evaluate Cosmos3 on any --env (e.g. robolab).",
     )
     parser.add_argument(
+        "--nopause-latency",
+        default=None,
+        metavar="PATH",
+        help="Keep the sim running while the master is called. PATH is a "
+             "JSON latency table: {\"kinds\": {kind: system-prompt "
+             "prefix}, \"latency_s\": {kind: [seconds, ...]}}. Each master "
+             "call is sent on the current frame; its reply reaches the "
+             "strategy ceil(latency x --nopause-hz) sim steps later, the "
+             "latency drawn per call from the table (seeded by the "
+             "instruction, __episode_id and call index). Meanwhile pi0.5 "
+             "keeps running the prompt it last received, and the arm holds "
+             "still before an episode's first prompt. Calls are logged to "
+             "<episode dir>/nopause.jsonl. (default: off — the sim waits "
+             "for every reply)",
+    )
+    parser.add_argument(
+        "--nopause-hz",
+        type=float,
+        default=None,
+        help="Sim control rate (steps per second) that converts "
+             "--nopause-latency seconds into sim steps. Required with "
+             "--nopause-latency.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -723,6 +747,9 @@ def main():
             "client, no translation is needed — drop "
             "--vla-obs-key-remap."
         )
+
+    if args.nopause_latency is not None and args.nopause_hz is None:
+        parser.error("--nopause-latency requires --nopause-hz.")
 
     # ------------------------------------------------------------------
     # Validate --gt-metric-types
@@ -870,6 +897,8 @@ def main():
         backend=backend,
         vla_obs_key_remap=args.vla_obs_key_remap,
         client_protocol=args.client_protocol,
+        nopause_latency=args.nopause_latency,
+        nopause_hz=args.nopause_hz,
     )
 
     proxy = OrchestratorProxy(config)

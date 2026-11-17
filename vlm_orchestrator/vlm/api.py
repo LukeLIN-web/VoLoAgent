@@ -49,6 +49,7 @@ _OPENAI_REASONING_RE = re.compile(rf"(?:^|/)(?:{_OPENAI_REASONING})(?:[-/]|$)")
 _IMAGE_EXT = {"image/jpeg": "jpg", "image/png": "png"}
 _call_log_dir: str | os.PathLike | None = None
 _call_log_lock = threading.Lock()
+_call_hook = None
 
 
 def is_reasoning_model(model: str) -> bool:
@@ -61,6 +62,13 @@ def set_call_log_dir(path: str | os.PathLike | None) -> None:
     """Directory where :func:`chat_create` records its calls; None stops recording."""
     global _call_log_dir
     _call_log_dir = path
+
+
+def set_call_hook(fn) -> None:
+    """``fn(messages)`` runs after each :func:`chat_create` reply arrives (and is
+    recorded), before the reply is returned; None removes it."""
+    global _call_hook
+    _call_hook = fn
 
 
 def _save_image(log_dir: str | os.PathLike, data_url: str) -> str:
@@ -137,6 +145,7 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
     one that raises) appends a record to ``<dir>/vlm_calls.jsonl``: the direct
     caller, the exact request (data-URL images replaced by
     ``vlm_images/<sha1>.<ext>`` files beside it), the reply, usage and latency.
+    A hook set by :func:`set_call_hook` then runs before the reply is returned.
     """
     kwargs = dict(model=model, messages=messages, **extra)
     if is_reasoning_model(model):
@@ -156,17 +165,20 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
             kwargs["max_tokens"] = max_tokens
     log_dir = _call_log_dir
     if log_dir is None:
-        return client.chat.completions.create(**kwargs)
-    frame = sys._getframe(1)
-    caller = (f"{frame.f_globals['__name__']}:"
-              f"{getattr(frame.f_code, 'co_qualname', frame.f_code.co_name)}")
-    t = time.time()
-    try:
         response = client.chat.completions.create(**kwargs)
-    except Exception as e:
-        _record_call(log_dir, t, caller, kwargs, None, repr(e))
-        raise
-    _record_call(log_dir, t, caller, kwargs, response, None)
+    else:
+        frame = sys._getframe(1)
+        caller = (f"{frame.f_globals['__name__']}:"
+                  f"{getattr(frame.f_code, 'co_qualname', frame.f_code.co_name)}")
+        t = time.time()
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            _record_call(log_dir, t, caller, kwargs, None, repr(e))
+            raise
+        _record_call(log_dir, t, caller, kwargs, response, None)
+    if _call_hook is not None:
+        _call_hook(messages)
     return response
 
 
