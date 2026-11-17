@@ -24,6 +24,7 @@ import time
 import numpy as np
 
 from vlm_orchestrator.diagnostics.metrics1_failure_logger import TaskFailureLogger
+from vlm_orchestrator.nopause import Gate, LatencyTable, hold_chunk
 from vlm_orchestrator.protocols.base import (
     Backend,
     BackendConnection,
@@ -36,7 +37,7 @@ from vlm_orchestrator.strategies.base import (
     StrategyContext,
 )
 from vlm_orchestrator.strategies.passthrough import PassthroughStrategy
-from vlm_orchestrator.vlm.api import set_call_log_dir
+from vlm_orchestrator.vlm.api import set_call_hook, set_call_log_dir
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,8 @@ class ProxyConfig:
         vla_obs_key_remap: str = "none",
         vla_selection_context: bool = False,
         client_protocol: str = "openpi",
+        nopause_latency: str | None = None,
+        nopause_hz: float | None = None,
         # ----- backward-compat shim (used by tests / old call-sites) -----
         vlm=None,
         rewrite_strategy: str = "first_per_episode",
@@ -174,6 +177,9 @@ class ProxyConfig:
         self.vla_obs_key_remap = vla_obs_key_remap
         self.vla_selection_context = vla_selection_context
         self.client_protocol = client_protocol
+        # Latency table (path) that turns on the unpaused sim; see nopause.py.
+        self.nopause_latency = nopause_latency
+        self.nopause_hz = nopause_hz
 
         # Frontend / backend default to openpi WebSocket on both sides
         # (the only supported configuration before Option D).  Other
@@ -283,6 +289,8 @@ class OrchestratorProxy:
         # cleaned instruction → number of episodes seen so far.
         self._per_task_episode_count: dict[str, int] = {}
 
+        self._gate: Gate | None = None
+
     def serve_forever(self):
         asyncio.run(self._run())
 
@@ -310,6 +318,19 @@ class OrchestratorProxy:
         lines.append(bar)
         for line in lines:
             logger.info(line)
+
+        if self.config.nopause_latency is not None:
+            self._gate = Gate(
+                LatencyTable(self.config.nopause_latency),
+                self.config.nopause_hz,
+                asyncio.get_running_loop(),
+            )
+            set_call_hook(self._gate.hook)
+            logger.info(
+                f"Unpaused sim: master replies land after latencies from "
+                f"{self.config.nopause_latency} at "
+                f"{self.config.nopause_hz} steps/s"
+            )
 
         await self.config.frontend.serve(
             self.config.host, self.config.port, self._handle_session,
@@ -530,6 +551,11 @@ class OrchestratorProxy:
                 )
                 if episode_marker is not None:
                     self._last_episode_marker = episode_marker
+                if self._gate is not None and is_new_episode:
+                    await self._gate.abort()
+                    self._gate.start_episode(
+                        f"{client_prompt}|{episode_marker}"
+                    )
                 if is_new_episode:
                     # Finalize the PREVIOUS episode before rotating to
                     # the next one.  The session-end ``finally`` block
@@ -611,9 +637,29 @@ class OrchestratorProxy:
                 # inside process() don't block the asyncio event loop.
                 # This keeps websocket ping/pong alive and prevents the
                 # eval client from disconnecting due to ping timeouts.
-                obs, state = await asyncio.to_thread(
-                    self.config.strategy.process, obs, state,
-                )
+                if self._gate is not None:
+                    # Unpaused sim: while a master reply is in flight the
+                    # request is served without the strategy, by pi0.5 on
+                    # the prompt it last ran (held still before the first).
+                    processed = await self._gate.step(
+                        self.config.strategy.process, obs, state,
+                    )
+                    if processed is not None:
+                        obs, state = processed
+                    else:
+                        if state.grasp_tool_active or state.place_tool_active:
+                            raise RuntimeError(
+                                "a tool is active while a master reply "
+                                "is in flight"
+                            )
+                        if self._gate.prompt_in_force is not None:
+                            obs[self.config.prompt_key] = (
+                                self._gate.prompt_in_force
+                            )
+                else:
+                    obs, state = await asyncio.to_thread(
+                        self.config.strategy.process, obs, state,
+                    )
 
                 # Aspect-1: passive failure log.  Reads ``obs["gt_state"]``
                 # (if present) and emits structured events.  Side-effect
@@ -697,6 +743,12 @@ class OrchestratorProxy:
                 # (tens of seconds on a busy GPU), so like process() they
                 # run in a thread to keep the client's pings answered.
                 if (
+                    self._gate is not None
+                    and self._gate.due is not None
+                    and self._gate.prompt_in_force is None
+                ):
+                    response = {"actions": hold_chunk(obs)}
+                elif (
                     getattr(state, "grasp_tool_active", False)
                     and state.grasp_tool_executor is not None
                 ):
@@ -826,6 +878,8 @@ class OrchestratorProxy:
                         f"[VLA SEND #{state.infer_count}] "
                         f"keys={list(vla_obs)[:5]}…"
                     )
+                    if self._gate is not None:
+                        self._gate.prompt_in_force = vla_prompt
                     try:
                         response = await backend_conn.infer(vla_obs)
                     except Exception as vla_err:
@@ -1033,6 +1087,8 @@ class OrchestratorProxy:
                     exc_info=True,
                 )
         finally:
+            if self._gate is not None:
+                await self._gate.abort()
             # Finalize trajectory collection for the last episode
             self._finalize_trajectory_episode(state)
 
