@@ -7,7 +7,8 @@ The strategy runs in a worker thread.  :meth:`Gate.hook`, installed as the
 ``chat_create`` call hook, holds each master reply until the proxy's sim clock
 reaches the step the reply is due (the call's step plus its latency, drawn from
 a measured table, in sim steps); until then the proxy keeps serving action
-chunks without the strategy.
+chunks without the strategy.  With ``instant_next`` a monitor reply whose action
+is "next" is not held: it reaches the strategy on the step it was called.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ import zlib
 
 import numpy as np
 
+from vlm_orchestrator.failure_handlers.base import ACTION_NEXT
 from vlm_orchestrator.gt_metrics.target_resolver import _SYSTEM_PROMPT as GT_RESOLVER_PROMPT
+from vlm_orchestrator.vlm import parse_json
 
 
 class LatencyTable:
@@ -54,6 +57,14 @@ class EpisodeEnded(BaseException):
     """Raised in a held master call whose episode ended before its reply was due."""
 
 
+def says_next(response) -> bool:
+    """Whether a monitor reply's JSON names the action "next"."""
+    try:
+        return parse_json(response.choices[0].message.content).get("action") == ACTION_NEXT
+    except (ValueError, KeyError, AttributeError, TypeError):
+        return False
+
+
 def hold_chunk(obs: dict) -> np.ndarray:
     """Eight steps holding the arm's joints with the gripper open."""
     return np.tile(np.r_[obs["observation/joint_position"][:7], 0.0], (8, 1))
@@ -67,9 +78,10 @@ class Gate:
     :meth:`step`, since strategies swallow exceptions around master calls.
     """
 
-    def __init__(self, table: LatencyTable, hz: float, loop):
+    def __init__(self, table: LatencyTable, hz: float, loop, instant_next: bool = False):
         self.table = table
         self.hz = hz
+        self.instant_next = instant_next
         self.loop = loop
         self.due: int | None = None
         self.fault: BaseException | None = None
@@ -129,23 +141,25 @@ class Gate:
             return
         self.loop.call_soon_threadsafe(self._signal.set_result, result)
 
-    def hook(self, messages) -> None:
+    def hook(self, messages, response) -> None:
         if messages[0]["content"] == GT_RESOLVER_PROMPT:
             return  # the GT metrics' resolver feeds no action, so its reply is not delayed
         try:
-            self._hold(messages)
+            self._hold(messages, response)
         except EpisodeEnded:
             raise
         except BaseException as e:
             self.fault = e
             raise
 
-    def _hold(self, messages) -> None:
+    def _hold(self, messages, response) -> None:
         if threading.current_thread() is not self._thread:
             raise RuntimeError("master call outside the gated strategy.process()")
         kind = self.table.kind(messages[0]["content"])
         latency = self.table.draw(kind, f"{self.episode_key}|{self.call_index}")
         delay = math.ceil(latency * self.hz)
+        if self.instant_next and kind == "monitor" and says_next(response):
+            delay = 0
         call_step = self._state.episode_step
         row = {
             "call_index": self.call_index, "kind": kind,
@@ -155,11 +169,12 @@ class Gate:
         self.call_index += 1
         log_path = os.path.join(self._state.episode_log_dir, "nopause.jsonl")
 
-        self._release.clear()
-        self.due = row["due_step"]
-        self.loop.call_soon_threadsafe(self._signal.set_result, None)
-        self._release.wait()
-        self.due = None
+        if delay:
+            self._release.clear()
+            self.due = row["due_step"]
+            self.loop.call_soon_threadsafe(self._signal.set_result, None)
+            self._release.wait()
+            self.due = None
 
         if self._ended:
             row.update(release_step=None, discarded=True)

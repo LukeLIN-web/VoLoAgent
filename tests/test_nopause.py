@@ -149,6 +149,66 @@ def test_second_call_is_held_from_the_release_step(table, tmp_path):
     assert recycle["call_step"] == monitor["release_step"]
 
 
+def reply(content: str):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
+        usage=None,
+    )
+
+
+def run_one_call(table, tmp_path, monkeypatch, system_prompt, content, instant_next):
+    """One master call at step 40: (whether process() returned on that step, the logged row)."""
+    monkeypatch.setattr(CLIENT.chat.completions, "create", lambda **kwargs: reply(content))
+
+    def process(obs, state):
+        master(system_prompt)
+        return obs, state
+
+    async def main():
+        gate = Gate(table, HZ, asyncio.get_running_loop(), instant_next=instant_next)
+        set_call_hook(gate.hook)
+        gate.start_episode("stack the cubes|0")
+        state = SimpleNamespace(episode_step=40, episode_log_dir=str(tmp_path))
+        first = await gate.step(process, {"frame": 1}, state)
+        if first is None:
+            state.episode_step = gate.due
+            assert await gate.step(process, {"frame": 2}, state) is not None
+        assert gate.due is None
+        return first is not None
+
+    same_step = asyncio.run(main())
+    [row] = rows(tmp_path)
+    assert set(row) == ROW_FIELDS
+    return same_step, row
+
+
+def test_instant_next_lets_a_monitor_next_reply_through_on_its_call_step(table, tmp_path, monkeypatch):
+    same_step, row = run_one_call(
+        table, tmp_path, monkeypatch, MONITOR,
+        '{"status": "complete", "action": "next", "reason": "placed"}', True,
+    )
+    assert same_step
+    assert row["latency_s"] == table.draw("monitor", "stack the cubes|0|0")
+    assert (row["delay_steps"], row["due_step"], row["release_step"]) == (0, 40, 40)
+
+
+@pytest.mark.parametrize("system_prompt, content, instant_next", [
+    (MONITOR, '{"action": "next"}', False),
+    (MONITOR, '{"status": "in_progress", "action": "continue"}', True),
+    (MONITOR, "not json, next", True),
+    (PLAN, '{"action": "next"}', True),
+    (RECYCLE, '{"action": "next"}', True),
+])
+def test_every_other_reply_is_held_for_its_table_latency(
+    table, tmp_path, monkeypatch, system_prompt, content, instant_next,
+):
+    same_step, row = run_one_call(table, tmp_path, monkeypatch, system_prompt, content, instant_next)
+    kind = table.kind(system_prompt + " tabletop tasks.")
+    delay = math.ceil(table.draw(kind, "stack the cubes|0|0") * HZ)
+    assert not same_step
+    assert (row["delay_steps"], row["due_step"], row["release_step"]) == (delay, 40 + delay, 40 + delay)
+
+
 def test_abort_discards_the_reply_and_ends_process(table, tmp_path):
     ended = []
 

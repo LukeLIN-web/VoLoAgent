@@ -65,7 +65,7 @@ def set_call_log_dir(path: str | os.PathLike | None) -> None:
 
 
 def set_call_hook(fn) -> None:
-    """``fn(messages)`` runs after each :func:`chat_create` reply arrives (and is
+    """``fn(messages, response)`` runs after each :func:`chat_create` reply arrives (and is
     recorded), before the reply is returned; None removes it."""
     global _call_hook
     _call_hook = fn
@@ -178,7 +178,7 @@ def chat_create(client, *, model: str, messages, temperature: float = 0.0,
             raise
         _record_call(log_dir, t, caller, kwargs, response, None)
     if _call_hook is not None:
-        _call_hook(messages)
+        _call_hook(messages, response)
     return response
 
 

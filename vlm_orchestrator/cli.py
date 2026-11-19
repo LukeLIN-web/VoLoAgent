@@ -681,6 +681,14 @@ def main():
              "--nopause-latency.",
     )
     parser.add_argument(
+        "--nopause-instant-next",
+        action="store_true",
+        help="With --nopause-latency: a monitor reply whose action is "
+             "\"next\" reaches the strategy on the step it was called (0 "
+             "delay steps); every other reply is still delayed by the "
+             "table. (default: off)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -750,6 +758,8 @@ def main():
 
     if args.nopause_latency is not None and args.nopause_hz is None:
         parser.error("--nopause-latency requires --nopause-hz.")
+    if args.nopause_instant_next and args.nopause_latency is None:
+        parser.error("--nopause-instant-next requires --nopause-latency.")
 
     # ------------------------------------------------------------------
     # Validate --gt-metric-types
@@ -899,6 +909,7 @@ def main():
         client_protocol=args.client_protocol,
         nopause_latency=args.nopause_latency,
         nopause_hz=args.nopause_hz,
+        nopause_instant_next=args.nopause_instant_next,
     )
 
     proxy = OrchestratorProxy(config)
