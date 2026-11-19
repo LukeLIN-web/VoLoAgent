@@ -150,6 +150,7 @@ class ProxyConfig:
         client_protocol: str = "openpi",
         nopause_latency: str | None = None,
         nopause_hz: float | None = None,
+        nopause_instant_next: bool = False,
         # ----- backward-compat shim (used by tests / old call-sites) -----
         vlm=None,
         rewrite_strategy: str = "first_per_episode",
@@ -180,6 +181,7 @@ class ProxyConfig:
         # Latency table (path) that turns on the unpaused sim; see nopause.py.
         self.nopause_latency = nopause_latency
         self.nopause_hz = nopause_hz
+        self.nopause_instant_next = nopause_instant_next
 
         # Frontend / backend default to openpi WebSocket on both sides
         # (the only supported configuration before Option D).  Other
@@ -324,12 +326,15 @@ class OrchestratorProxy:
                 LatencyTable(self.config.nopause_latency),
                 self.config.nopause_hz,
                 asyncio.get_running_loop(),
+                instant_next=self.config.nopause_instant_next,
             )
             set_call_hook(self._gate.hook)
             logger.info(
                 f"Unpaused sim: master replies land after latencies from "
                 f"{self.config.nopause_latency} at "
                 f"{self.config.nopause_hz} steps/s"
+                + (", monitor \"next\" replies not delayed"
+                   if self.config.nopause_instant_next else "")
             )
 
         await self.config.frontend.serve(
