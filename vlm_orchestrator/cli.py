@@ -706,6 +706,14 @@ def main():
              "The selector must remove it before policy inference (default: off).",
     )
     parser.add_argument(
+        "--vla-task-prompt",
+        action="store_true",
+        help="Send the VLA the task's original instruction in place of the "
+             "sentence the strategy handed over (a subgoal). The strategy, "
+             "its master calls and the tools are unchanged; each replaced "
+             "sentence is logged once as a vla_task_prompt record (default: off).",
+    )
+    parser.add_argument(
         "--client-protocol",
         choices=["openpi", "dreamzero", "cosmos3"],
         default="openpi",
@@ -995,6 +1003,7 @@ def main():
         backend=backend,
         vla_obs_key_remap=args.vla_obs_key_remap,
         vla_selection_context=args.vla_selection_context,
+        vla_task_prompt=args.vla_task_prompt,
         client_protocol=args.client_protocol,
         nopause_latency=args.nopause_latency,
         nopause_hz=args.nopause_hz,

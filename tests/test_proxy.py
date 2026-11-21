@@ -3,6 +3,7 @@
 
 """Integration test: spin up a mock VLA server, the orchestrator proxy, and a client."""
 
+import json
 import threading
 import time
 
@@ -154,6 +155,57 @@ def test_rewrite():
 
     client.close()
     vla_server.shutdown()
+
+
+def test_vla_task_prompt(tmp_path):
+    """--vla-task-prompt: the strategy keeps its sentence, the VLA gets the task's instruction."""
+    vla_port = 19886
+    proxy_port = 19887
+
+    vla_server = start_mock_vla(vla_port)
+
+    config = ProxyConfig(
+        vla_host="127.0.0.1",
+        vla_port=vla_port,
+        host="127.0.0.1",
+        port=proxy_port,
+        vlm=MockVLM(),
+        vla_task_prompt=True,
+        log_dir=str(tmp_path),
+    )
+    proxy = OrchestratorProxy(config)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    time.sleep(0.5)
+
+    packer = codec.Packer()
+    client = ws_client.connect(
+        f"ws://127.0.0.1:{proxy_port}", compression=None, max_size=None
+    )
+    codec.unpackb(client.recv())
+
+    obs = {
+        "prompt": "pick up the banana",
+        "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+    }
+    for prompt in ("pick up the banana", "pick up the banana", "stack the bowls"):
+        client.send(packer.pack({**obs, "prompt": prompt}))
+        response = codec.unpackb(client.recv())
+        assert response["received_prompt"] == prompt
+        assert response["orchestrator_instruction"] == prompt.upper()
+
+    client.close()
+    vla_server.shutdown()
+    time.sleep(0.5)
+    records = [
+        json.loads(line)
+        for f in tmp_path.rglob("*.jsonl") for line in f.read_text().splitlines()
+    ]
+    swaps = [(r["replaced"], r["sent"]) for r in records if r.get("type") == "vla_task_prompt"]
+    assert swaps == [
+        ("PICK UP THE BANANA", "pick up the banana"),
+        ("STACK THE BOWLS", "stack the bowls"),
+    ]
 
 
 def test_cosmos3_passthrough_strips_orchestrator_only_keys():
