@@ -146,6 +146,7 @@ class ProxyConfig:
         backend: Backend | None = None,
         vla_obs_key_remap: str = "none",
         vla_selection_context: bool = False,
+        vla_task_prompt: bool = False,
         client_protocol: str = "openpi",
         # ----- backward-compat shim (used by tests / old call-sites) -----
         vlm=None,
@@ -173,6 +174,7 @@ class ProxyConfig:
         )
         self.vla_obs_key_remap = vla_obs_key_remap
         self.vla_selection_context = vla_selection_context
+        self.vla_task_prompt = vla_task_prompt
         self.client_protocol = client_protocol
 
         # Frontend / backend default to openpi WebSocket on both sides
@@ -671,6 +673,19 @@ class OrchestratorProxy:
                         and not any(k.startswith(p) for p in _STRIP_PREFIXES)
                     )
                 }
+                if self.config.vla_task_prompt and state.original_instruction is not None:
+                    # The strategy keeps its own sentence (state.rewritten_instruction);
+                    # only what the VLA is conditioned on changes.
+                    replaced = (state.episode_id, vla_prompt)   # one record per sentence per episode
+                    if replaced != getattr(state, "vla_task_prompt_replaced", None):
+                        state.vla_task_prompt_replaced = replaced
+                        state.log({
+                            "type": "vla_task_prompt",
+                            "replaced": vla_prompt,
+                            "sent": state.original_instruction,
+                            "step_count": state.infer_count,
+                        })
+                    vla_obs[self.config.prompt_key] = vla_prompt = state.original_instruction
                 if self.config.vla_selection_context:
                     if selection_step is None:
                         selection_step = client_step if client_step is not None else state.episode_step
