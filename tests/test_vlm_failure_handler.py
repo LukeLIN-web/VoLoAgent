@@ -215,9 +215,12 @@ class _FakeState:
 
 
 class TestVLMFailureHandler:
-    def _make_handler(self, vlm_response, check_interval=5):
-        """Create handler with a mock VLM that returns fixed response."""
+    def _make_handler(self, vlm_response, check_interval=5, **kwargs):
+        """Create handler with a mock VLM that returns fixed response, or
+        the next of a list of responses."""
         def mock_vlm_call(system_prompt, user_content):
+            if isinstance(vlm_response, list):
+                return vlm_response.pop(0)
             return vlm_response
 
         def mock_build_check(text, init_img, cur_img, extra, **kw):
@@ -236,7 +239,78 @@ class TestVLMFailureHandler:
             get_extra_images_fn=mock_get_extra,
             check_interval=check_interval,
             recovery_mode="replan",
+            **kwargs,
         )
+
+    NEXT = '{"status": "complete", "action": "next", "reason": "done"}'
+    CONTINUE = '{"status": "in_progress", "action": "continue", "reason": "moving"}'
+    REPLAN = '{"status": "failure", "action": "replan", "reason": "dropped"}'
+
+    def _run(self, handler, state, steps):
+        """step() once per episode step: {step: action} of the replies passed on."""
+        passed = {}
+        for _ in range(steps):
+            state.tick()
+            result = handler.step({}, state)
+            if result is not None:
+                passed[state.episode_step] = result.action
+                if result.action != ACTION_CONTINUE:
+                    handler.on_subgoal_advanced({}, state, 0)
+        return passed
+
+    def _replies(self, state):
+        return [
+            (e["outcome"], e["call_step"], e["episode_step"])
+            for e in state.log_entries if e["type"] == "vlm_reply"
+        ]
+
+    def test_next_needs_the_configured_number_of_next_replies_in_a_row(self):
+        handler = self._make_handler(
+            [self.NEXT, self.CONTINUE, self.NEXT, self.NEXT, self.NEXT],
+            next_confirmations=2,
+        )
+        state = _FakeState()
+        handler.on_episode_start({}, state)
+        # checks at 5 (next), 10 (continue), 15 (next), 20 (next -> passed on)
+        assert self._run(handler, state, 24) == {20: ACTION_NEXT}
+        assert self._replies(state) == [("unconfirmed", 5, 5), ("unconfirmed", 15, 15)]
+        # the streak starts over after the subgoal advanced
+        assert self._run(handler, state, 5) == {}
+        assert self._replies(state)[-1] == ("unconfirmed", 25, 25)
+
+    def test_default_logs_no_reply_events(self):
+        handler = self._make_handler([self.CONTINUE, self.NEXT])
+        state = _FakeState()
+        handler.on_episode_start({}, state)
+        assert self._run(handler, state, 10) == {10: ACTION_NEXT}
+        assert self._replies(state) == []
+
+    def test_reply_takes_effect_on_its_due_step_while_later_checks_go_out(self):
+        latency = [12, 3]  # the second check's reply lands first
+        handler = self._make_handler(
+            [self.CONTINUE, self.REPLAN, self.NEXT, self.NEXT],
+            reply_due_fn=lambda: state.episode_step + latency.pop(0),
+        )
+        state = _FakeState()
+        handler.on_episode_start({}, state)
+        # checks at 5 (due 17) and 10 (due 13): the replan lands at 13 and
+        # the reply still in flight, judged on an older frame, is dropped
+        assert self._run(handler, state, 17) == {13: ACTION_REPLAN}
+        assert self._replies(state) == [("applied", 10, 13), ("dropped", 5, 13)]
+
+    def test_overlapping_next_replies_confirm_each_other(self):
+        handler = self._make_handler(
+            [self.NEXT, self.NEXT, self.NEXT],
+            next_confirmations=2,
+            reply_due_fn=lambda: state.episode_step + 12,
+        )
+        state = _FakeState()
+        handler.on_episode_start({}, state)
+        # checks at 5, 10, 15 land at 17, 22, 27: advance at 22, third dropped
+        assert self._run(handler, state, 27) == {22: ACTION_NEXT}
+        assert self._replies(state) == [
+            ("unconfirmed", 5, 17), ("applied", 10, 22), ("dropped", 15, 22),
+        ]
 
     def test_returns_none_before_interval(self):
         handler = self._make_handler('{"status": "complete", "action": "next"}')

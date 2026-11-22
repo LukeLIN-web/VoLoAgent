@@ -9,6 +9,9 @@ reaches the step the reply is due (the call's step plus its latency, drawn from
 a measured table, in sim steps); until then the proxy keeps serving action
 chunks without the strategy.  With ``instant_next`` a monitor reply whose action
 is "next" is not held: it reaches the strategy on the step it was called.
+With ``overlap_monitor`` no monitor reply is held: the strategy keeps running,
+so monitor calls overlap in flight, and the monitor itself applies each reply
+on its due step, which it takes from :meth:`Gate.pop_monitor_due`.
 """
 
 from __future__ import annotations
@@ -78,10 +81,13 @@ class Gate:
     :meth:`step`, since strategies swallow exceptions around master calls.
     """
 
-    def __init__(self, table: LatencyTable, hz: float, loop, instant_next: bool = False):
+    def __init__(self, table: LatencyTable, hz: float, loop,
+                 instant_next: bool = False, overlap_monitor: bool = False):
         self.table = table
         self.hz = hz
         self.instant_next = instant_next
+        self.overlap_monitor = overlap_monitor
+        self._monitor_due: int | None = None
         self.loop = loop
         self.due: int | None = None
         self.fault: BaseException | None = None
@@ -97,6 +103,11 @@ class Gate:
         self.episode_key = key
         self.call_index = 0
         self.prompt_in_force: str | None = None
+
+    def pop_monitor_due(self) -> int | None:
+        """Due step of the monitor reply just left unheld; None if it was held."""
+        due, self._monitor_due = self._monitor_due, None
+        return due
 
     async def step(self, process, obs: dict, state):
         """``process(obs, state)``'s result, or None while a reply is in flight
@@ -168,6 +179,13 @@ class Gate:
         }
         self.call_index += 1
         log_path = os.path.join(self._state.episode_log_dir, "nopause.jsonl")
+
+        if self.overlap_monitor and kind == "monitor":
+            self._monitor_due = row["due_step"]
+            row.update(release_step=None, overlap=True)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+            return
 
         if delay:
             self._release.clear()

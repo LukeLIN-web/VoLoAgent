@@ -192,6 +192,55 @@ def test_instant_next_lets_a_monitor_next_reply_through_on_its_call_step(table, 
     assert (row["delay_steps"], row["due_step"], row["release_step"]) == (0, 40, 40)
 
 
+def test_overlap_monitor_leaves_monitor_replies_unheld_and_hands_over_their_due_step(table, tmp_path):
+    dues, gates = [], []
+
+    def process(obs, state):
+        master(MONITOR)
+        dues.append(gates[0].pop_monitor_due())
+        dues.append(gates[0].pop_monitor_due())
+        return obs, state
+
+    async def main():
+        gate = Gate(table, HZ, asyncio.get_running_loop(), overlap_monitor=True)
+        gates.append(gate)
+        set_call_hook(gate.hook)
+        gate.start_episode("stack the cubes|0")
+        state = SimpleNamespace(episode_step=40, episode_log_dir=str(tmp_path))
+        assert await gate.step(process, {"frame": 1}, state) is not None
+        state.episode_step = 48
+        assert await gate.step(process, {"frame": 2}, state) is not None
+        assert gate.due is None
+
+    asyncio.run(main())
+    first, second = rows(tmp_path)
+    assert set(first) == ROW_FIELDS | {"overlap"}
+    delays = [math.ceil(table.draw("monitor", f"stack the cubes|0|{i}") * HZ) for i in range(2)]
+    assert [first["due_step"], second["due_step"]] == [40 + delays[0], 48 + delays[1]]
+    assert first["due_step"] > second["call_step"]  # in flight together
+    assert first["release_step"] is None and first["overlap"] is True
+    assert dues == [first["due_step"], None, second["due_step"], None]
+
+
+def test_overlap_monitor_still_holds_plan_replies(table, tmp_path, monkeypatch):
+    monkeypatch.setattr(CLIENT.chat.completions, "create", lambda **kwargs: reply("{}"))
+
+    def process(obs, state):
+        master(PLAN)
+        return obs, state
+
+    async def main():
+        gate = Gate(table, HZ, asyncio.get_running_loop(), overlap_monitor=True)
+        set_call_hook(gate.hook)
+        gate.start_episode("stack the cubes|0")
+        state = SimpleNamespace(episode_step=40, episode_log_dir=str(tmp_path))
+        assert await gate.step(process, {"frame": 1}, state) is None
+        assert gate.pop_monitor_due() is None
+        await gate.abort()
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize("system_prompt, content, instant_next", [
     (MONITOR, '{"action": "next"}', False),
     (MONITOR, '{"status": "in_progress", "action": "continue"}', True),

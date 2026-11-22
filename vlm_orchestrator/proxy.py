@@ -150,6 +150,7 @@ class ProxyConfig:
         nopause_latency: str | None = None,
         nopause_hz: float | None = None,
         nopause_instant_next: bool = False,
+        nopause_overlap_monitor: bool = False,
         # ----- backward-compat shim (used by tests / old call-sites) -----
         vlm=None,
         rewrite_strategy: str = "first_per_episode",
@@ -180,6 +181,7 @@ class ProxyConfig:
         self.nopause_latency = nopause_latency
         self.nopause_hz = nopause_hz
         self.nopause_instant_next = nopause_instant_next
+        self.nopause_overlap_monitor = nopause_overlap_monitor
 
         # Frontend / backend default to openpi WebSocket on both sides
         # (the only supported configuration before Option D).  Other
@@ -325,14 +327,21 @@ class OrchestratorProxy:
                 self.config.nopause_hz,
                 asyncio.get_running_loop(),
                 instant_next=self.config.nopause_instant_next,
+                overlap_monitor=self.config.nopause_overlap_monitor,
             )
             set_call_hook(self._gate.hook)
+            if self.config.nopause_overlap_monitor:
+                self.config.strategy.monitor_reply_due = (
+                    self._gate.pop_monitor_due
+                )
             logger.info(
                 f"Unpaused sim: master replies land after latencies from "
                 f"{self.config.nopause_latency} at "
                 f"{self.config.nopause_hz} steps/s"
                 + (", monitor \"next\" replies not delayed"
                    if self.config.nopause_instant_next else "")
+                + (", monitor calls overlap in flight"
+                   if self.config.nopause_overlap_monitor else "")
             )
 
         await self.config.frontend.serve(

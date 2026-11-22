@@ -371,6 +371,8 @@ class VLMFailureHandler(FailureHandler):
         get_vlm_image_fn: Callable,
         get_extra_images_fn: Callable,
         check_interval: int = 80,
+        next_confirmations: int = 1,
+        reply_due_fn: Callable[[], int | None] | None = None,
         recovery_mode: str = "replan",
         primary_label: str = "External camera",
         extra_labels: list[str] | None = None,
@@ -383,6 +385,13 @@ class VLMFailureHandler(FailureHandler):
         self._get_vlm_image = get_vlm_image_fn
         self._get_extra_images = get_extra_images_fn
         self._check_interval = check_interval
+        # A "next" is passed on only as the ``next_confirmations``-th "next"
+        # in a row.  ``reply_due_fn`` names the step the reply just received
+        # takes effect (None: now); replies wait in ``_pending`` until then.
+        self._next_confirmations = next_confirmations
+        self._reply_due = reply_due_fn
+        self._pending: list[tuple[int, int, HandlerResult]] = []
+        self._next_streak = 0
         self._primary_label = primary_label
         self._extra_labels = extra_labels
 
@@ -413,19 +422,75 @@ class VLMFailureHandler(FailureHandler):
 
     def on_episode_start(self, obs: dict, state: Any) -> None:
         self._step_at_last_check = state.episode_step
+        self._pending.clear()
+        self._next_streak = 0
 
     def on_subgoal_advanced(self, obs: dict, state: Any, idx: int) -> None:
         self._step_at_last_check = state.episode_step
+        self._drop_pending(state)
+
+    def _drop_pending(self, state: Any) -> None:
+        """Forget replies judged on frames from before the plan changed."""
+        for due_step, call_step, _ in self._pending:
+            state.log({
+                "type": "vlm_reply", "outcome": "dropped",
+                "call_step": call_step, "due_step": due_step,
+                "episode_step": state.episode_step,
+            })
+        self._pending.clear()
+        self._next_streak = 0
 
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
 
     def step(self, obs: dict, state: Any) -> HandlerResult | None:
-        """Run periodic VLM detection.
+        """Run periodic VLM detection and return the reply that takes effect now.
 
-        Returns ``None`` if it's not time to check yet.
+        Returns ``None`` when no reply calls for an action on this step.
         """
+        result = self._check(obs, state)
+        if result is not None:
+            due = self._reply_due() if self._reply_due is not None else None
+            self._pending.append((
+                state.episode_step if due is None else due,
+                state.episode_step, result,
+            ))
+        return self._deliver(state)
+
+    def _deliver(self, state: Any) -> HandlerResult | None:
+        now = state.episode_step
+        for item in sorted(
+            (r for r in self._pending if r[0] <= now), key=lambda r: r[0],
+        ):
+            self._pending.remove(item)
+            due_step, call_step, result = item
+            if result.action == ACTION_NEXT:
+                self._next_streak += 1
+            else:
+                self._next_streak = 0
+            if (result.action == ACTION_NEXT
+                    and self._next_streak < self._next_confirmations):
+                outcome = "unconfirmed"
+            elif (result.status == STATUS_IN_PROGRESS
+                    and result.action == ACTION_CONTINUE):
+                outcome = "none"
+            else:
+                outcome = "applied"
+            if call_step != now or outcome == "unconfirmed":
+                state.log({
+                    "type": "vlm_reply", "outcome": outcome,
+                    "action": result.action, "call_step": call_step,
+                    "due_step": due_step, "episode_step": now,
+                })
+            if outcome == "applied":
+                if result.action != ACTION_CONTINUE:
+                    self._drop_pending(state)
+                return result
+        return None
+
+    def _check(self, obs: dict, state: Any) -> HandlerResult | None:
+        """Query the VLM if a check is due; ``None`` if not, or on a failed call."""
         # Not time to check yet
         if (state.episode_step - self._step_at_last_check
                 < self._check_interval):
@@ -533,11 +598,6 @@ class VLMFailureHandler(FailureHandler):
             "vlm_raw": raw[:500],
             "step_count": state.infer_count,
         })
-
-        # Return None for in_progress + continue (no action needed)
-        if (result.status == STATUS_IN_PROGRESS
-                and result.action == ACTION_CONTINUE):
-            return None
 
         return result
 

@@ -583,6 +583,10 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
     # VLM failure handler (lazy creation)
     # ------------------------------------------------------------------
 
+    # Set by the proxy in the unpaused sim with overlapping monitor calls:
+    # returns the step the monitor reply just received takes effect.
+    monitor_reply_due = None
+
     def _create_vlm_handler(self) -> None:
         """Create the VLM failure handler (deferred until first use).
 
@@ -599,6 +603,10 @@ class SubgoalBaseStrategy(OrchestrationStrategy):
             get_vlm_image_fn=self.ctx.get_vlm_image,
             get_extra_images_fn=self.ctx.get_vlm_extra_images,
             check_interval=self.config.check_interval,
+            next_confirmations=getattr(self.config, "next_confirmations", 1),
+            reply_due_fn=lambda: (
+                self.monitor_reply_due and self.monitor_reply_due()
+            ),
             recovery_mode=self._recovery_mode,
             primary_label=primary_label,
             extra_labels=extra_labels,

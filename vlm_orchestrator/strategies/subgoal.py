@@ -116,6 +116,8 @@ class SubgoalConfig:
     # behavior on pi05 (chunk=8) and remain meaningful for any VLA
     # behind a shim that uses pi0_family with horizon=8.
     check_interval: int = 40
+    next_confirmations: int = 1
+    """Monitor "next" replies in a row needed to advance the subgoal."""
     # Effectively-disabled timeout — advancement is gated on VLM/GT
     # completion checks instead.  Time-based advancement was hurting
     # repetition tasks (forcing the orchestrator to race through

@@ -681,6 +681,23 @@ def main():
              "--nopause-latency.",
     )
     parser.add_argument(
+        "--nopause-overlap-monitor",
+        action="store_true",
+        help="With --nopause-latency: monitor calls do not wait for the "
+             "previous monitor reply. A check is sent every "
+             "--check-interval steps on the current frame and its reply "
+             "takes effect at its own due step; replies still in flight "
+             "when the subgoal or plan changes are dropped. (default: off "
+             "— one master call in flight at a time)",
+    )
+    parser.add_argument(
+        "--next-confirmations",
+        type=int,
+        default=1,
+        help="Subgoal mode: monitor \"next\" replies in a row needed to "
+             "advance the subgoal (default: 1)",
+    )
+    parser.add_argument(
         "--nopause-instant-next",
         action="store_true",
         help="With --nopause-latency: a monitor reply whose action is "
@@ -760,6 +777,8 @@ def main():
         parser.error("--nopause-latency requires --nopause-hz.")
     if args.nopause_instant_next and args.nopause_latency is None:
         parser.error("--nopause-instant-next requires --nopause-latency.")
+    if args.nopause_overlap_monitor and args.nopause_latency is None:
+        parser.error("--nopause-overlap-monitor requires --nopause-latency.")
 
     # ------------------------------------------------------------------
     # Validate --gt-metric-types
@@ -910,6 +929,7 @@ def main():
         nopause_latency=args.nopause_latency,
         nopause_hz=args.nopause_hz,
         nopause_instant_next=args.nopause_instant_next,
+        nopause_overlap_monitor=args.nopause_overlap_monitor,
     )
 
     proxy = OrchestratorProxy(config)
@@ -1191,6 +1211,7 @@ def _build_strategy(args):
         subgoal_config = SubgoalConfig(
             check_mode=args.subgoal_check_mode,
             check_interval=args.check_interval,
+            next_confirmations=args.next_confirmations,
             subgoal_timeout=args.subgoal_timeout,
             vlm_model=args.vlm_model,
             vlm_temperature=args.vlm_temperature,
